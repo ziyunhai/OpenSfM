@@ -4,11 +4,13 @@ set(SFM_FILES
     tracks_helpers.h
     map_helpers.h
     dense_helpers.h
+    reconstruction_grower.h
     src/retriangulation.cc
     src/ba_helpers.cc
     src/tracks_helpers.cc
     src/map_helpers.cc
     src/dense_helpers.cc
+    src/reconstruction_grower.cc
 )
 add_library(sfm ${SFM_FILES})
 target_link_libraries(sfm

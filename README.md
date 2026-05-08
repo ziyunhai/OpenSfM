@@ -28,8 +28,6 @@ conda create --name opensfm --file conda-osx-arm64.lock --yes
 conda activate opensfm && pip install -e .
 ```
 
-**Windows:** run `setup.bat` — it handles everything automatically.
-
 Then reconstruct a dataset:
 ```bash
 conda activate opensfm

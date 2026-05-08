@@ -1,7 +1,9 @@
 name: opensfm
 dependencies:
     - python=3.10
+    - pip
     - cmake=3.31
+    - ninja
     - make
     - libxcrypt # [linux] [osx]
     - libopencv *=headless*
@@ -14,3 +16,4 @@ dependencies:
     - conda-forge::gperftools # [linux]
     - conda-forge::ceres-solver=2.2
     - conda-forge::fast_float
+    - conda-forge::gdal

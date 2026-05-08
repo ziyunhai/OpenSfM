@@ -3,6 +3,8 @@ from typing import Tuple
 
 import cv2
 import numpy as np
+
+from opensfm import pygeometry
 from scipy.spatial.transform import Rotation
 from numpy.typing import NDArray
 
