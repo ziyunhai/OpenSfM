@@ -48,7 +48,11 @@ PYBIND11_MODULE(pydense, m) {
            py::arg("R"), py::arg("t"), py::arg("depth"), py::arg("normal"),
            py::arg("color"), py::arg("mask"),
            py::arg("confidence") = py::none(), py::arg("name") = "")
-      .def("fuse", &dense::SVOFuserWrapper::Fuse);
+      .def("fuse", &dense::SVOFuserWrapper::Fuse)
+      .def("fuse_only", &dense::SVOFuserWrapper::FuseOnly)
+      .def("refine", &dense::SVOFuserWrapper::Refine, py::arg("color_iters"),
+           py::arg("joint_iters"), py::arg("lambda_reg"))
+      .def("extract_points", &dense::SVOFuserWrapper::ExtractPoints);
 
   py::class_<dense::DepthmapClusterEstimatorWrapper>(m,
                                                      "DepthmapClusterEstimator")

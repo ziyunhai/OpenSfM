@@ -38,6 +38,15 @@ void SVOIntegratorCL::BuildKernels() {
   k_extract_ = cl::Kernel(program_, "svo_extract_points", &err);
   opencl::CheckCL(err, "kernel svo_extract_points");
 
+  k_refine_clear_ = cl::Kernel(program_, "svo_refine_clear", &err);
+  opencl::CheckCL(err, "kernel svo_refine_clear");
+
+  k_refine_accumulate_ = cl::Kernel(program_, "svo_refine_accumulate", &err);
+  opencl::CheckCL(err, "kernel svo_refine_accumulate");
+
+  k_refine_update_ = cl::Kernel(program_, "svo_refine_update", &err);
+  opencl::CheckCL(err, "kernel svo_refine_update");
+
   // 1-byte dummy buffer used as placeholder when normal/color/mask is absent.
   cl_dummy_ = cl::Buffer(dev.context(), static_cast<cl_mem_flags>(CL_MEM_READ_ONLY),
                          static_cast<cl::size_type>(1), nullptr, &err);
@@ -636,6 +645,208 @@ void SVOIntegratorCL::ExtractPoints(float min_weight, float voxel_size,
     (*colors)[i] = Vec3<uint8_t>(host_clr[i * 3], host_clr[i * 3 + 1],
                                  host_clr[i * 3 + 2]);
   }
+}
+
+// ── Photometric refinement ────────────────────────────────────────────
+
+void SVOIntegratorCL::PrepareRefinement(
+    const std::vector<SVOCameraGPU>& cameras,
+    const std::vector<uint8_t>& packed_colors,
+    const std::vector<float>& packed_depths,
+    const std::vector<ImageDesc>& image_descs,
+    int n_views) {
+  if (capacity_ == 0) {
+    throw std::runtime_error(
+        "SVOIntegratorCL::PrepareRefinement: Initialize() + Integrate() "
+        "must be called first");
+  }
+
+  auto& dev = opencl::CLContext::Instance().Device(device_idx_);
+  auto& ctx = dev.context();
+  auto& queue = dev.queue();
+  cl_int err;
+
+  n_refine_views_ = n_views;
+
+  // Allocate gradient and Adam buffers.
+  const size_t grad_bytes =
+      static_cast<size_t>(capacity_) * 4 * sizeof(float);
+  const size_t adam_bytes =
+      static_cast<size_t>(capacity_) * 8 * sizeof(float);
+  cl_refine_grad_ =
+      cl::Buffer(ctx, CL_MEM_READ_WRITE, grad_bytes, nullptr, &err);
+  opencl::CheckCL(err, "refine grad buffer");
+  cl_refine_adam_ =
+      cl::Buffer(ctx, CL_MEM_READ_WRITE, adam_bytes, nullptr, &err);
+  opencl::CheckCL(err, "refine adam buffer");
+
+  // Upload packed color images.
+  const size_t color_bytes = packed_colors.size() * sizeof(uint8_t);
+  cl_color_images_ =
+      cl::Buffer(ctx, CL_MEM_READ_ONLY, color_bytes, nullptr, &err);
+  opencl::CheckCL(err, "refine color images buffer");
+  queue.enqueueWriteBuffer(cl_color_images_, CL_FALSE, 0, color_bytes,
+                           packed_colors.data());
+
+  // Upload packed depth maps.
+  const size_t depth_bytes = packed_depths.size() * sizeof(float);
+  cl_depth_images_ =
+      cl::Buffer(ctx, CL_MEM_READ_ONLY, depth_bytes, nullptr, &err);
+  opencl::CheckCL(err, "refine depth images buffer");
+  queue.enqueueWriteBuffer(cl_depth_images_, CL_FALSE, 0, depth_bytes,
+                           packed_depths.data());
+
+  // Upload camera array.
+  const size_t cam_bytes =
+      static_cast<size_t>(n_views) * sizeof(SVOCameraGPU);
+  cl_cameras_array_ =
+      cl::Buffer(ctx, CL_MEM_READ_ONLY, cam_bytes, nullptr, &err);
+  opencl::CheckCL(err, "refine cameras buffer");
+  queue.enqueueWriteBuffer(cl_cameras_array_, CL_FALSE, 0, cam_bytes,
+                           cameras.data());
+
+  // Upload image descriptors.
+  const size_t desc_bytes =
+      static_cast<size_t>(n_views) * sizeof(ImageDesc);
+  cl_image_descs_ =
+      cl::Buffer(ctx, CL_MEM_READ_ONLY, desc_bytes, nullptr, &err);
+  opencl::CheckCL(err, "refine image descs buffer");
+  queue.enqueueWriteBuffer(cl_image_descs_, CL_FALSE, 0, desc_bytes,
+                           image_descs.data());
+
+  // Clear gradient and Adam buffers.
+  queue.finish();
+  {
+    const size_t global =
+        ((static_cast<size_t>(capacity_) + 255u) / 256u) * 256u;
+    k_refine_clear_.setArg(0, cl_refine_grad_);
+    k_refine_clear_.setArg(1, cl_refine_adam_);
+    k_refine_clear_.setArg(2, capacity_);
+    k_refine_clear_.setArg(3, static_cast<cl_int>(1));  // clear Adam too
+    queue.enqueueNDRangeKernel(k_refine_clear_, cl::NullRange,
+                               cl::NDRange(global), cl::NDRange(256));
+    queue.finish();
+  }
+
+  std::cerr << "[SVOIntegratorCL] PrepareRefinement: " << n_views
+            << " views, " << (color_bytes >> 20) << " MB colors, "
+            << (depth_bytes >> 20) << " MB depths, "
+            << ((grad_bytes + adam_bytes) >> 20) << " MB grad+adam\n";
+
+  refine_prepared_ = true;
+}
+
+void SVOIntegratorCL::Refine(int color_iters, int joint_iters,
+                             float lambda_reg, float lambda_decay,
+                             float voxel_size, float trunc_dist,
+                             float min_weight) {
+  if (!refine_prepared_) {
+    throw std::runtime_error(
+        "SVOIntegratorCL::Refine: PrepareRefinement() not called");
+  }
+
+  auto& dev = opencl::CLContext::Instance().Device(device_idx_);
+  auto& queue = dev.queue();
+
+  const float inv_voxel_size = 1.0f / voxel_size;
+  const float min_weight_scaled = min_weight * kWeightScale;
+  const float lr_sdf = 0.1f * voxel_size;
+  const float lr_color = 0.3f;
+  const float beta1 = 0.9f;
+  const float beta2 = 0.999f;
+  const float epsilon = 1e-8f;
+
+  const int total_iters = color_iters + joint_iters;
+  float cur_lambda = lambda_reg;
+
+  // Find max image dimensions for dispatch sizing.
+  // Read back image descs to find max width/height.
+  std::vector<ImageDesc> descs(n_refine_views_);
+  queue.enqueueReadBuffer(cl_image_descs_, CL_TRUE, 0,
+                          n_refine_views_ * sizeof(ImageDesc), descs.data());
+  int max_w = 0, max_h = 0;
+  for (int v = 0; v < n_refine_views_; ++v) {
+    if (descs[v].width > max_w) max_w = descs[v].width;
+    if (descs[v].height > max_h) max_h = descs[v].height;
+  }
+
+  const size_t update_global =
+      ((static_cast<size_t>(capacity_) + 255u) / 256u) * 256u;
+
+  for (int iter = 0; iter < total_iters; ++iter) {
+    const bool color_only = (iter < color_iters);
+
+    // Phase 1: Accumulate gradients from each source view.
+    for (int vi = 0; vi < n_refine_views_; ++vi) {
+      int arg = 0;
+      k_refine_accumulate_.setArg(arg++, cl_table_);
+      k_refine_accumulate_.setArg(arg++, capacity_mask_);
+      k_refine_accumulate_.setArg(arg++, cl_refine_grad_);
+      k_refine_accumulate_.setArg(arg++, cl_color_images_);
+      k_refine_accumulate_.setArg(arg++, cl_depth_images_);
+      k_refine_accumulate_.setArg(arg++, cl_cameras_array_);
+      k_refine_accumulate_.setArg(arg++, cl_image_descs_);
+      k_refine_accumulate_.setArg(arg++, static_cast<cl_int>(n_refine_views_));
+      k_refine_accumulate_.setArg(arg++, static_cast<cl_int>(vi));
+      k_refine_accumulate_.setArg(arg++, voxel_size);
+      k_refine_accumulate_.setArg(arg++, inv_voxel_size);
+      k_refine_accumulate_.setArg(arg++, trunc_dist);
+      k_refine_accumulate_.setArg(arg++, min_weight_scaled);
+      k_refine_accumulate_.setArg(arg++,
+                                  static_cast<cl_int>(color_only ? 1 : 0));
+
+      // Dispatch for this view's image dimensions.
+      const size_t gw =
+          static_cast<size_t>((descs[vi].width + 15) / 16 * 16);
+      const size_t gh =
+          static_cast<size_t>((descs[vi].height + 15) / 16 * 16);
+      queue.enqueueNDRangeKernel(k_refine_accumulate_, cl::NullRange,
+                                 cl::NDRange(gw, gh), cl::NDRange(16, 16));
+    }
+    queue.finish();
+
+    // Phase 2: Adam update + Laplacian regularization.
+    {
+      int arg = 0;
+      k_refine_update_.setArg(arg++, cl_table_);
+      k_refine_update_.setArg(arg++, capacity_mask_);
+      k_refine_update_.setArg(arg++, capacity_);
+      k_refine_update_.setArg(arg++, cl_refine_grad_);
+      k_refine_update_.setArg(arg++, cl_refine_adam_);
+      k_refine_update_.setArg(arg++, min_weight_scaled);
+      k_refine_update_.setArg(arg++, voxel_size);
+      k_refine_update_.setArg(arg++, cur_lambda);
+      k_refine_update_.setArg(arg++, lr_sdf);
+      k_refine_update_.setArg(arg++, lr_color);
+      k_refine_update_.setArg(arg++, beta1);
+      k_refine_update_.setArg(arg++, beta2);
+      k_refine_update_.setArg(arg++, epsilon);
+      k_refine_update_.setArg(arg++, static_cast<cl_int>(iter));
+      k_refine_update_.setArg(arg++,
+                              static_cast<cl_int>(color_only ? 0 : 1));
+      queue.enqueueNDRangeKernel(k_refine_update_, cl::NullRange,
+                                 cl::NDRange(update_global),
+                                 cl::NDRange(256));
+      queue.finish();
+    }
+
+    cur_lambda *= lambda_decay;
+
+    if ((iter + 1) % 10 == 0 || iter == total_iters - 1) {
+      std::cerr << "[SVOIntegratorCL] Refine iter " << (iter + 1) << "/"
+                << total_iters << " ("
+                << (color_only ? "color-only" : "joint") << ")\n";
+    }
+  }
+
+  // Release refinement image buffers (no longer needed).
+  cl_color_images_ = cl::Buffer();
+  cl_depth_images_ = cl::Buffer();
+  cl_cameras_array_ = cl::Buffer();
+  cl_image_descs_ = cl::Buffer();
+  cl_refine_grad_ = cl::Buffer();
+  cl_refine_adam_ = cl::Buffer();
+  refine_prepared_ = false;
 }
 
 }  // namespace dense

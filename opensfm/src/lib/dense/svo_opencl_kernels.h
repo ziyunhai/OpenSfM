@@ -17,7 +17,7 @@
 namespace dense {
 
 inline const char* kSVOKernelSource =
-R"CL(
+    R"CL(
 
 // =====================================================================
 // Constants
@@ -339,7 +339,7 @@ __kernel void svo_integrate(
                         tsdf_fp, nx_fp, ny_fp, nz_fp, cr, cg, cb, w_int);
     }
 })CL"
-R"CL(
+    R"CL(
 
 // =====================================================================
 // Lightweight counting hash table (12 bytes/slot vs 48 for integration).
@@ -653,7 +653,722 @@ __kernel void svo_extract_points(
         out_colors[out_idx * 3 + 2] = (uchar)clamp(ba + t * (bb - ba), 0.0f, 255.0f);
     }
 })CL"
-R"CL(
+    R"CL(
+
+// =====================================================================
+// Photometric refinement kernels
+// =====================================================================
+
+// ---- Atomic float add via CAS loop ----
+void atomic_add_f(__global float* addr, float val) {
+    union { uint u; float f; } expected, desired;
+    expected.f = *addr;
+    do {
+        desired.f = expected.f + val;
+        uint old = atomic_cmpxchg((__global volatile uint*)addr,
+                                  expected.u, desired.u);
+        if (old == expected.u) break;
+        expected.u = old;
+    } while (true);
+}
+
+// Per-view image descriptor (must match host-side ImageDesc).
+typedef struct {
+    int width;
+    int height;
+    int color_offset;  // byte offset into packed color buffer (÷3 = pixel offset)
+    int depth_offset;  // pixel offset into packed depth buffer
+} RefineImageDesc;
+
+// ---- Trilinear SDF sampling ----
+// Decode the weighted-average TSDF from a hash table slot.
+float decode_tsdf(__global const VoxelSlot* table, uint slot_idx) {
+    float sw = (float)table[slot_idx].sum_weight;
+    if (sw < 1.0f) return 1.0f;  // empty → outside
+    return (float)table[slot_idx].sum_tsdf / (sw * (float)FP_SCALE);
+}
+
+// Sample TSDF at an arbitrary world-space point via trilinear interpolation.
+// Returns 1.0 if any of the 8 corner voxels are missing (unknown region).
+float sample_sdf_trilinear(
+    __global const VoxelSlot* table, uint mask,
+    float3 p, float inv_vs, float min_weight_scaled)
+{
+    // Fractional voxel coordinates.
+    float fx = p.x * inv_vs - 0.5f;
+    float fy = p.y * inv_vs - 0.5f;
+    float fz = p.z * inv_vs - 0.5f;
+    int ix = (int)floor(fx);
+    int iy = (int)floor(fy);
+    int iz = (int)floor(fz);
+    float tx = fx - (float)ix;
+    float ty = fy - (float)iy;
+    float tz = fz - (float)iz;
+
+    float vals[8];
+    int offsets[8][3] = {
+        {0,0,0}, {1,0,0}, {0,1,0}, {1,1,0},
+        {0,0,1}, {1,0,1}, {0,1,1}, {1,1,1}
+    };
+    for (int c = 0; c < 8; c++) {
+        uint si = hash_lookup(table, mask,
+                              ix + offsets[c][0],
+                              iy + offsets[c][1],
+                              iz + offsets[c][2]);
+        if (si == 0xFFFFFFFF) return 1.0f;
+        float sw = (float)table[si].sum_weight;
+        if (sw < min_weight_scaled) return 1.0f;
+        vals[c] = (float)table[si].sum_tsdf / (sw * (float)FP_SCALE);
+    }
+
+    // Trilinear interpolation.
+    float c00 = vals[0] * (1.0f - tx) + vals[1] * tx;
+    float c10 = vals[2] * (1.0f - tx) + vals[3] * tx;
+    float c01 = vals[4] * (1.0f - tx) + vals[5] * tx;
+    float c11 = vals[6] * (1.0f - tx) + vals[7] * tx;
+    float c0  = c00 * (1.0f - ty) + c10 * ty;
+    float c1  = c01 * (1.0f - ty) + c11 * ty;
+    return c0 * (1.0f - tz) + c1 * tz;
+}
+
+// ---- SDF gradient via central differences ----
+float3 compute_sdf_gradient(
+    __global const VoxelSlot* table, uint mask,
+    float3 p, float inv_vs, float eps, float min_weight_scaled)
+{
+    float3 grad;
+    grad.x = sample_sdf_trilinear(table, mask,
+                 p + (float3)(eps, 0.0f, 0.0f), inv_vs, min_weight_scaled)
+           - sample_sdf_trilinear(table, mask,
+                 p - (float3)(eps, 0.0f, 0.0f), inv_vs, min_weight_scaled);
+    grad.y = sample_sdf_trilinear(table, mask,
+                 p + (float3)(0.0f, eps, 0.0f), inv_vs, min_weight_scaled)
+           - sample_sdf_trilinear(table, mask,
+                 p - (float3)(0.0f, eps, 0.0f), inv_vs, min_weight_scaled);
+    grad.z = sample_sdf_trilinear(table, mask,
+                 p + (float3)(0.0f, 0.0f, eps), inv_vs, min_weight_scaled)
+           - sample_sdf_trilinear(table, mask,
+                 p - (float3)(0.0f, 0.0f, eps), inv_vs, min_weight_scaled);
+    return grad / (2.0f * eps);
+}
+
+// ---- Bilinear image sampling ----
+float3 sample_image_bilinear(
+    __global const uchar* images,
+    __global const RefineImageDesc* descs,
+    int view_idx, float u, float v)
+{
+    int w = descs[view_idx].width;
+    int h = descs[view_idx].height;
+    int base = descs[view_idx].color_offset;
+
+    // Clamp to image bounds.
+    float uf = clamp(u, 0.0f, (float)(w - 1));
+    float vf = clamp(v, 0.0f, (float)(h - 1));
+    int u0 = (int)floor(uf);
+    int v0 = (int)floor(vf);
+    int u1 = min(u0 + 1, w - 1);
+    int v1 = min(v0 + 1, h - 1);
+    float fu = uf - (float)u0;
+    float fv = vf - (float)v0;
+
+    #define PIX(uu, vv) (base + ((vv) * w + (uu)) * 3)
+    float r = (float)images[PIX(u0,v0)+0] * (1-fu)*(1-fv)
+            + (float)images[PIX(u1,v0)+0] * fu*(1-fv)
+            + (float)images[PIX(u0,v1)+0] * (1-fu)*fv
+            + (float)images[PIX(u1,v1)+0] * fu*fv;
+    float g = (float)images[PIX(u0,v0)+1] * (1-fu)*(1-fv)
+            + (float)images[PIX(u1,v0)+1] * fu*(1-fv)
+            + (float)images[PIX(u0,v1)+1] * (1-fu)*fv
+            + (float)images[PIX(u1,v1)+1] * fu*fv;
+    float b = (float)images[PIX(u0,v0)+2] * (1-fu)*(1-fv)
+            + (float)images[PIX(u1,v0)+2] * fu*(1-fv)
+            + (float)images[PIX(u0,v1)+2] * (1-fu)*fv
+            + (float)images[PIX(u1,v1)+2] * fu*fv;
+    #undef PIX
+    return (float3)(r, g, b);
+}
+
+// Sample depth from packed depth buffer (nearest neighbor).
+float sample_depth_nn(
+    __global const float* depths,
+    __global const RefineImageDesc* descs,
+    int view_idx, int u, int v)
+{
+    int w = descs[view_idx].width;
+    int base = descs[view_idx].depth_offset;
+    return depths[base + v * w + u];
+}
+
+// ---- Project a 3D point into a camera ----
+// Returns (u, v, z_cam). z_cam <= 0 means behind camera.
+float3 project_point(
+    __constant SVOCamera* cams, int view_idx,
+    float3 world_pt)
+{
+    __constant SVOCamera* cam = &cams[view_idx];
+    // World → camera: p_cam = R * world_pt + t
+    float3 p_cam;
+    p_cam.x = cam->R[0]*world_pt.x + cam->R[1]*world_pt.y + cam->R[2]*world_pt.z + cam->t[0];
+    p_cam.y = cam->R[3]*world_pt.x + cam->R[4]*world_pt.y + cam->R[5]*world_pt.z + cam->t[1];
+    p_cam.z = cam->R[6]*world_pt.x + cam->R[7]*world_pt.y + cam->R[8]*world_pt.z + cam->t[2];
+    if (p_cam.z <= 0.0f) return (float3)(0.0f, 0.0f, -1.0f);
+
+    // Camera → pixel: p_px = K * p_cam / z (but we have Kinv, not K).
+    // Recover K from Kinv: K = Kinv^{-1}. For a 3×3 upper-triangular intrinsics,
+    // we can use the projection directly: u = fx*X/Z + cx, v = fy*Y/Z + cy.
+    // But we only have Kinv stored. Use: (u,v,1)^T = (1/z) * K * p_cam_norm.
+    // Since Kinv * (u,v,1) = (X/Z, Y/Z, 1), we need K explicitly.
+    // Alternative: Kinv is the inverse of K. K = inv(Kinv).
+    // For a 3x3 matrix, compute inline:
+    __constant float* ki = cam->Kinv;  // row-major Kinv
+    // K = inv(Kinv). For upper triangular K, Kinv is also upper triangular.
+    // det(Kinv) = ki[0]*ki[4]*ki[8] (for upper triangular).
+    float det = ki[0]*(ki[4]*ki[8] - ki[5]*ki[7])
+              - ki[1]*(ki[3]*ki[8] - ki[5]*ki[6])
+              + ki[2]*(ki[3]*ki[7] - ki[4]*ki[6]);
+    if (fabs(det) < 1e-12f) return (float3)(0.0f, 0.0f, -1.0f);
+    float inv_det = 1.0f / det;
+
+    // Adjugate, transposed (cofactor matrix transpose) for row-major.
+    float K00 = (ki[4]*ki[8] - ki[5]*ki[7]) * inv_det;
+    float K01 = (ki[2]*ki[7] - ki[1]*ki[8]) * inv_det;
+    float K02 = (ki[1]*ki[5] - ki[2]*ki[4]) * inv_det;
+    float K10 = (ki[5]*ki[6] - ki[3]*ki[8]) * inv_det;
+    float K11 = (ki[0]*ki[8] - ki[2]*ki[6]) * inv_det;
+    float K12 = (ki[2]*ki[3] - ki[0]*ki[5]) * inv_det;
+
+    float inv_z = 1.0f / p_cam.z;
+    float u = (K00 * p_cam.x + K01 * p_cam.y + K02 * p_cam.z) * inv_z;
+    float v = (K10 * p_cam.x + K11 * p_cam.y + K12 * p_cam.z) * inv_z;
+    return (float3)(u, v, p_cam.z);
+}
+
+// ---- Image gradient (central differences) ----
+float2 image_gradient(
+    __global const uchar* images,
+    __global const RefineImageDesc* descs,
+    int view_idx, float u, float v)
+{
+    // Gradient of grayscale intensity (average of RGB channels).
+    float3 cp = sample_image_bilinear(images, descs, view_idx, u + 1.0f, v);
+    float3 cm = sample_image_bilinear(images, descs, view_idx, u - 1.0f, v);
+    float3 rp = sample_image_bilinear(images, descs, view_idx, u, v + 1.0f);
+    float3 rm = sample_image_bilinear(images, descs, view_idx, u, v - 1.0f);
+    float dx = ((cp.x + cp.y + cp.z) - (cm.x + cm.y + cm.z)) / 6.0f;
+    float dy = ((rp.x + rp.y + rp.z) - (rm.x + rm.y + rm.z)) / 6.0f;
+    return (float2)(dx, dy);
+}
+
+// ---- Per-channel image gradient (central differences) ----
+// Returns (dI_ch/du, dI_ch/dv) for a single channel (0=R, 1=G, 2=B).
+float2 image_gradient_channel(
+    __global const uchar* images,
+    __global const RefineImageDesc* descs,
+    int view_idx, float u, float v, int ch)
+{
+    float3 cp = sample_image_bilinear(images, descs, view_idx, u + 1.0f, v);
+    float3 cm = sample_image_bilinear(images, descs, view_idx, u - 1.0f, v);
+    float3 rp = sample_image_bilinear(images, descs, view_idx, u, v + 1.0f);
+    float3 rm = sample_image_bilinear(images, descs, view_idx, u, v - 1.0f);
+    float dx, dy;
+    if (ch == 0)      { dx = (cp.x - cm.x) * 0.5f; dy = (rp.x - rm.x) * 0.5f; }
+    else if (ch == 1) { dx = (cp.y - cm.y) * 0.5f; dy = (rp.y - rm.y) * 0.5f; }
+    else              { dx = (cp.z - cm.z) * 0.5f; dy = (rp.z - rm.z) * 0.5f; }
+    return (float2)(dx, dy);
+}
+
+// ---- Local patch statistics for affine normalization ----
+// Computes mean and inverse stddev of grayscale intensity over a 5×5 patch.
+// Returns (mean, inv_sigma). If sigma < threshold, returns inv_sigma = 0 (flat patch).
+float2 patch_stats(
+    __global const uchar* images,
+    __global const RefineImageDesc* descs,
+    int view_idx, float u, float v)
+{
+    float sum = 0.0f;
+    float sum_sq = 0.0f;
+    int count = 0;
+    for (int dy = -2; dy <= 2; dy++) {
+        for (int dx = -2; dx <= 2; dx++) {
+            float3 c = sample_image_bilinear(images, descs, view_idx,
+                                             u + (float)dx, v + (float)dy);
+            float gray = (c.x + c.y + c.z) * 0.333333f;
+            sum += gray;
+            sum_sq += gray * gray;
+            count++;
+        }
+    }
+    float mean = sum / (float)count;
+    float var = sum_sq / (float)count - mean * mean;
+    float sigma = sqrt(fmax(var, 0.0f));
+    float inv_sigma = (sigma > 3.0f) ? (1.0f / sigma) : 0.0f;  // flat patch guard
+    return (float2)(mean, inv_sigma);
+}
+
+)CL"
+    R"CL(
+
+// =====================================================================
+// svo_refine_clear — zero gradient + Adam buffers
+// =====================================================================
+__kernel void svo_refine_clear(
+    __global float* grad_buf,    // 4 floats per slot
+    __global float* adam_buf,    // 8 floats per slot
+    uint capacity,
+    int clear_adam)              // 1 = also clear Adam state
+{
+    uint i = get_global_id(0);
+    if (i >= capacity) return;
+    grad_buf[i * 4 + 0] = 0.0f;
+    grad_buf[i * 4 + 1] = 0.0f;
+    grad_buf[i * 4 + 2] = 0.0f;
+    grad_buf[i * 4 + 3] = 0.0f;
+    if (clear_adam) {
+        for (int j = 0; j < 8; j++) adam_buf[i * 8 + j] = 0.0f;
+    }
+}
+
+// =====================================================================
+// svo_refine_accumulate — per-pixel gradient accumulation
+//
+// Dispatched once per camera view: global_size = (cols_pad, rows_pad).
+// For each pixel, ray-march to find the zero crossing, then project the
+// surface point into all OTHER views and compute photometric gradient.
+// =====================================================================
+__kernel void svo_refine_accumulate(
+    __global const VoxelSlot* table,
+    uint                      capacity_mask,
+    __global float*           grad_buf,       // 4 floats per slot
+    __global const uchar*     color_images,   // packed RGB
+    __global const float*     depth_images,   // packed depths
+    __constant SVOCamera*     cameras,        // N cameras (constant memory)
+    __global const RefineImageDesc* img_descs,
+    int                       n_views,
+    int                       src_view,       // which camera we're ray-casting from
+    float                     voxel_size,
+    float                     inv_voxel_size,
+    float                     trunc_dist,
+    float                     min_weight_scaled,
+    int                       color_only)     // 1 = skip SDF gradient
+{
+    int col = get_global_id(0);
+    int row = get_global_id(1);
+    int src_w = img_descs[src_view].width;
+    int src_h = img_descs[src_view].height;
+    if (col >= src_w || row >= src_h) return;
+
+    // Border margin: 5×5 patch needs ±2, plus ±1 for gradient = ±3 total.
+    if (col < 3 || col >= src_w - 3 || row < 3 || row >= src_h - 3) return;
+
+    // Check depth — skip if no valid depth at this pixel.
+    float d = sample_depth_nn(depth_images, img_descs, src_view, col, row);
+    if (d <= 0.0f) return;
+
+    // ---- Back-project pixel to world ----
+    __constant SVOCamera* cam = &cameras[src_view];
+    float uc = (float)col, vr = (float)row;
+    float3 p_cam;
+    p_cam.x = d * (cam->Kinv[0]*uc + cam->Kinv[1]*vr + cam->Kinv[2]);
+    p_cam.y = d * (cam->Kinv[3]*uc + cam->Kinv[4]*vr + cam->Kinv[5]);
+    p_cam.z = d * (cam->Kinv[6]*uc + cam->Kinv[7]*vr + cam->Kinv[8]);
+
+    float3 diff = (float3)(p_cam.x - cam->t[0],
+                           p_cam.y - cam->t[1],
+                           p_cam.z - cam->t[2]);
+    float3 p_world;
+    p_world.x = cam->Rinv[0]*diff.x + cam->Rinv[1]*diff.y + cam->Rinv[2]*diff.z;
+    p_world.y = cam->Rinv[3]*diff.x + cam->Rinv[4]*diff.y + cam->Rinv[5]*diff.z;
+    p_world.z = cam->Rinv[6]*diff.x + cam->Rinv[7]*diff.y + cam->Rinv[8]*diff.z;
+
+    float3 cp = (float3)(cam->cam_pos[0], cam->cam_pos[1], cam->cam_pos[2]);
+    float3 ray = p_world - cp;
+    float ray_len = length(ray);
+    if (ray_len < 1e-8f) return;
+    ray /= ray_len;
+
+    // ---- Ray-march: sphere stepping to find sign change ----
+    float min_step = 0.5f * voxel_size;
+    float max_step = 2.0f * voxel_size;
+    float t_start = fmax(0.0f, ray_len - trunc_dist);
+    float t_end   = ray_len + trunc_dist;
+
+    float tt = t_start;
+    float sdf_prev = sample_sdf_trilinear(table, capacity_mask,
+                         cp + tt * ray, inv_voxel_size, min_weight_scaled);
+    float t_prev = tt;
+    bool found = false;
+
+    #define REFINE_MAX_STEPS 64
+    for (int step = 0; step < REFINE_MAX_STEPS; step++) {
+        float sdf_cur = sample_sdf_trilinear(table, capacity_mask,
+                            cp + tt * ray, inv_voxel_size, min_weight_scaled);
+        if (sdf_cur < 0.0f && sdf_prev > 0.0f) {
+            found = true;
+            break;
+        }
+        t_prev = tt;
+        sdf_prev = sdf_cur;
+        float step_sz = clamp(fabs(sdf_cur) * voxel_size, min_step, max_step);
+        tt += step_sz;
+        if (tt > t_end) break;
+    }
+    if (!found) return;
+
+    // ---- Regula falsi sub-voxel refinement ----
+    float t_a = t_prev, f_a = sdf_prev;
+    float t_b = tt, f_b = sample_sdf_trilinear(table, capacity_mask,
+                               cp + tt * ray, inv_voxel_size, min_weight_scaled);
+    for (int i = 0; i < 4; i++) {
+        float denom = f_b - f_a;
+        if (fabs(denom) < 1e-10f) break;
+        float t_m = t_a - f_a * (t_b - t_a) / denom;
+        float f_m = sample_sdf_trilinear(table, capacity_mask,
+                        cp + t_m * ray, inv_voxel_size, min_weight_scaled);
+        if (f_m * f_a < 0.0f) { t_b = t_m; f_b = f_m; }
+        else                   { t_a = t_m; f_a = f_m; }
+    }
+    float t_surface = t_a - f_a * (t_b - t_a) / (f_b - f_a + 1e-10f);
+    float3 x_surface = cp + t_surface * ray;
+
+    // ---- Compute trilinear weights and slot indices for 8 corners ----
+    float fx = x_surface.x * inv_voxel_size - 0.5f;
+    float fy = x_surface.y * inv_voxel_size - 0.5f;
+    float fz = x_surface.z * inv_voxel_size - 0.5f;
+    int ix = (int)floor(fx);
+    int iy = (int)floor(fy);
+    int iz = (int)floor(fz);
+    float tx = fx - (float)ix;
+    float ty = fy - (float)iy;
+    float tz = fz - (float)iz;
+
+    float weights[8];
+    uint slots[8];
+    int corner_dx[8] = {0,1,0,1,0,1,0,1};
+    int corner_dy[8] = {0,0,1,1,0,0,1,1};
+    int corner_dz[8] = {0,0,0,0,1,1,1,1};
+
+    bool all_valid = true;
+    for (int c = 0; c < 8; c++) {
+        slots[c] = hash_lookup(table, capacity_mask,
+                               ix + corner_dx[c],
+                               iy + corner_dy[c],
+                               iz + corner_dz[c]);
+        if (slots[c] == 0xFFFFFFFF) { all_valid = false; break; }
+
+        float wx = corner_dx[c] ? tx : (1.0f - tx);
+        float wy = corner_dy[c] ? ty : (1.0f - ty);
+        float wz = corner_dz[c] ? tz : (1.0f - tz);
+        weights[c] = wx * wy * wz;
+    }
+    if (!all_valid) return;
+
+    // ---- Surface normal via central-difference SDF gradient ----
+    float eps = 0.5f * voxel_size;
+    float3 grad_sdf = compute_sdf_gradient(table, capacity_mask,
+                          x_surface, inv_voxel_size, eps, min_weight_scaled);
+    float grad_len = length(grad_sdf);
+    if (grad_len < 1e-6f) return;
+    float3 normal = grad_sdf / grad_len;
+
+    // ---- Source camera patch statistics for affine normalization ----
+    float2 src_stats = patch_stats(color_images, img_descs,
+                                   src_view, (float)col, (float)row);
+    float src_mean = src_stats.x;
+    float src_inv_sigma = src_stats.y;
+    if (src_inv_sigma == 0.0f) return;  // flat patch — no photometric information
+
+    float3 src_color = sample_image_bilinear(color_images, img_descs,
+                                             src_view, (float)col, (float)row);
+
+    // ---- Accumulate photometric gradient from other views ----
+    float total_grad_d = 0.0f;
+    float total_grad_r = 0.0f;
+    float total_grad_g = 0.0f;
+    float total_grad_b = 0.0f;
+    int n_valid_views = 0;
+
+    for (int j = 0; j < n_views; j++) {
+        if (j == src_view) continue;
+
+        // Project surface point into view j.
+        float3 proj = project_point(cameras, j, x_surface);
+        if (proj.z <= 0.0f) continue;
+
+        int jw = img_descs[j].width;
+        int jh = img_descs[j].height;
+        if (proj.x < 4.0f || proj.x >= (float)(jw - 4) ||
+            proj.y < 4.0f || proj.y >= (float)(jh - 4)) continue;
+
+        // Depth-buffer visibility check.
+        float stored_depth = sample_depth_nn(depth_images, img_descs, j,
+                                            (int)(proj.x + 0.5f),
+                                            (int)(proj.y + 0.5f));
+        if (stored_depth > 0.0f && proj.z > stored_depth * 1.05f) continue;
+
+        // Viewing angle check.
+        float3 cam_j_pos = (float3)(cameras[j].cam_pos[0],
+                                    cameras[j].cam_pos[1],
+                                    cameras[j].cam_pos[2]);
+        float3 ray_j = normalize(x_surface - cam_j_pos);
+        float cos_angle = fabs(dot(normal, ray_j));
+        if (cos_angle < 0.15f) continue;  // grazing angle
+
+        // ---- Affine-normalized patch comparison ----
+        float2 dst_stats = patch_stats(color_images, img_descs,
+                                       j, proj.x, proj.y);
+        float dst_inv_sigma = dst_stats.y;
+        if (dst_inv_sigma == 0.0f) continue;  // flat patch in target view
+
+        float3 dst_color = sample_image_bilinear(color_images, img_descs,
+                                                 j, proj.x, proj.y);
+
+        // Normalized colors: (I - μ) / σ → affine-invariant comparison.
+        float src_gray = (src_color.x + src_color.y + src_color.z) * 0.333333f;
+        float dst_gray = (dst_color.x + dst_color.y + dst_color.z) * 0.333333f;
+        float src_norm = (src_gray - src_mean) * src_inv_sigma;
+        float dst_norm = (dst_gray - dst_stats.x) * dst_inv_sigma;
+
+        // Affine-normalized residual (scalar, for SDF gradient).
+        float norm_residual = dst_norm - src_norm;
+
+        // Raw color residual (for color gradient — keeps color info).
+        float3 residual = dst_color - src_color;
+        float r2 = residual.x * residual.x + residual.y * residual.y
+                 + residual.z * residual.z;
+        float sigma2 = 400.0f;
+        float cauchy_w = 2.0f / (sigma2 + r2);
+
+        // Color gradient: push voxel color toward consensus.
+        total_grad_r += cauchy_w * residual.x * cos_angle;
+        total_grad_g += cauchy_w * residual.y * cos_angle;
+        total_grad_b += cauchy_w * residual.z * cos_angle;
+
+        if (!color_only) {
+            // ---- Per-channel SDF gradient with affine-normalized loss ----
+            float inv_z = 1.0f / proj.z;
+            float fx_j = 1.0f / (cameras[j].Kinv[0] + 1e-10f);
+            float fy_j = 1.0f / (cameras[j].Kinv[4] + 1e-10f);
+
+            // Normal in camera j coordinates.
+            float3 n_cam;
+            n_cam.x = cameras[j].R[0]*normal.x + cameras[j].R[1]*normal.y + cameras[j].R[2]*normal.z;
+            n_cam.y = cameras[j].R[3]*normal.x + cameras[j].R[4]*normal.y + cameras[j].R[5]*normal.z;
+
+            float du_dn = fx_j * inv_z * n_cam.x;
+            float dv_dn = fy_j * inv_z * n_cam.y;
+
+            // Per-channel image gradient → per-channel projected normal derivative.
+            // ∂E/∂d = Σ_ch [ ∂ρ/∂r_ch × ∇I_j_ch · (du_dn, dv_dn) ] / |∇D|
+            float s = 0.0f;
+            for (int ch = 0; ch < 3; ch++) {
+                float2 ig = image_gradient_channel(color_images, img_descs,
+                                                   j, proj.x, proj.y, ch);
+                float grad_proj = ig.x * du_dn + ig.y * dv_dn;
+                // Affine-normalized: scale image gradient by dst_inv_sigma.
+                grad_proj *= dst_inv_sigma;
+                // Cauchy on normalized residual (per-channel approximation).
+                float nr2 = norm_residual * norm_residual;
+                float cauchy_nr = 2.0f * norm_residual / (1.0f + nr2);
+                s += cauchy_nr * grad_proj;
+            }
+            s /= (3.0f * (grad_len + 1e-6f));
+
+            total_grad_d += s * cos_angle;
+        }
+
+        n_valid_views++;
+    }
+
+    if (n_valid_views == 0) return;
+
+    // Normalize by number of valid view pairs.
+    float inv_n = 1.0f / (float)n_valid_views;
+    total_grad_d *= inv_n;
+    total_grad_r *= inv_n;
+    total_grad_g *= inv_n;
+    total_grad_b *= inv_n;
+
+    // ---- Distribute gradients to 8 corner voxels ----
+    for (int c = 0; c < 8; c++) {
+        float w = weights[c];
+        if (w < 1e-8f) continue;
+        uint si = slots[c];
+
+        // Atomic float add via CAS loop — prevents race-condition gradient loss.
+        atomic_add_f(&grad_buf[si * 4 + 0], w * total_grad_d);
+        atomic_add_f(&grad_buf[si * 4 + 1], w * total_grad_r);
+        atomic_add_f(&grad_buf[si * 4 + 2], w * total_grad_g);
+        atomic_add_f(&grad_buf[si * 4 + 3], w * total_grad_b);
+    }
+}
+
+)CL"
+    R"CL(
+
+// =====================================================================
+// svo_refine_update — Adam update + Laplacian regularization
+//
+// One work-item per hash table slot.
+// =====================================================================
+__kernel void svo_refine_update(
+    __global VoxelSlot*   table,
+    uint                  capacity_mask,
+    uint                  capacity,
+    __global float*       grad_buf,       // 4 floats per slot
+    __global float*       adam_buf,       // 8 floats per slot
+    float                 min_weight_scaled,
+    float                 voxel_size,
+    float                 lambda_reg,
+    float                 lr_sdf,
+    float                 lr_color,
+    float                 beta1,
+    float                 beta2,
+    float                 epsilon,
+    int                   iteration,       // for Adam bias correction
+    int                   update_sdf)      // 0 = color only, 1 = joint
+{
+    uint i = get_global_id(0);
+    if (i >= capacity) return;
+
+    uint key_ab = table[i].key_ab;
+    if (key_ab == EMPTY_KEY) return;
+    if (table[i].count == 0) return;
+
+    float sw = (float)table[i].sum_weight;
+    if (sw < min_weight_scaled) return;
+
+    // Only update near-surface voxels (|TSDF| < 1.5 voxel band).
+    float inv_fp_sw = 1.0f / (sw * (float)FP_SCALE);
+    float tsdf = (float)table[i].sum_tsdf * inv_fp_sw;
+    if (fabs(tsdf) > 0.5f) return;  // far from surface
+
+    // Read accumulated gradients.
+    float grad_d = grad_buf[i * 4 + 0];
+    float grad_r = grad_buf[i * 4 + 1];
+    float grad_g = grad_buf[i * 4 + 2];
+    float grad_b = grad_buf[i * 4 + 3];
+
+    // Clear gradient buffer for next iteration.
+    grad_buf[i * 4 + 0] = 0.0f;
+    grad_buf[i * 4 + 1] = 0.0f;
+    grad_buf[i * 4 + 2] = 0.0f;
+    grad_buf[i * 4 + 3] = 0.0f;
+
+    // Skip if no gradient was accumulated.
+    float photo_d_mag = fabs(grad_d);
+    if (photo_d_mag + fabs(grad_r) + fabs(grad_g) + fabs(grad_b) < 1e-10f) return;
+
+    int kx = (int)((key_ab >> 16) & 0xFFFF) - 32768;
+    int ky = (int)(key_ab & 0xFFFF) - 32768;
+    int kz = table[i].key_c;
+
+    // ---- Laplacian regularization on SDF ----
+    // Only apply if this voxel received photometric SDF gradient (avoids
+    // unconditional smoothing of voxels not hit by any ray this iteration).
+    if (update_sdf && lambda_reg > 0.0f && photo_d_mag > 1e-10f) {
+        float neighbor_sum = 0.0f;
+        int n_nbrs = 0;
+        int dx[6] = {1,-1,0,0,0,0};
+        int dy[6] = {0,0,1,-1,0,0};
+        int dz[6] = {0,0,0,0,1,-1};
+        for (int nb = 0; nb < 6; nb++) {
+            uint ni = hash_lookup(table, capacity_mask,
+                                  kx + dx[nb], ky + dy[nb], kz + dz[nb]);
+            if (ni == 0xFFFFFFFF) continue;
+            float nsw = (float)table[ni].sum_weight;
+            if (nsw < min_weight_scaled) continue;
+            float ntsdf = (float)table[ni].sum_tsdf / (nsw * (float)FP_SCALE);
+            neighbor_sum += ntsdf;
+            n_nbrs++;
+        }
+        if (n_nbrs > 0) {
+            float laplacian = tsdf - neighbor_sum / (float)n_nbrs;
+            grad_d += lambda_reg * 2.0f * laplacian;
+        }
+    }
+
+    // ---- Weight-scaled learning rate ----
+    float weight_factor = 1.0f / (1.0f + 0.002f * sw / (float)WEIGHT_SCALE);
+    float lr_d_eff = lr_sdf * weight_factor;
+    float lr_c_eff = lr_color * weight_factor;
+
+    // ---- Adam update ----
+    int t_adam = iteration + 1;
+    float bc1 = 1.0f - pown(beta1, t_adam);
+    float bc2 = 1.0f - pown(beta2, t_adam);
+
+    __global float* adam = &adam_buf[i * 8];
+
+    if (update_sdf) {
+        // Adam on SDF: indices 0 (m_d) and 1 (v_d).
+        adam[0] = beta1 * adam[0] + (1.0f - beta1) * grad_d;
+        adam[1] = beta2 * adam[1] + (1.0f - beta2) * grad_d * grad_d;
+        float m_hat = adam[0] / bc1;
+        float v_hat = adam[1] / bc2;
+        float delta_d = lr_d_eff * m_hat / (sqrt(v_hat) + epsilon);
+
+        // Update TSDF value.
+        float new_tsdf = clamp(tsdf - delta_d, -1.0f, 1.0f);
+        int new_sum_tsdf = (int)(new_tsdf * sw * (float)FP_SCALE);
+        table[i].sum_tsdf = new_sum_tsdf;
+    }
+
+    // Adam on color: indices 2-7 (m_r, v_r, m_g, v_g, m_b, v_b).
+    float inv_sw = 1.0f / sw;
+    float cur_r = (float)table[i].sum_r * inv_sw;
+    float cur_g = (float)table[i].sum_g * inv_sw;
+    float cur_b = (float)table[i].sum_b * inv_sw;
+
+    // ---- Laplacian regularization on color ----
+    // if (lambda_reg > 0.0f) {
+    //     float nbr_r = 0.0f, nbr_g = 0.0f, nbr_b = 0.0f;
+    //     int n_nbrs_c = 0;
+    //     int dx[6] = {1,-1,0,0,0,0};
+    //     int dy[6] = {0,0,1,-1,0,0};
+    //     int dz[6] = {0,0,0,0,1,-1};
+    //     for (int nb = 0; nb < 6; nb++) {
+    //         uint ni = hash_lookup(table, capacity_mask,
+    //                               kx + dx[nb], ky + dy[nb], kz + dz[nb]);
+    //         if (ni == 0xFFFFFFFF) continue;
+    //         float nsw = (float)table[ni].sum_weight;
+    //         if (nsw < min_weight_scaled) continue;
+    //         float inv_nsw = 1.0f / nsw;
+    //         nbr_r += (float)table[ni].sum_r * inv_nsw;
+    //         nbr_g += (float)table[ni].sum_g * inv_nsw;
+    //         nbr_b += (float)table[ni].sum_b * inv_nsw;
+    //         n_nbrs_c++;
+    //     }
+    //     if (n_nbrs_c > 0) {
+    //         float inv_n = 1.0f / (float)n_nbrs_c;
+    //         // Color regularization: 0.1× the SDF lambda (lighter touch).
+    //         float lambda_c = lambda_reg * 0.1f;
+    //         grad_r += lambda_c * 2.0f * (cur_r - nbr_r * inv_n);
+    //         grad_g += lambda_c * 2.0f * (cur_g - nbr_g * inv_n);
+    //         grad_b += lambda_c * 2.0f * (cur_b - nbr_b * inv_n);
+    //     }
+    // }
+
+    float grads_c[3] = {grad_r, grad_g, grad_b};
+    float curs_c[3] = {cur_r, cur_g, cur_b};
+    int sums_c[3];
+
+    for (int ch = 0; ch < 3; ch++) {
+        int mi = 2 + ch * 2;
+        int vi = 3 + ch * 2;
+        adam[mi] = beta1 * adam[mi] + (1.0f - beta1) * grads_c[ch];
+        adam[vi] = beta2 * adam[vi] + (1.0f - beta2) * grads_c[ch] * grads_c[ch];
+        float mh = adam[mi] / bc1;
+        float vh = adam[vi] / bc2;
+        float delta_c = lr_c_eff * mh / (sqrt(vh) + epsilon);
+        float new_c = clamp(curs_c[ch] - delta_c, 0.0f, 255.0f);
+        sums_c[ch] = (int)(new_c * sw);
+    }
+
+    table[i].sum_r = sums_c[0];
+    table[i].sum_g = sums_c[1];
+    table[i].sum_b = sums_c[2];
+}
 
 )CL";
 

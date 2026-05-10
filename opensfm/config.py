@@ -481,7 +481,7 @@ class OpenSfMConfig:
     # SVO truncation factor: truncation_distance = factor * voxel_size.
     depthmap_fusion_svo_trunc_factor: float = 12
     # SVO minimum weight for extracting points
-    depthmap_fusion_svo_min_weight: float = 4
+    depthmap_fusion_svo_min_weight: float = 3
     # Maximum unique voxels per SVO sub-volume.
     # Clusters are spatially split so each piece stays within this budget.
     # The GPU hash table is sized to 2x this (50% load factor).
@@ -494,6 +494,15 @@ class OpenSfMConfig:
     depthmap_fusion_svo_coarse_factor: int = 8
     # Relative margin added to each side of the per-cluster bounding box
     depthmap_cluster_bbox_margin: float = 0.01
+    # Photometric TSDF refinement (Zollhöfer 2015 / Pons-Keriven 2007).
+    # Enable in-place SDF+color refinement after SVO fusion.
+    depthmap_fusion_svo_refine_enabled: bool = True
+    # Number of color-only refinement iterations (phase 1).
+    depthmap_fusion_svo_refine_color_iters: int = 20
+    # Number of joint SDF+color iterations (phase 2).
+    depthmap_fusion_svo_refine_joint_iters: int = 30
+    # Initial Laplacian regularization weight (decayed ×0.95/iter).
+    depthmap_fusion_svo_refine_lambda_reg: float = 0.01
 
     ##################################
     # Params for octree point cloud tiling (viewer streaming)

@@ -1604,7 +1604,25 @@ def _fuse_per_cluster(
                     return
 
                 # Voxels within budget — proceed with integration.
-                pts_arr, nrm_arr, clr_arr = fuser.fuse()
+                refine_enabled = config[
+                    "depthmap_fusion_svo_refine_enabled"
+                ]
+                if refine_enabled:
+                    fuser.fuse_only()
+                    fuser.refine(
+                        color_iters=config[
+                            "depthmap_fusion_svo_refine_color_iters"
+                        ],
+                        joint_iters=config[
+                            "depthmap_fusion_svo_refine_joint_iters"
+                        ],
+                        lambda_reg=config[
+                            "depthmap_fusion_svo_refine_lambda_reg"
+                        ],
+                    )
+                    pts_arr, nrm_arr, clr_arr = fuser.extract_points()
+                else:
+                    pts_arr, nrm_arr, clr_arr = fuser.fuse()
                 pts = np.asarray(pts_arr, dtype=np.float32)
                 nrm = np.asarray(nrm_arr, dtype=np.float32)
                 clr = np.asarray(clr_arr, dtype=np.uint8)

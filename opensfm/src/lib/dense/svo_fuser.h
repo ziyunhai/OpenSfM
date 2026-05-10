@@ -8,15 +8,21 @@
 
 namespace dense {
 
+// Forward-declare so we don't pull in OpenCL headers here.
+class SVOIntegratorCL;
+
 // SVOFuser: TSDF-based depthmap fusion on GPU via OpenCL.
 //
-// Usage: AddView() → CountVoxels() → Fuse().
+// Usage: AddView() → CountVoxels() → Fuse() → [Refine()] → ExtractPoints().
 // CountVoxels() must be called before Fuse() so the caller can check
 // the voxel budget and split if necessary.
+// After Fuse(), the hash table remains on GPU. Optionally call Refine()
+// for photometric refinement, then ExtractPoints() to get the result.
 
 class SVOFuser {
  public:
   SVOFuser();
+  ~SVOFuser();
 
   // ------- Parameters -------
   void SetVoxelSize(float size);
@@ -38,9 +44,25 @@ class SVOFuser {
   // Must be called before Fuse().
   uint32_t CountVoxels();
 
-  // Integrate all views and extract surface points.
+  // Integrate all views into the GPU hash table.
+  // The hash table remains alive for Refine() and ExtractPoints().
   // Throws if CountVoxels() was not called first.
-  void Fuse(std::vector<Vec3f>* fused_points, std::vector<Vec3f>* fused_normals,
+  void Fuse();
+
+  // Photometric refinement on the GPU hash table (in-place).
+  // Phase 1: color-only (color_iters), Phase 2: joint SDF+color (joint_iters).
+  // Must be called after Fuse().
+  void Refine(int color_iters, int joint_iters, float lambda_reg);
+
+  // Extract surface points from the (possibly refined) hash table.
+  // Returns [points, normals, colors].
+  void ExtractPoints(std::vector<Vec3f>* fused_points,
+                     std::vector<Vec3f>* fused_normals,
+                     std::vector<Vec3<uint8_t>>* fused_colors);
+
+  // Legacy API: Fuse + ExtractPoints in one call (backward compat).
+  void Fuse(std::vector<Vec3f>* fused_points,
+            std::vector<Vec3f>* fused_normals,
             std::vector<Vec3<uint8_t>>* fused_colors);
 
  private:
@@ -65,6 +87,9 @@ class SVOFuser {
   bool has_bbox_ = false;
   Eigen::Vector3f bbox_min_world_ = Eigen::Vector3f::Zero();
   Eigen::Vector3f bbox_max_world_ = Eigen::Vector3f::Zero();
+
+  // GPU integrator kept alive between Fuse() and Refine()/ExtractPoints().
+  std::unique_ptr<SVOIntegratorCL> integrator_;
 };
 
 }  // namespace dense

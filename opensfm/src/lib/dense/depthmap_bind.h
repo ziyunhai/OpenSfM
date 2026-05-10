@@ -353,6 +353,35 @@ class SVOFuserWrapper {
     return retn;
   }
 
+  // Split API: Fuse (no extract), Refine, ExtractPoints.
+  void FuseOnly() {
+    py::gil_scoped_release release;
+    sf_.Fuse();
+  }
+
+  void Refine(int color_iters, int joint_iters, float lambda_reg) {
+    py::gil_scoped_release release;
+    sf_.Refine(color_iters, joint_iters, lambda_reg);
+  }
+
+  py::list ExtractPoints() {
+    std::vector<Vec3f> points;
+    std::vector<Vec3f> normals;
+    std::vector<Vec3<uint8_t>> colors;
+
+    {
+      py::gil_scoped_release release;
+      sf_.ExtractPoints(&points, &normals, &colors);
+    }
+
+    const int n = static_cast<int>(points.size());
+    py::list retn;
+    retn.append(foundation::py_array_from_data(points.data()->data(), n, 3));
+    retn.append(foundation::py_array_from_data(normals.data()->data(), n, 3));
+    retn.append(foundation::py_array_from_data(colors.data()->data(), n, 3));
+    return retn;
+  }
+
  private:
   SVOFuser sf_;
 };

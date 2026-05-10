@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 
@@ -11,6 +12,8 @@ namespace dense {
 
 SVOFuser::SVOFuser()
     : voxel_size_(0.02f), trunc_factor_(4.0f), min_weight_(3.0f) {}
+
+SVOFuser::~SVOFuser() = default;
 
 void SVOFuser::SetVoxelSize(float size) { voxel_size_ = std::max(1e-6f, size); }
 
@@ -108,13 +111,7 @@ uint32_t SVOFuser::CountVoxels() {
   return n_unique;
 }
 
-void SVOFuser::Fuse(std::vector<Vec3f>* fused_points,
-                    std::vector<Vec3f>* fused_normals,
-                    std::vector<Vec3<uint8_t>>* fused_colors) {
-  fused_points->clear();
-  fused_normals->clear();
-  fused_colors->clear();
-
+void SVOFuser::Fuse() {
   if (views_.empty()) {
     return;
   }
@@ -130,8 +127,6 @@ void SVOFuser::Fuse(std::vector<Vec3f>* fused_points,
   }
 
   const float trunc_dist = trunc_factor_ * voxel_size_;
-
-  // Convert world-space bbox to voxel integer coordinates once.
   const float inv_vs = 1.0f / voxel_size_;
   Eigen::Vector3i bbox_min_v, bbox_max_v;
   if (has_bbox_) {
@@ -142,7 +137,6 @@ void SVOFuser::Fuse(std::vector<Vec3f>* fused_points,
   const Eigen::Vector3i* bbox_min_ptr = has_bbox_ ? &bbox_min_v : nullptr;
   const Eigen::Vector3i* bbox_max_ptr = has_bbox_ ? &bbox_max_v : nullptr;
 
-  // Allocate at 2× the counted size for ~50% load factor.
   uint32_t capacity = static_cast<uint32_t>(
       std::min<uint64_t>(static_cast<uint64_t>(last_voxel_count_) * 2,
                          std::numeric_limits<uint32_t>::max()));
@@ -150,8 +144,8 @@ void SVOFuser::Fuse(std::vector<Vec3f>* fused_points,
   std::cerr << "[SVOFuser] Voxel count " << last_voxel_count_ << " → capacity "
             << capacity << "\n";
 
-  SVOIntegratorCL integrator(device_idx_);
-  integrator.Initialize(capacity);
+  integrator_ = std::make_unique<SVOIntegratorCL>(device_idx_);
+  integrator_->Initialize(capacity);
 
   for (size_t i = 0; i < views_.size(); ++i) {
     const auto& sv = views_[i];
@@ -168,17 +162,136 @@ void SVOFuser::Fuse(std::vector<Vec3f>* fused_points,
     const float* weight_ptr =
         (sv.weight.size() > 0) ? sv.weight.data() : nullptr;
 
-    integrator.Integrate(Kf, Rf, tf, sv.depth.data(), rows, cols, normal_ptr,
-                         color_ptr, mask_ptr, weight_ptr, voxel_size_,
-                         trunc_dist, bbox_min_ptr, bbox_max_ptr);
+    integrator_->Integrate(Kf, Rf, tf, sv.depth.data(), rows, cols, normal_ptr,
+                           color_ptr, mask_ptr, weight_ptr, voxel_size_,
+                           trunc_dist, bbox_min_ptr, bbox_max_ptr);
   }
 
-  {
-    integrator.ExtractPoints(min_weight_, voxel_size_, fused_points,
-                             fused_normals, fused_colors);
-    std::cerr << "[SVOFuser] GPU ExtractPoints: " << fused_points->size()
-              << " surface points\n";
+  std::cerr << "[SVOFuser] Fuse complete, hash table alive on GPU\n";
+}
+
+void SVOFuser::Refine(int color_iters, int joint_iters, float lambda_reg) {
+  if (!integrator_) {
+    throw std::runtime_error(
+        "SVOFuser::Refine: Fuse() must be called before Refine()");
   }
+  if (views_.empty()) {
+    return;
+  }
+
+  const float trunc_dist = trunc_factor_ * voxel_size_;
+  const int n_views = static_cast<int>(views_.size());
+
+  // Build packed camera array.
+  std::vector<SVOCameraGPU> cameras(n_views);
+  for (int i = 0; i < n_views; ++i) {
+    const auto& sv = views_[i];
+    const Mat3f Kf = sv.K.cast<float>();
+    const Mat3f Rf = sv.R.cast<float>();
+    const Vec3f tf = sv.t.cast<float>();
+    const Mat3f Kinv = Kf.inverse();
+    const Mat3f Rinv = Rf.transpose();
+    const Vec3f cam_pos = -Rinv * tf;
+
+    // ColMajor M^T data == RowMajor M data.
+    auto to_row_major = [](const Mat3f& M, float* out) {
+      const Mat3f Mt = M.transpose();
+      std::memcpy(out, Mt.data(), 9 * sizeof(float));
+    };
+
+    SVOCameraGPU& cam = cameras[i];
+    to_row_major(Kinv, cam.Kinv);
+    to_row_major(Rinv, cam.Rinv);
+    to_row_major(Rf, cam.R);
+    cam.t[0] = tf.x(); cam.t[1] = tf.y(); cam.t[2] = tf.z();
+    cam.cam_pos[0] = cam_pos.x();
+    cam.cam_pos[1] = cam_pos.y();
+    cam.cam_pos[2] = cam_pos.z();
+    cam._pad[0] = cam._pad[1] = cam._pad[2] = 0.0f;
+  }
+
+  // Build packed color images and depth maps, plus descriptors.
+  std::vector<SVOIntegratorCL::ImageDesc> descs(n_views);
+  std::vector<uint8_t> packed_colors;
+  std::vector<float> packed_depths;
+  size_t color_offset = 0;
+  size_t depth_offset = 0;
+  for (int i = 0; i < n_views; ++i) {
+    const auto& sv = views_[i];
+    const int h = static_cast<int>(sv.depth.rows());
+    const int w = static_cast<int>(sv.depth.cols());
+    const size_t npix = static_cast<size_t>(h) * w;
+
+    descs[i].width = w;
+    descs[i].height = h;
+    descs[i].offset = static_cast<int32_t>(color_offset);
+    descs[i]._pad = static_cast<int32_t>(depth_offset);
+
+    // Color: 3 bytes per pixel (interleaved RGB).
+    if (sv.color.size() > 0) {
+      // PixelData3u8 is (3, h*w) ColMajor → need to interleave to (h*w, 3).
+      const size_t old_size = packed_colors.size();
+      packed_colors.resize(old_size + npix * 3);
+      for (size_t p = 0; p < npix; ++p) {
+        packed_colors[old_size + p * 3 + 0] = sv.color(0, p);
+        packed_colors[old_size + p * 3 + 1] = sv.color(1, p);
+        packed_colors[old_size + p * 3 + 2] = sv.color(2, p);
+      }
+    } else {
+      packed_colors.resize(packed_colors.size() + npix * 3, 0);
+    }
+    color_offset += npix * 3;
+
+    // Depth: 4 bytes per pixel.
+    const size_t old_dsize = packed_depths.size();
+    packed_depths.resize(old_dsize + npix);
+    std::memcpy(packed_depths.data() + old_dsize, sv.depth.data(),
+                npix * sizeof(float));
+    depth_offset += npix;
+  }
+
+  integrator_->PrepareRefinement(cameras, packed_colors, packed_depths,
+                                 descs, n_views);
+
+  const float lambda_decay = 0.95f;
+  integrator_->Refine(color_iters, joint_iters, lambda_reg, lambda_decay,
+                      voxel_size_, trunc_dist, min_weight_);
+
+  std::cerr << "[SVOFuser] Refine complete (" << color_iters << " color + "
+            << joint_iters << " joint iterations)\n";
+}
+
+void SVOFuser::ExtractPoints(std::vector<Vec3f>* fused_points,
+                             std::vector<Vec3f>* fused_normals,
+                             std::vector<Vec3<uint8_t>>* fused_colors) {
+  if (!integrator_) {
+    throw std::runtime_error(
+        "SVOFuser::ExtractPoints: Fuse() must be called first");
+  }
+
+  integrator_->ExtractPoints(min_weight_, voxel_size_, fused_points,
+                             fused_normals, fused_colors);
+  std::cerr << "[SVOFuser] GPU ExtractPoints: " << fused_points->size()
+            << " surface points\n";
+
+  // Release GPU resources.
+  integrator_.reset();
+}
+
+// Legacy API: Fuse + ExtractPoints in one call.
+void SVOFuser::Fuse(std::vector<Vec3f>* fused_points,
+                    std::vector<Vec3f>* fused_normals,
+                    std::vector<Vec3<uint8_t>>* fused_colors) {
+  fused_points->clear();
+  fused_normals->clear();
+  fused_colors->clear();
+
+  if (views_.empty()) {
+    return;
+  }
+
+  Fuse();
+  ExtractPoints(fused_points, fused_normals, fused_colors);
 }
 
 }  // namespace dense
