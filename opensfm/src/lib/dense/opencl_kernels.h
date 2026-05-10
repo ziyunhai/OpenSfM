@@ -19,7 +19,7 @@ namespace dense {
 inline constexpr int kMaxSources = 16;
 
 inline const char* kPatchMatchKernelSource =
-R"CL(
+    R"CL(
 
 // Maximum number of source images the kernels support.
 #define MAX_SOURCES 16
@@ -297,7 +297,7 @@ float compute_ncc(
   // stride=2.0 → 2x radius, etc.
   // stride=2.5 → 2.5x radius
   // stride=3.0 → 3x radius (last resort)
-  float strides[5] = {1.0f, 1.5f, 2.0f, 2.5f, 3.0f};
+  float strides[5] = {1.0f, 2.0f};
 
   // Track the best NCC across all scales.  Previously this returned the
   // LAST stride's NCC, which could be worse than an earlier stride —
@@ -419,7 +419,7 @@ float compute_census_cost(
   // Normalise to [0, 1]:  24 is max Hamming distance for 5x5-1 = 24 bits
   return (float)hamming / 24.0f;
 })CL"
-R"CL(
+    R"CL(
 
 // =====================================================================
 // Combined matching cost: (1-w)*NCC_cost + w*Census_cost
@@ -517,7 +517,7 @@ float compute_ncc_multiscale(
   }
   return best_ncc;
 })CL"
-R"CL(
+    R"CL(
 
 // =====================================================================
 // Census-transform cost using pre-computed warp parameters.
@@ -742,7 +742,7 @@ int compute_cost_vector(
   #undef COST_CASE
   return n_src;
 })CL"
-R"CL(
+    R"CL(
 
 // =====================================================================
 // Compute initial multi-view cost and selected views bitmask.
@@ -1044,7 +1044,7 @@ float compute_weighted_cost_geom(
   }
   return total / weight_norm;
 })CL"
-R"CL(
+    R"CL(
 
 // =====================================================================
 // Kernel: Random initialisation of plane hypotheses.
@@ -1463,7 +1463,7 @@ __kernel void acmmp_patchmatch(
         src_img12, src_img13, src_img14, src_img15);
   }
 )CL"
-R"CL(
+    R"CL(
 
   // --- Near down ---
   if (y < height - 1) {
@@ -1610,7 +1610,7 @@ R"CL(
   float weight_norm = 0.0f;
   for (int i = 0; i < n_src; i++) {
 )CL"
-R"CL(
+    R"CL(
     if (view_weights[i] > 0.0f) {
       new_selected |= (1u << i);
       weight_norm += view_weights[i];
@@ -1812,7 +1812,7 @@ R"CL(
   costs[idx] = cost_now;
   rand_states[idx] = state;
 })CL"
-R"CL(
+    R"CL(
 
 // =====================================================================
 // Kernel: Upsample plane hypotheses from a coarser resolution.
@@ -2051,7 +2051,7 @@ __kernel void acmmp_checkerboard_filter(
   // this prevents the median from mixing depths from different surfaces,
   // which would otherwise crystallize wrong-depth blobs.
   {
-    float percent = 0.15f;  // 1.5% depth difference allowed
+    float percent = 0.03f;  // // was 0.15f
     float center_d = filter_buf[0];
     if (center_d > 0.0f) {
       float depth_lo = center_d * (1 - percent);

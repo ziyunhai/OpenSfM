@@ -205,14 +205,11 @@ void DepthmapEstimator::RunLevel(int level, int total_levels,
   }
 
   // ---- PatchMatch iterations with prior re-seeding ----
+  PriorReinit(w, h);
   for (int i = 0; i < params_.max_iterations; ++i) {
-    // TODO : fix re-initialisation logic. For jow, it produces worse results
-    // if (have_prior) {
-    //   PriorReinit(w, h);
-    // }
     RunIteration(i, w, h);
-    RunCheckerboardFilter(w, h);
   }
+  RunCheckerboardFilter(w, h);
 
   auto& dev = opencl::CLContext::Instance().Device(device_idx_);
   const int npix = w * h;
@@ -232,7 +229,7 @@ void DepthmapEstimator::RunLevel(int level, int total_levels,
     // Restore original data.
     images_ = orig_images_;
     Ks_ = orig_Ks_;
-    ReadBackResults(result, full_w, full_h, /*apply_median=*/true);
+    ReadBackResults(result, full_w, full_h, /*apply_median=*/false);
   } else {
     // Return intermediate result (useful for cluster orchestration).
     ReadBackResults(result, w, h, /*apply_median=*/false);

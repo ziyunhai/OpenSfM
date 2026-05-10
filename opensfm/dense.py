@@ -110,12 +110,16 @@ def compute_depthmaps(
     # ── 1c. Global neighbor selection (C++, multithreaded) ────────────
     #   SelectNeighbors uses the super-point visibility from the
     #   covisibility graph directly — no Python common-tracks dict needed.
+    theta_min: float = config.get("depthmap_neighbor_min_angle", 3.0)
+    theta_max: float = config.get("depthmap_neighbor_max_angle", 60.0)
     nbr_result: pysfm.NeighborResult = pysfm.select_neighbors(
         graph,
         reconstruction.map,
         super_points,
         processable,
         num_neighbors,
+        theta_min_deg=theta_min,
+        theta_max_deg=theta_max,
     )
     context.log_memory("C++ neighbor selection done")
 

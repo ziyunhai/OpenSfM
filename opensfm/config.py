@@ -428,7 +428,7 @@ class OpenSfMConfig:
     # Max number of carve votes a pixel may receive before it is discarded.
     depthmap_max_carved_views: int = 1
     # Save per-shot raw/clean PLYs and per-cluster debug PLYs (slow, for debugging only).
-    depthmap_save_debug_ply: bool = False
+    depthmap_save_debug_ply: bool = True
     # Spatial sigma for bilateral NCC weighting
     depthmap_sigma_spatial: float = 5.0
     # Color sigma for bilateral NCC weighting, in normalized [0,1] intensity units.
@@ -436,15 +436,20 @@ class OpenSfMConfig:
     # Weight for Census transform cost vs bilateral NCC (0 = NCC only, 1 = Census only).
     depthmap_census_weight: float = 0.3
     # Number of multi-scale hierarchy levels (1 = full-res only, 2 = half+full,  3 = quarter+half+full, etc.).
-    depthmap_hierarchy_levels: int = 4
+    depthmap_hierarchy_levels: int = 3
     # Depth/normal smoothness weight for PatchMatch
-    depthmap_smooth_weight: float = 0.3
+    depthmap_smooth_weight: float = 0.05
     # Weight for geometric consistency cost (0 = disabled). Applied per source view.
     depthmap_geom_consistency_weight: float = 0.05
     # Maximum number of reference views per cluster for geometric consistency.
     depthmap_cluster_max_size: int = 8
     # Use SfM points to seed a Delaunay planar prior before PatchMatch iterations
     depthmap_sfm_planar_prior: bool = True
+    # Minimum baseline angle (degrees) for neighbor selection.
+    # Views with avg baseline < this are excluded from best-neighbors.
+    depthmap_neighbor_min_angle: float = 3.0
+    # Maximum baseline angle (degrees) for neighbor selection.
+    depthmap_neighbor_max_angle: float = 60.0
     # Number of shots per incremental fusion batch (controls peak memory).
     depthmap_fusion_batch_size: int = 50
     # Minimum number of consistent views for a fused point
