@@ -334,3 +334,141 @@ def test_integration_extract_exif_from_file(monkeypatch):
     assert d["make"] == "TestMake"
     assert d["width"] == 100
     assert "camera" in d
+
+
+# ── Missing GPS fallback (no GPS tags, no DJI) ──────────────────────
+
+
+def test_extract_lon_lat_missing_returns_none(monkeypatch):
+    """No GPS or DJI tags → lon/lat are None."""
+    e = create_exif_with_tags({}, monkeypatch)
+    lon, lat = e.extract_lon_lat()
+    assert lon is None
+    assert lat is None
+
+
+def test_extract_altitude_missing_returns_none(monkeypatch):
+    """No altitude tags → altitude is None."""
+    e = create_exif_with_tags({}, monkeypatch)
+    assert e.extract_altitude() is None
+
+
+def test_extract_altitude_integer_value(monkeypatch):
+    """Integer GPS altitude (not Ratio) is handled."""
+    tags = {
+        "GPS GPSAltitude": MockTag([200]),
+    }
+    e = create_exif_with_tags(tags, monkeypatch)
+    assert e.extract_altitude() == 200.0
+
+
+# ── Missing focal fallback ──────────────────────────────────────────
+
+
+def test_focal_missing_returns_zero(monkeypatch):
+    """No focal length tags → focal_35 and focal_ratio are 0."""
+    e = create_exif_with_tags({}, monkeypatch)
+    focal_35, focal_ratio = e.extract_focal()
+    assert focal_35 == 0.0
+    assert focal_ratio == 0.0
+
+
+# ── Orientation variants ────────────────────────────────────────────
+
+
+def test_orientation_zero_falls_back_to_1(monkeypatch):
+    """Orientation tag of 0 should fall back to 1."""
+    tags = {"Image Orientation": MockTag([0])}
+    e = create_exif_with_tags(tags, monkeypatch)
+    assert e.extract_orientation() == 1
+
+
+# ── sensor_string helper ────────────────────────────────────────────
+
+
+def test_sensor_string_deduplicates_make():
+    """When model contains make, make is removed from model part."""
+    result = exif.sensor_string("Canon", "Canon EOS 5D")
+    assert result == "canon eos 5d"
+
+
+def test_sensor_string_unknown_make():
+    """Unknown make keeps 'unknown' prefix."""
+    result = exif.sensor_string("unknown", "SomeModel")
+    assert result == "unknown somemodel"
+
+
+# ── compute_focal helper ────────────────────────────────────────────
+
+
+def test_compute_focal_from_35mm():
+    """focal_35 directly provides the ratio."""
+    f35, ratio = exif.compute_focal(50.0, None, None, None)
+    assert abs(f35 - 50.0) < 1e-6
+    assert abs(ratio - 50.0 / 36.0) < 1e-6
+
+
+def test_compute_focal_from_sensor_width():
+    """Focal and sensor width compute the ratio."""
+    f35, ratio = exif.compute_focal(None, 24.0, 36.0, None)
+    assert abs(ratio - 24.0 / 36.0) < 1e-6
+    assert abs(f35 - 36.0 * ratio) < 1e-6
+
+
+def test_compute_focal_no_info():
+    """No focal info returns zeros."""
+    f35, ratio = exif.compute_focal(None, None, None, None)
+    assert f35 == 0.0
+    assert ratio == 0.0
+
+
+# ── camera_id_ helper ───────────────────────────────────────────────
+
+
+def test_camera_id_basic():
+    cid = exif.camera_id_("Canon", "EOS 5D", 4000, 3000, "perspective", 0.85)
+    assert cid.startswith("v2 canon")
+    assert "perspective" in cid
+    assert "4000" in cid
+
+
+# ── DOP extraction ──────────────────────────────────────────────────
+
+
+def test_extract_dop_present(monkeypatch):
+    tags = {"GPS GPSDOP": MockTag([exifread.utils.Ratio(25, 10)])}
+    e = create_exif_with_tags(tags, monkeypatch)
+    assert e.extract_dop() == 2.5
+
+
+def test_extract_dop_missing(monkeypatch):
+    e = create_exif_with_tags({}, monkeypatch)
+    assert e.extract_dop() is None
+
+
+# ── Image size extraction branches ──────────────────────────────────
+
+
+def test_extract_image_size_from_image_tags(monkeypatch):
+    """Falls back to Image ImageWidth/Length tags."""
+    tags = {
+        "Image ImageWidth": MockTag([800]),
+        "Image ImageLength": MockTag([600]),
+    }
+    e = create_exif_with_tags(tags, monkeypatch)
+    w, h = e.extract_image_size()
+    assert w == 800
+    assert h == 600
+
+
+def test_extract_image_size_from_loader(monkeypatch):
+    """Falls back to image_size_loader when no EXIF size tags."""
+    monkeypatch.setattr("exifread.process_file", lambda f, details=False: {})
+    monkeypatch.setattr("opensfm.exif.get_xmp", lambda f: [])
+    fileobj = io.BytesIO(b"")
+    fileobj.name = "test.jpg"
+    e = exif.EXIF(fileobj, lambda: (480, 640),
+                  "perspective", use_exif_size=True)
+    w, h = e.extract_image_size()
+    assert w == 640
+    assert h == 480

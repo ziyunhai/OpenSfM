@@ -2,7 +2,7 @@
 """Test the rig module."""
 
 import numpy as np
-from opensfm import pygeometry, rig, types
+from opensfm import pygeometry, pymap, rig, types
 
 
 def test_create_instances_with_patterns() -> None:
@@ -174,3 +174,132 @@ def test_compute_relative_pose() -> None:
     assert np.allclose(
         [-0.5, 0.5, 0], rig_cameras["camera_id_4"].pose.get_origin(), atol=1e-7
     )
+
+
+# ── find_image_rig ───────────────────────────────────────────────────
+
+
+def test_find_image_rig_match() -> None:
+    """Image matching a pattern returns rig_camera_id and instance_member_id."""
+    patterns = {"camera_left": "(left)", "camera_right": "(right)"}
+    cam_id, inst_id = rig.find_image_rig("12345_left.jpg", patterns)
+    assert cam_id == "camera_left"
+    assert inst_id == "12345_.jpg"
+
+
+def test_find_image_rig_no_match() -> None:
+    """Image matching no pattern returns (None, None)."""
+    patterns = {"camera_left": "(left)"}
+    cam_id, inst_id = rig.find_image_rig("12345_top.jpg", patterns)
+    assert cam_id is None
+    assert inst_id is None
+
+
+def test_find_image_rig_full_match_skipped() -> None:
+    """Pattern that consumes entire image name (empty instance_member_id) is skipped."""
+    patterns = {"all": "(12345)"}
+    cam_id, inst_id = rig.find_image_rig("12345", patterns)
+    assert cam_id is None
+    assert inst_id is None
+
+
+# ── group_instances ──────────────────────────────────────────────────
+
+
+def test_group_instances_single_group() -> None:
+    """All instances with same camera set are in one group."""
+    instances = {
+        "inst1": [("im1_left", "cam_left"), ("im1_right", "cam_right")],
+        "inst2": [("im2_left", "cam_left"), ("im2_right", "cam_right")],
+    }
+    groups = rig.group_instances(instances)
+    assert len(groups) == 1
+    key = list(groups.keys())[0]
+    assert len(groups[key]) == 2
+
+
+def test_group_instances_multiple_groups() -> None:
+    """Instances with different camera sets form separate groups."""
+    instances = {
+        "inst1": [("im1_left", "cam_left"), ("im1_right", "cam_right")],
+        "inst2": [("im2_red", "cam_red"), ("im2_green", "cam_green")],
+    }
+    groups = rig.group_instances(instances)
+    assert len(groups) == 2
+
+
+# ── rig_assignments_per_image ────────────────────────────────────────
+
+
+def test_rig_assignments_per_image_basic() -> None:
+    """Each image gets its instance_id, rig_camera_id, and sibling shots."""
+    assignments = {
+        "inst1": [("shot_a", "cam_left"), ("shot_b", "cam_right")],
+    }
+    result = rig.rig_assignments_per_image(assignments)
+    assert "shot_a" in result
+    inst_id, cam_id, siblings = result["shot_a"]
+    assert inst_id == "inst1"
+    assert cam_id == "cam_left"
+    assert set(siblings) == {"shot_a", "shot_b"}
+
+
+def test_rig_assignments_per_image_multiple_instances() -> None:
+    assignments = {
+        "inst1": [("s1", "c1")],
+        "inst2": [("s2", "c1"), ("s3", "c2")],
+    }
+    result = rig.rig_assignments_per_image(assignments)
+    assert len(result) == 3
+    assert result["s2"][0] == "inst2"
+
+
+# ── count_reconstructed_instances ────────────────────────────────────
+
+
+def test_count_reconstructed_instances_all_found() -> None:
+    """All instances are counted when all shots are reconstructed."""
+    rec = types.Reconstruction()
+    cam = pygeometry.Camera.create_perspective(0.5, 0.0, 0.0)
+    cam.id = "cam"
+    rec.add_camera(cam)
+    for sid in ["s1", "s2", "s3", "s4"]:
+        rec.create_shot(sid, "cam")
+
+    instances = [
+        [("s1", "c1"), ("s2", "c2")],
+        [("s3", "c1"), ("s4", "c2")],
+    ]
+    assert rig.count_reconstructed_instances(instances, rec) == 2
+
+
+def test_count_reconstructed_instances_partial() -> None:
+    """Instances missing shots are not fully counted."""
+    rec = types.Reconstruction()
+    cam = pygeometry.Camera.create_perspective(0.5, 0.0, 0.0)
+    cam.id = "cam"
+    rec.add_camera(cam)
+    rec.create_shot("s1", "cam")
+    rec.create_shot("s2", "cam")
+    # s3 is missing from reconstruction
+
+    instances = [
+        [("s1", "c1"), ("s2", "c2")],
+        [("s3", "c1")],  # s3 missing
+    ]
+    # Instance 1 fully reconstructed, instance 2 not
+    assert rig.count_reconstructed_instances(instances, rec) == 1
+
+
+# ── default_rig_cameras ─────────────────────────────────────────────
+
+
+def test_default_rig_cameras() -> None:
+    """Creates identity-pose rig cameras for each camera_id."""
+    result = rig.default_rig_cameras(["cam1", "cam2"])
+    assert len(result) == 2
+    assert "cam1" in result
+    assert "cam2" in result
+    for cam_id, rc in result.items():
+        assert rc.id == cam_id
+        assert np.allclose(rc.pose.rotation, [0, 0, 0])
