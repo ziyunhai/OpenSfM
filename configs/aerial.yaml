@@ -90,3 +90,16 @@ bundle_compensate_gps_bias: true
 # Annealing schedule for GCP weights: list of multipliers applied to gcp_global_weight
 # across successive bundle passes. Set to [1.0] to disable annealing (single pass).
 gcp_annealing_steps: [5.0, 25.0]
+
+##################################
+# Params for Dense Reconstruction
+##################################
+depthmap_checkerboard_filter: False
+# Minimum connected component size in pixels; smaller segments are removed as speckle noise
+depthmap_speckle_min_size: 0
+# Maximum gap size in pixels for linear depth interpolation (0 = disabled)
+depthmap_gap_max_size: 0
+# Weight for geometric consistency cost (0 = disabled). Applied per source view.
+depthmap_geom_consistency_weight: 0
+# Use SfM points to seed a Delaunay planar prior before PatchMatch iterations
+depthmap_sfm_planar_prior: False
