@@ -27,7 +27,7 @@ jobs:
       - name: Build OpenSfM with coverage instrumentation
         shell: bash -l {0}
         run: |
-          rm -rf cmake_build
+          rm -rf build
           pip install \
             --config-settings=cmake.define.OPENSFM_ENABLE_COVERAGE=ON \
             --config-settings=cmake.define.OPENSFM_BUILD_TESTS=ON \
@@ -35,7 +35,7 @@ jobs:
 
       - name: Run C++ tests
         shell: bash -l {0}
-        run: cd cmake_build && ctest --output-on-failure
+        run: cd build && ctest --output-on-failure
 
       - name: Run Python tests with coverage
         shell: bash -l {0}
@@ -56,7 +56,7 @@ jobs:
         run: |
           gcovr \
             --root . \
-            cmake_build \
+            build \
             --filter 'opensfm/src/lib/' \
             --exclude 'opensfm/src/lib/third_party/' \
             --exclude '.*/test/.*' \

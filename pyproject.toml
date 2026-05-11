@@ -63,8 +63,13 @@ Documentation = "https://docs.opensfm.org/"
 cmake.source-dir = "opensfm/src"
 cmake.build-type = "Release"
 
-# Use a fixed build directory (useful for running C++ tests)
-build-dir = "cmake_build"
+# Build directory for pip / scikit-build-core (cmake + compiled .so extensions).
+# C++ test-only builds stay in cmake_build (via standalone cmake).
+build-dir = "build"
+
+# Editable installs: use redirect mode so .so files stay in build/
+# instead of being copied into the opensfm/ source tree.
+editable.mode = "redirect"
 
 # Minimum CMake version
 cmake.version = ">=3.15"
@@ -95,6 +100,8 @@ sdist.exclude = [
     ".git/**",
     ".github/**",
     "cmake_build/**",
+    "build/**",
+    "coverage_data/**",
     "**/__pycache__/**",
     "**/*.pyc",
 ]

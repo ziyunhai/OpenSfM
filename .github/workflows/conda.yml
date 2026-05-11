@@ -30,7 +30,7 @@ jobs:
 
       - name: Run C++ tests
         shell: bash -l {0}
-        run: cd cmake_build && ctest
+        run: cd build && ctest
 
       - name: Run Python tests
         shell: bash -l {0}

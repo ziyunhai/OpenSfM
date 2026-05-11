@@ -21,10 +21,12 @@ if(MSVC)
   add_definitions(-DNOMINMAX)
 endif()
 
-# Place compilation results in opensfm/ folder
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${opensfm_SOURCE_DIR}/../..")
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_RELEASE "${opensfm_SOURCE_DIR}/../..")
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_DEBUG "${opensfm_SOURCE_DIR}/../..")
+# Place compiled extension modules in the build directory (build/ or cmake_build/)
+# rather than the source tree. scikit-build-core's editable redirect mode handles
+# making them importable via site-packages.
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}")
 
 ####### Compilation Options #######
 # Note: Common options and definitions are in ../cmake/OpenSfMCommon.cmake
