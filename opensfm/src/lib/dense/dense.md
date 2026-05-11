@@ -198,7 +198,7 @@ All per-cluster `fused_batch_XXXX.ply` files are concatenated into `fused.ply`.
 | `depthmap_top_k`                   | 4       | Raw   | Top-k view selection for cost aggregation    |
 | `depthmap_sigma_spatial`           | 5.0     | Raw   | Bilateral spatial sigma (pixels)             |
 | `depthmap_sigma_color`             | 3/255   | Raw   | Bilateral color sigma (normalized intensity) |
-| `depthmap_census_weight`           | 0.3     | Raw   | NCC/Census blend weight                      |
+| `depthmap_use_census`              | True    | Raw   | Census fallback when NCC fails               |
 | `depthmap_smooth_weight`           | 0.3     | Raw   | Smoothness regularization weight             |
 | `depthmap_geom_consistency_weight` | 0.05    | Raw   | Geometric consistency weight                 |
 | `depthmap_sfm_planar_prior`        | True    | Raw   | Enable SfM Delaunay planar prior             |

@@ -13,27 +13,6 @@ PYBIND11_MODULE(pydense, m) {
       .def("add_point", &dense::OpenMVSExporter::AddPoint)
       .def("export", &dense::OpenMVSExporter::Export);
 
-  py::class_<dense::DepthmapFuserWrapper>(m, "DepthmapFuser")
-      .def(py::init())
-      .def("set_min_num_consistent",
-           &dense::DepthmapFuserWrapper::SetMinNumConsistent)
-      .def("set_max_reproj_error",
-           &dense::DepthmapFuserWrapper::SetMaxReprojError)
-      .def("set_max_depth_error",
-           &dense::DepthmapFuserWrapper::SetMaxDepthError)
-      .def("set_max_normal_error",
-           &dense::DepthmapFuserWrapper::SetMaxNormalError)
-      .def("set_border_margin", &dense::DepthmapFuserWrapper::SetBorderMargin)
-      .def("set_num_threads", &dense::DepthmapFuserWrapper::SetNumThreads)
-      .def("set_sor_params", &dense::DepthmapFuserWrapper::SetSORParams)
-      .def("set_behind_depth_factor",
-           &dense::DepthmapFuserWrapper::SetBehindDepthFactor)
-      .def("add_view", &dense::DepthmapFuserWrapper::AddView, py::arg("K"),
-           py::arg("R"), py::arg("t"), py::arg("depth"), py::arg("normal"),
-           py::arg("color"), py::arg("mask"), py::arg("neighbor_ids"),
-           py::arg("primary") = true)
-      .def("fuse", &dense::DepthmapFuserWrapper::Fuse);
-
   py::class_<dense::SVOFuserWrapper>(m, "SVOFuser")
       .def(py::init())
       .def("set_voxel_size", &dense::SVOFuserWrapper::SetVoxelSize)
@@ -70,8 +49,8 @@ PYBIND11_MODULE(pydense, m) {
       .def("set_sigma_color",
            &dense::DepthmapClusterEstimatorWrapper::SetSigmaColor)
       .def("set_top_k", &dense::DepthmapClusterEstimatorWrapper::SetTopK)
-      .def("set_census_weight",
-           &dense::DepthmapClusterEstimatorWrapper::SetCensusWeight)
+      .def("set_use_census",
+           &dense::DepthmapClusterEstimatorWrapper::SetUseCensus)
       .def("set_smooth_weight",
            &dense::DepthmapClusterEstimatorWrapper::SetSmoothWeight)
       .def("set_checkerboard_filter",

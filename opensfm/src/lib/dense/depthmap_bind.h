@@ -25,7 +25,7 @@ class DepthmapClusterEstimatorWrapper {
   void SetSigmaSpatial(float v) { params_.sigma_spatial = v; }
   void SetSigmaColor(float v) { params_.sigma_color = v; }
   void SetTopK(int k) { params_.top_k = k; }
-  void SetCensusWeight(float w) { params_.census_weight = w; }
+  void SetUseCensus(bool v) { params_.use_census = v; }
   void SetSmoothWeight(float w) { params_.smooth_weight = w; }
   void SetCheckerboardFilter(bool v) { params_.checkerboard_filter = v; }
   void SetSpeckleMinSize(int v) { params_.speckle_min_size = v; }
@@ -174,7 +174,7 @@ class DepthmapClusterEstimatorWrapper {
   void SetSigmaSpatial(float) {}
   void SetSigmaColor(float) {}
   void SetTopK(int) {}
-  void SetCensusWeight(float) {}
+  void SetUseCensus(bool) {}
   void SetSmoothWeight(float) {}
   void SetCheckerboardFilter(bool) {}
   void SetSpeckleMinSize(int) {}
@@ -229,69 +229,10 @@ class DepthmapCleanerWrapper {
 
 #endif  // OPENSFM_HAVE_OPENCL
 
-#include <dense/fuser.h>
 #include <dense/svo_fuser.h>
 #include <pybind11/eigen.h>
 
 namespace dense {
-
-class DepthmapFuserWrapper {
- public:
-  void SetMinNumConsistent(int n) { df_.SetMinNumConsistent(n); }
-  void SetMaxReprojError(float px) { df_.SetMaxReprojError(px); }
-  void SetMaxDepthError(float ratio) { df_.SetMaxDepthError(ratio); }
-  void SetMaxNormalError(float degrees) { df_.SetMaxNormalError(degrees); }
-  void SetBorderMargin(int px) { df_.SetBorderMargin(px); }
-  void SetNumThreads(int n) { df_.SetNumThreads(n); }
-  void SetSORParams(int knn, float stddev_factor) {
-    df_.SetSORParams(knn, stddev_factor);
-  }
-  void SetBehindDepthFactor(float f) { df_.SetBehindDepthFactor(f); }
-
-  void AddView(const Mat3d& K, const Mat3d& R, const Vec3d& t,
-               Eigen::Ref<const ImageF> depth,
-               const py::array_t<float, py::array::c_style>& normal,
-               const py::array_t<uint8_t, py::array::c_style>& color,
-               Eigen::Ref<const ImageU8> mask,
-               const py::array_t<int>& neighbor_ids, bool primary = true) {
-    const int h = static_cast<int>(depth.rows());
-    const int w = static_cast<int>(depth.cols());
-    if (normal.ndim() != 3 || normal.shape(0) != h || normal.shape(1) != w) {
-      throw std::invalid_argument(
-          "depth and normal must have matching shapes.");
-    }
-    if (color.ndim() != 3 || color.shape(0) != h || color.shape(1) != w) {
-      throw std::invalid_argument("depth and color must have matching shapes.");
-    }
-    Eigen::Map<const PixelData3f> n_e(normal.data(), 3, h * w);
-    Eigen::Map<const PixelData3u8> c_e(color.data(), 3, h * w);
-    std::vector<int> nbrs(neighbor_ids.data(),
-                          neighbor_ids.data() + neighbor_ids.size());
-    df_.AddView(K, R, t, depth, n_e, c_e, mask, nbrs, primary);
-  }
-
-  py::list Fuse() {
-    std::vector<Vec3f> points;
-    std::vector<Vec3f> normals;
-    std::vector<Vec3<uint8_t>> colors;
-
-    {
-      py::gil_scoped_release release;
-      df_.Fuse(&points, &normals, &colors);
-    }
-
-    const int n = static_cast<int>(points.size());
-    // Vec3f is 3 contiguous floats — reinterpret as (N,3) flat array.
-    py::list retn;
-    retn.append(foundation::py_array_from_data(points.data()->data(), n, 3));
-    retn.append(foundation::py_array_from_data(normals.data()->data(), n, 3));
-    retn.append(foundation::py_array_from_data(colors.data()->data(), n, 3));
-    return retn;
-  }
-
- private:
-  DepthmapFuser df_;
-};
 
 // ---- SVOFuser wrapper ----
 

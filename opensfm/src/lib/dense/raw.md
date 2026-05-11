@@ -193,23 +193,22 @@ Non-parametric cost robust to illumination changes and textureless surfaces.
   patches), return cost = 1.0 to prevent false matches.
 - Uses the **same homography warp** as NCC (Jacobian-based).
 
-### 4.3 Combined Cost (`compute_combined_cost`)
+### 4.3 Single-View Cost (`compute_single_cost`)
 
 ```
+ncc = compute_ncc_multiscale(...)
 if NCC <= -0.5:                           // NCC completely failed
-    cost = Census                         // Census always works
-elif census_weight == 0:
-    cost = 1 - NCC                        // pure NCC cost
+    if use_census:
+        cost = Census                     // Census always works
+    else:
+        cost = 2.0                        // invalid
 else:
-    t = smoothstep(0.1, 0.6, 1-NCC)      // adaptive blend factor
-    blend = census_weight * t
-    cost = (1-blend) * (1-NCC) + blend * Census
+    cost = 1 - NCC                        // NCC cost in [0, 2]
 ```
 
-**Key insight for oversmoothing**: on textured surfaces (NCC ≥ 0.9),
-`t = 0` so Census is completely skipped. On low-texture surfaces (NCC ≈ 0.4),
-Census is fully engaged. This adaptive blend avoids Census's coarser
-discriminative power degrading high-quality NCC matches.
+When NCC fails (low-texture surfaces like asphalt, walls), Census provides
+a robust fallback. Census always produces a valid cost because it compares
+relative pixel orderings, not absolute values.
 
 ### 4.4 Optimized Cost Vector (`compute_cost_vector`)
 

@@ -12,7 +12,6 @@ set(DENSE_FILES
     opencl_kernels.h
     opencl_utils.h
     openmvs_exporter.h
-    src/fuser.cc
     src/svo.cc
     src/svo_fuser.cc
 )

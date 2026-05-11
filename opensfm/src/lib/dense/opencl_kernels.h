@@ -166,8 +166,7 @@ float compute_ncc_at_stride(
     float dfdx_x, float dfdx_y,
     float dfdy_x, float dfdy_y,
     float spatial_factor,
-    float color_factor,
-    float *out_var_ref
+    float color_factor
 ) {
   const sampler_t samp = CLK_NORMALIZED_COORDS_FALSE |
                          CLK_ADDRESS_CLAMP_TO_EDGE |
@@ -228,9 +227,6 @@ float compute_ncc_at_stride(
   float var_ref = sum_rr * inv_w - mean_r * mean_r;
   float var_src = sum_ss * inv_w - mean_s * mean_s;
 
-  // Output reference variance for depth-prior blending.
-  if (out_var_ref) *out_var_ref = var_ref;
-
   // Reference PatchMatch uses kMinVar = 1e-5 with [0,255] pixel values.
   // Our pixels are [0,1], so equivalent threshold is 1e-5 / 255² ≈ 1.5e-10.
   // With center-shifted accumulation this is numerically stable.
@@ -240,237 +236,6 @@ float compute_ncc_at_stride(
   return covar / sqrt(var_ref * var_src);
 }
 
-float compute_ncc(
-    read_only image2d_t ref_img,
-    read_only image2d_t src_img,
-    __global const Camera *ref_cam,
-    __global const Camera *src_cam,
-    int cx, int cy,
-    PlaneHypothesis plane,
-    int half_patch,
-    float sigma_spatial,
-    float sigma_color
-) {
-  const sampler_t samp = CLK_NORMALIZED_COORDS_FALSE |
-                         CLK_ADDRESS_CLAMP_TO_EDGE |
-                         CLK_FILTER_LINEAR;
-
-  float ref_center = read_imagef(ref_img, samp, (float2)(cx + 0.5f, cy + 0.5f)).x;
-
-  float depth = depth_from_plane((float)cx, (float)cy, plane, ref_cam);
-  if (depth <= 0.0f) return -1.0f;
-
-  // Back-project center to world
-  float3 center_world = backproject((float)cx, (float)cy, depth, ref_cam);
-
-  // Project to source
-  float3 src_proj = project(center_world, src_cam);
-  if (src_proj.z < 1e-6f) return -1.0f;
-  float src_cx = src_proj.x / src_proj.z;
-  float src_cy = src_proj.y / src_proj.z;
-
-  // Jacobian via finite differences for patch warping
-  float depth_dx = depth_from_plane((float)(cx+1), (float)cy, plane, ref_cam);
-  float depth_dy = depth_from_plane((float)cx, (float)(cy+1), plane, ref_cam);
-  if (depth_dx <= 0.0f || depth_dy <= 0.0f) return -1.0f;
-
-  float3 world_dx = backproject((float)(cx+1), (float)cy, depth_dx, ref_cam);
-  float3 world_dy = backproject((float)cx, (float)(cy+1), depth_dy, ref_cam);
-
-  float3 proj_dx = project(world_dx, src_cam);
-  float3 proj_dy = project(world_dy, src_cam);
-  if (proj_dx.z < 1e-6f || proj_dy.z < 1e-6f) return -1.0f;
-
-  float dfdx_x = proj_dx.x / proj_dx.z - src_cx;
-  float dfdx_y = proj_dx.y / proj_dx.z - src_cy;
-  float dfdy_x = proj_dy.x / proj_dy.z - src_cx;
-  float dfdy_y = proj_dy.y / proj_dy.z - src_cy;
-
-  float spatial_factor = -1.0f / (2.0f * sigma_spatial * sigma_spatial);
-  float color_factor = -1.0f / (2.0f * sigma_color * sigma_color);
-
-  float src_center = read_imagef(src_img, samp, (float2)(src_cx + 0.5f, src_cy + 0.5f)).x;
-
-  // Multi-scale: try progressively larger effective radii via strided
-  // sampling.  Same number of samples at each scale, so cost is O(1)
-  // per additional scale attempted.  Only escalate when variance is too
-  // low (textureless patch).
-  //
-  // stride=1.0 → original patch size
-  // stride=2.0 → 2x radius, etc.
-  // stride=3.0 → 3x radius (last resort)
-  float strides[3] = {1.0f, 2.0f, 3.0f};
-
-  float best_ncc = -1.0f;
-  for (int s = 0; s < 3; s++) {
-    float ncc = compute_ncc_at_stride(
-        ref_img, src_img, ref_center, src_center,
-        src_cx, src_cy, cx, cy, half_patch, strides[s],
-        dfdx_x, dfdx_y, dfdy_x, dfdy_y,
-        spatial_factor, color_factor, 0);
-    if (ncc > best_ncc) best_ncc = ncc;
-    if (best_ncc > 0.1f) return best_ncc;  // good enough, done
-  }
-
-  return best_ncc;  // best across all scales
-}
-
-// =====================================================================
-// Census-transform matching cost between reference and source patches.
-//
-// The Census transform compares each pixel in a window to the center pixel,
-// producing a binary descriptor.  The Hamming distance between the reference
-// and (warped) source Census descriptors gives a non-parametric matching
-// cost that is robust to:
-//   - Low-texture / uniform surfaces (asphalt, walls, sky)
-//   - Global illumination changes
-//   - Radiometric differences between views
-//
-// Unlike NCC, Census ALWAYS produces a valid cost because it does not
-// depend on patch variance — even a perfectly uniform patch produces a
-// well-defined (all-zero) descriptor.
-//
-// We use a 5x5 Census window (25 comparisons → 25 bits in a uint).
-// The result is normalised to [0, 1] where 0 = perfect match.
-// =====================================================================
-float compute_census_cost(
-    read_only image2d_t ref_img,
-    read_only image2d_t src_img,
-    __global const Camera *ref_cam,
-    __global const Camera *src_cam,
-    int cx, int cy,
-    PlaneHypothesis plane
-) {
-  const sampler_t samp = CLK_NORMALIZED_COORDS_FALSE |
-                         CLK_ADDRESS_CLAMP_TO_EDGE |
-                         CLK_FILTER_LINEAR;
-
-  float depth = depth_from_plane((float)cx, (float)cy, plane, ref_cam);
-  if (depth <= 0.0f) return 1.0f;
-
-  // Back-project center to world and project to source
-  float3 center_world = backproject((float)cx, (float)cy, depth, ref_cam);
-  float3 src_proj = project(center_world, src_cam);
-  if (src_proj.z < 1e-6f) return 1.0f;
-  float src_cx = src_proj.x / src_proj.z;
-  float src_cy = src_proj.y / src_proj.z;
-
-  // Jacobian for patch warping (same as NCC)
-  float depth_dx = depth_from_plane((float)(cx+1), (float)cy, plane, ref_cam);
-  float depth_dy = depth_from_plane((float)cx, (float)(cy+1), plane, ref_cam);
-  if (depth_dx <= 0.0f || depth_dy <= 0.0f) return 1.0f;
-
-  float3 world_dx = backproject((float)(cx+1), (float)cy, depth_dx, ref_cam);
-  float3 world_dy = backproject((float)cx, (float)(cy+1), depth_dy, ref_cam);
-  float3 proj_dx = project(world_dx, src_cam);
-  float3 proj_dy = project(world_dy, src_cam);
-  if (proj_dx.z < 1e-6f || proj_dy.z < 1e-6f) return 1.0f;
-
-  float dfdx_x = proj_dx.x / proj_dx.z - src_cx;
-  float dfdx_y = proj_dx.y / proj_dx.z - src_cy;
-  float dfdy_x = proj_dy.x / proj_dy.z - src_cx;
-  float dfdy_y = proj_dy.y / proj_dy.z - src_cy;
-
-  // Center pixel values
-  float ref_center = read_imagef(ref_img, samp, (float2)(cx + 0.5f, cy + 0.5f)).x;
-  float src_center = read_imagef(src_img, samp, (float2)(src_cx + 0.5f, src_cy + 0.5f)).x;
-
-  // Build 5x5 Census descriptors (25 bits each)
-  uint ref_census = 0u;
-  uint src_census = 0u;
-  int bit = 0;
-
-  for (int dy = -2; dy <= 2; dy++) {
-    for (int dx = -2; dx <= 2; dx++) {
-      if (dx == 0 && dy == 0) continue;  // skip center
-
-      float rx = (float)(cx + dx);
-      float ry = (float)(cy + dy);
-      float ref_val = read_imagef(ref_img, samp, (float2)(rx + 0.5f, ry + 0.5f)).x;
-
-      float sx = src_cx + dfdx_x * dx + dfdy_x * dy;
-      float sy = src_cy + dfdx_y * dx + dfdy_y * dy;
-      float src_val = read_imagef(src_img, samp, (float2)(sx + 0.5f, sy + 0.5f)).x;
-
-      if (ref_val > ref_center) ref_census |= (1u << bit);
-      if (src_val > src_center) src_census |= (1u << bit);
-      bit++;
-    }
-  }
-
-  // Hamming distance
-  uint xor_val = ref_census ^ src_census;
-  int hamming = popcount(xor_val);
-
-  // Minimum contrast: if both descriptors have fewer than 3 set bits,
-  // the patches are essentially uniform.  A Hamming distance of 0
-  // between two all-zero descriptors is meaningless — it holds for
-  // *any* depth.  Return worst-case cost to prevent false matches.
-  if (popcount(ref_census) < 3 && popcount(src_census) < 3) return 1.0f;
-
-  // Normalise to [0, 1]:  24 is max Hamming distance for 5x5-1 = 24 bits
-  return (float)hamming / 24.0f;
-})CL"
-    R"CL(
-
-// =====================================================================
-// Combined matching cost: (1-w)*NCC_cost + w*Census_cost
-//
-// When NCC fails (returns -1 due to low variance), we fall back entirely
-// to the Census cost, which always works.  This is critical for
-// textureless surfaces like asphalt, painted walls, etc.
-// =====================================================================
-float compute_combined_cost(
-    read_only image2d_t ref_img,
-    read_only image2d_t src_img,
-    __global const Camera *ref_cam,
-    __global const Camera *src_cam,
-    int cx, int cy,
-    PlaneHypothesis plane,
-    int half_patch,
-    float sigma_spatial,
-    float sigma_color,
-    float census_weight
-) {
-  float ncc = compute_ncc(ref_img, src_img, ref_cam, src_cam,
-                          cx, cy, plane, half_patch,
-                          sigma_spatial, sigma_color);
-
-  if (ncc <= -0.5f) {
-    // NCC completely failed (textureless / degenerate): Census only.
-    // Census always produces a valid cost because it compares relative
-    // pixel orderings, not absolute values — even a uniform patch gives
-    // a well-defined (all-zero) descriptor.
-    if (census_weight > 1e-6f) {
-      float census = compute_census_cost(ref_img, src_img, ref_cam, src_cam,
-                                         cx, cy, plane);
-      return census;
-    }
-    return 2.0f;  // Census disabled and NCC failed
-  }
-
-  float ncc_cost = 1.0f - ncc;  // [0, 2], good match → near 0
-
-  if (census_weight < 1e-6f) return ncc_cost;  // Census disabled
-
-  // Adaptive blending: Census contributes only when NCC quality is poor.
-  // On textured surfaces (ncc >= 0.9), Census is skipped entirely,
-  // preserving NCC's sub-pixel precision and avoiding overhead.
-  // On dark/low-texture surfaces (ncc ~= 0.4), Census is fully engaged
-  // at the user-specified census_weight, providing robust discrimination.
-  //
-  // smoothstep(0.1, 0.6, ncc_cost) gives:
-  //   ncc >= 0.9 (ncc_cost <= 0.1) → t = 0 → pure NCC
-  //   ncc ~= 0.4 (ncc_cost ~= 0.6) → t = 1 → full census_weight blend
-  float t = smoothstep(0.1f, 0.6f, ncc_cost);
-  float blend = census_weight * t;
-
-  if (blend < 1e-4f) return ncc_cost;  // fast path: skip Census entirely
-
-  float census = compute_census_cost(ref_img, src_img, ref_cam, src_cam,
-                                     cx, cy, plane);
-  return (1.0f - blend) * ncc_cost + blend * census;
-}
 
 // =====================================================================
 // NCC using pre-computed warp parameters (single-scale).
@@ -490,8 +255,7 @@ float compute_ncc_multiscale(
     float dfdx_x, float dfdx_y,
     float dfdy_x, float dfdy_y,
     float spatial_factor,
-    float color_factor,
-    float *out_var_ref
+    float color_factor
 ) {
   float strides[3] = {1.0f, 2.0f, 3.0f};
   float best_ncc = -1.0f;
@@ -500,7 +264,7 @@ float compute_ncc_multiscale(
         ref_img, src_img, ref_center, src_center,
         src_cx, src_cy, cx, cy, half_patch, strides[s],
         dfdx_x, dfdx_y, dfdy_x, dfdy_y,
-        spatial_factor, color_factor, out_var_ref);
+        spatial_factor, color_factor);
     if (ncc > best_ncc) best_ncc = ncc;
     if (best_ncc > 0.1f) return best_ncc;
   }
@@ -611,11 +375,9 @@ float compute_single_cost(
       (float2)(src_cx + 0.5f, src_cy + 0.5f)).x;
 
   // NCC (single-scale, using pre-computed warp)
-  float var_ref = 0.0f;
   float ncc = compute_ncc_multiscale(ref_img, src_img,
       ref_center, src_center, src_cx, src_cy, cx, cy, half_patch,
-      dfdx_x, dfdx_y, dfdy_x, dfdy_y, spatial_factor, color_factor,
-      &var_ref);
+      dfdx_x, dfdx_y, dfdy_x, dfdy_y, spatial_factor, color_factor);
 
   if (ncc <= -0.5f) {
     if (census_weight > 1e-6f) {
@@ -902,7 +664,6 @@ float compute_smoothness_cost(
 // =====================================================================
 // Compute surface normal from the depth gradient of 4-connected neighbors.
 //
-// OpenMVS-style (ComputeDepthGradient): derives a camera-space normal
 // from how depth changes spatially across neighboring pixels.  This
 // acts as an implicit geometric regularizer — biasing normals toward
 // being consistent with the local depth surface — without any explicit
@@ -1042,21 +803,6 @@ float compute_geom_consistency_cost(
   float dx = (float)px - back_x;
   float dy = (float)py - back_y;
   return min(max_cost, sqrt(dx * dx + dy * dy));
-}
-
-// =====================================================================
-// Compute view-weighted aggregate cost from a per-view cost vector.
-// =====================================================================
-float compute_weighted_cost(const float *cost_vec, const float *view_weights,
-                            float weight_norm, int n_src) {
-  if (weight_norm < 1e-6f) return 2.0f;
-  float total = 0.0f;
-  for (int i = 0; i < n_src; i++) {
-    if (view_weights[i] > 0.0f) {
-      total += view_weights[i] * cost_vec[i];
-    }
-  }
-  return total / weight_norm;
 }
 
 // =====================================================================
@@ -1785,7 +1531,7 @@ __kernel void acmmp_patchmatch(
   //
   // =================================================================
   {
-    // Perturbation scales (OpenMVS: perturbationDepth=0.005, perturbationNormal=0.01*π)
+    // Perturbation scales
     float depth_perturbation = 0.005f;
     float normal_perturbation = 0.01f * M_PI_F;
     float3 cur_normal = normalize((float3)(plane_now.x, plane_now.y, plane_now.z));
@@ -1835,7 +1581,6 @@ __kernel void acmmp_patchmatch(
       if (normal_perturbed.z > 0.0f) normal_perturbed.z = -normal_perturbed.z;
     }
 
-    // Compute surface normal from 4-neighbor depth gradient (OpenMVS trick).
     // This acts as a geometric regularizer: biases normals toward being
     // consistent with the local depth surface, without explicit smoothness.
     float3 surface_normal = compute_surface_normal(planes, &cameras[0],
@@ -1848,7 +1593,7 @@ __kernel void acmmp_patchmatch(
     //   2: (random_depth,     random_normal)
     //   3: (current_depth,    perturbed_normal)
     //   4: (perturbed_depth,  current_normal)
-    //   5: (current_depth,    surface_normal)  — OpenMVS-style
+    //   5: (current_depth,    surface_normal)
     float  ref_depths[6]  = {depth_rand, depth_now, depth_rand,
                              depth_now, depth_perturbed, depth_now};
     float3 ref_normals[6];

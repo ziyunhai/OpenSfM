@@ -620,7 +620,7 @@ def _setup_cluster_params(
     cluster.set_sigma_spatial(config["depthmap_sigma_spatial"])
     cluster.set_sigma_color(config["depthmap_sigma_color"])
     cluster.set_top_k(config["depthmap_num_matching_views"])
-    cluster.set_census_weight(config["depthmap_census_weight"])
+    cluster.set_use_census(config["depthmap_use_census"])
     cluster.set_hierarchy_levels(config["depthmap_hierarchy_levels"])
     cluster.set_smooth_weight(config["depthmap_smooth_weight"])
     cluster.set_checkerboard_filter(config["depthmap_checkerboard_filter"])
@@ -1366,13 +1366,6 @@ def _fuse_per_cluster(
         log.setup()
         cluster_shots = clusters[batch_num]
 
-        ordered = sorted(cluster_shots)
-        local_idx: Dict[str, int] = {
-            sid: i for i, sid in enumerate(ordered)
-        }
-
-        use_svo = config.get("depthmap_fusion_backend", "depthmap") == "svo"
-
         # ── Batch-preload helper ──────────────────────────────────────
         def _prepare_views(
             view_ids: List[str],
@@ -1462,272 +1455,212 @@ def _fuse_per_cluster(
 
         cluster_set = set(cluster_shots) & fusable_set
 
-        if use_svo:
-            # ── SVO fusion with sub-volume splitting ─────────────────
-            voxel_size = config["depthmap_fusion_svo_voxel_size"]
-            trunc_factor_cfg = config["depthmap_fusion_svo_trunc_factor"]
-            max_voxels = config["depthmap_fusion_svo_max_voxels"]
-            coarse_factor = config["depthmap_fusion_svo_coarse_factor"]
-            n_augment = config["depthmap_fusion_svo_augment_neighbors"]
+        # ── SVO fusion with sub-volume splitting ─────────────────
+        voxel_size = config["depthmap_fusion_svo_voxel_size"]
+        trunc_factor_cfg = config["depthmap_fusion_svo_trunc_factor"]
+        max_voxels = config["depthmap_fusion_svo_max_voxels"]
+        coarse_factor = config["depthmap_fusion_svo_coarse_factor"]
+        n_augment = config["depthmap_fusion_svo_augment_neighbors"]
 
-            # Step 1: Augment cluster with neighbor views.
-            augmented = _augment_cluster_views(
-                cluster_shots, all_neighbors, fusable_set, n_augment,
+        # Step 1: Augment cluster with neighbor views.
+        augmented = _augment_cluster_views(
+            cluster_shots, all_neighbors, fusable_set, n_augment,
+        )
+        n_extra = len(augmented) - len(cluster_shots)
+        logger.info(
+            f"Cluster {batch_num}: {len(cluster_shots)} shots + "
+            f"{n_extra} augmented = {len(augmented)} total"
+        )
+
+        # Step 2: Pre-scan on CPU (subsampled depth projection).
+        grid = _prescan_coarse_grid(
+            data, augmented, reconstruction,
+            voxel_size, coarse_factor,
+        )
+        coarse_size = voxel_size * coarse_factor
+        logger.info(
+            f"Cluster {batch_num}: pre-scan found {len(grid)} "
+            f"coarse cells (cell_size={coarse_size:.3f}m)"
+        )
+
+        # Step 3: Split into sub-volumes.
+        subvolumes = _split_into_subvolumes(
+            grid, augmented, voxel_size, coarse_factor,
+            max_voxels, trunc_factor_cfg,
+        )
+        logger.info(
+            f"Cluster {batch_num}: split into "
+            f"{len(subvolumes)} sub-volume(s)"
+        )
+
+        # Step 4: Fuse each sub-volume independently.
+        #         If the GPU counting pass reveals more voxels than
+        #         the budget, recursively split along the longest
+        #         core axis.
+        all_points: List[NDArray] = []
+        all_normals: List[NDArray] = []
+        all_colors: List[NDArray] = []
+
+        # Batch-load all views upfront (parallel I/O).
+        view_cache = _prepare_views(augmented)
+        logger.info(
+            f"Cluster {batch_num}: loaded {len(view_cache)} views"
+        )
+
+        def _fuse_subvolume(sv: _SubVolume) -> None:
+            """Fuse a single sub-volume, splitting if over budget."""
+            fuser = pydense.SVOFuser()
+            fuser.set_voxel_size(voxel_size)
+            fuser.set_trunc_factor(trunc_factor_cfg)
+            fuser.set_min_weight(
+                config["depthmap_fusion_svo_min_weight"]
             )
-            n_extra = len(augmented) - len(cluster_shots)
-            logger.info(
-                f"Cluster {batch_num}: {len(cluster_shots)} shots + "
-                f"{n_extra} augmented = {len(augmented)} total"
-            )
+            fuser.set_device(0)
+            fuser.set_bbox(sv.ext_min, sv.ext_max)
 
-            # Step 2: Pre-scan on CPU (subsampled depth projection).
-            grid = _prescan_coarse_grid(
-                data, augmented, reconstruction,
-                voxel_size, coarse_factor,
-            )
-            coarse_size = voxel_size * coarse_factor
-            logger.info(
-                f"Cluster {batch_num}: pre-scan found {len(grid)} "
-                f"coarse cells (cell_size={coarse_size:.3f}m)"
-            )
-
-            # Step 3: Split into sub-volumes.
-            subvolumes = _split_into_subvolumes(
-                grid, augmented, voxel_size, coarse_factor,
-                max_voxels, trunc_factor_cfg,
-            )
-            logger.info(
-                f"Cluster {batch_num}: split into "
-                f"{len(subvolumes)} sub-volume(s)"
-            )
-
-            # Step 4: Fuse each sub-volume independently.
-            #         If the GPU counting pass reveals more voxels than
-            #         the budget, recursively split along the longest
-            #         core axis.
-            all_points: List[NDArray] = []
-            all_normals: List[NDArray] = []
-            all_colors: List[NDArray] = []
-
-            # Batch-load all views upfront (parallel I/O).
-            view_cache = _prepare_views(augmented)
-            logger.info(
-                f"Cluster {batch_num}: loaded {len(view_cache)} views"
-            )
-
-            def _fuse_subvolume(sv: _SubVolume) -> None:
-                """Fuse a single sub-volume, splitting if over budget."""
-                fuser = pydense.SVOFuser()
-                fuser.set_voxel_size(voxel_size)
-                fuser.set_trunc_factor(trunc_factor_cfg)
-                fuser.set_min_weight(
-                    config["depthmap_fusion_svo_min_weight"]
-                )
-                fuser.set_device(0)
-                fuser.set_bbox(sv.ext_min, sv.ext_max)
-
-                sv_views = sorted(sv.view_ids)
-                n_loaded = 0
-                for sid in sv_views:
-                    result = view_cache.get(sid)
-                    if result is None:
-                        continue
-                    K, R, t, depth, normal, color, vmask, conf = result
-                    fuser.add_view(
-                        K, R, t, depth, normal, color, vmask,
-                        confidence=conf, name=sid,
-                    )
-                    n_loaded += 1
-
-                logger.info(
-                    f"  Sub-volume ({n_loaded} views), core "
-                    f"[{sv.core_min[0]:.1f},{sv.core_min[1]:.1f},"
-                    f"{sv.core_min[2]:.1f}]-"
-                    f"[{sv.core_max[0]:.1f},{sv.core_max[1]:.1f},"
-                    f"{sv.core_max[2]:.1f}]"
-                )
-
-                if n_loaded == 0:
-                    return
-
-                # Count actual voxels on GPU.
-                n_voxels = fuser.count_voxels()
-                if n_voxels > max_voxels:
-                    logger.info(
-                        f"  → {n_voxels} voxels > budget "
-                        f"{max_voxels}, splitting …"
-                    )
-                    del fuser
-                    # Binary split along longest core axis.
-                    spans = sv.core_max - sv.core_min
-                    axis = int(np.argmax(spans))
-                    mid = (sv.core_min[axis] + sv.core_max[axis]) / 2.0
-                    margin = trunc_factor_cfg * voxel_size
-
-                    # Left half.
-                    left_core_max = sv.core_max.copy()
-                    left_core_max[axis] = mid
-                    left_ext_min = (
-                        sv.core_min - margin
-                    ).astype(np.float32)
-                    left_ext_max = (
-                        left_core_max + margin
-                    ).astype(np.float32)
-                    left_views = {
-                        sid for sid in sv.view_ids
-                        if sid in fusable_set
-                    }
-                    left_sv = _SubVolume(
-                        core_min=sv.core_min.copy(),
-                        core_max=left_core_max.astype(np.float32),
-                        ext_min=left_ext_min,
-                        ext_max=left_ext_max,
-                        view_ids=left_views,
-                    )
-
-                    # Right half.
-                    right_core_min = sv.core_min.copy()
-                    right_core_min[axis] = mid
-                    right_ext_min = (
-                        right_core_min - margin
-                    ).astype(np.float32)
-                    right_ext_max = (
-                        sv.core_max + margin
-                    ).astype(np.float32)
-                    right_sv = _SubVolume(
-                        core_min=right_core_min.astype(np.float32),
-                        core_max=sv.core_max.copy(),
-                        ext_min=right_ext_min,
-                        ext_max=right_ext_max,
-                        view_ids=left_views,  # same views
-                    )
-
-                    _fuse_subvolume(left_sv)
-                    _fuse_subvolume(right_sv)
-                    return
-
-                # Voxels within budget — proceed with integration.
-                refine_enabled = config[
-                    "depthmap_fusion_svo_refine_enabled"
-                ]
-                if refine_enabled:
-                    fuser.fuse_only()
-                    fuser.refine(
-                        color_iters=config[
-                            "depthmap_fusion_svo_refine_color_iters"
-                        ],
-                        joint_iters=config[
-                            "depthmap_fusion_svo_refine_joint_iters"
-                        ],
-                        lambda_reg=config[
-                            "depthmap_fusion_svo_refine_lambda_reg"
-                        ],
-                    )
-                    pts_arr, nrm_arr, clr_arr = fuser.extract_points()
-                else:
-                    pts_arr, nrm_arr, clr_arr = fuser.fuse()
-                pts = np.asarray(pts_arr, dtype=np.float32)
-                nrm = np.asarray(nrm_arr, dtype=np.float32)
-                clr = np.asarray(clr_arr, dtype=np.uint8)
-
-                if len(pts) > 0:
-                    inside_core = np.all(
-                        (pts >= sv.core_min) & (pts <= sv.core_max),
-                        axis=1,
-                    )
-                    pts = pts[inside_core]
-                    nrm = nrm[inside_core]
-                    clr = clr[inside_core]
-
-                if len(pts) > 0:
-                    all_points.append(pts)
-                    all_normals.append(nrm)
-                    all_colors.append(clr)
-                    logger.info(
-                        f"    → {len(pts)} points extracted"
-                    )
-
-                del fuser
-
-            for sv in subvolumes:
-                _fuse_subvolume(sv)
-                gc.collect()
-
-            view_cache.clear()
-
-            # Concatenate all sub-volume results.
-            if all_points:
-                points = np.concatenate(all_points)
-                normals = np.concatenate(all_normals)
-                colors = np.concatenate(all_colors)
-            else:
-                points = np.empty((0, 3), dtype=np.float32)
-                normals = np.empty((0, 3), dtype=np.float32)
-                colors = np.empty((0, 3), dtype=np.uint8)
-            logger.info(
-                f"Cluster {batch_num}: {len(points)} total fused points "
-                f"from {len(subvolumes)} sub-volume(s)"
-            )
-            context.log_memory("fused cluster data in memory")
-
-        else:
-            # ── Depthmap fusion (unchanged) ──────────────────────────
-            fuser = pydense.DepthmapFuser()
-            fuser.set_min_num_consistent(
-                config["depthmap_fusion_min_consistent"]
-            )
-            fuser.set_max_reproj_error(
-                config["depthmap_fusion_max_reproj_error"]
-            )
-            fuser.set_max_depth_error(
-                config["depthmap_fusion_max_depth_error"]
-            )
-            fuser.set_max_normal_error(
-                config["depthmap_fusion_max_normal_error"]
-            )
-            fuser.set_border_margin(config["depthmap_fusion_border_margin"])
-            fuser.set_num_threads(config["depthmap_fusion_num_threads"])
-            fuser.set_sor_params(
-                config["depthmap_fusion_sor_knn"],
-                config["depthmap_fusion_sor_stddev_factor"],
-            )
-            fuser.set_behind_depth_factor(
-                config["depthmap_fusion_behind_depth_factor"]
-            )
-
-            dm_views = _prepare_views(ordered)
-            for sid in ordered:
-                result = dm_views.get(sid)
+            sv_views = sorted(sv.view_ids)
+            n_loaded = 0
+            for sid in sv_views:
+                result = view_cache.get(sid)
                 if result is None:
                     continue
-                K, R, t, depth, normal, color, vmask, confidence = result
-                nbrs = cluster_set
-                nbr_local = np.array(
-                    sorted(
-                        local_idx[n] for n in nbrs if n in local_idx
-                    ),
-                    dtype=np.int32,
-                )
-                is_primary = sid in cluster_set
+                K, R, t, depth, normal, color, vmask, conf = result
                 fuser.add_view(
-                    K, R, t,
-                    depth, normal, color,
-                    vmask,
-                    nbr_local,
-                    primary=is_primary,
+                    K, R, t, depth, normal, color, vmask,
+                    confidence=conf, name=sid,
                 )
+                n_loaded += 1
 
             logger.info(
-                f"Fusing cluster {batch_num}: {len(cluster_set)} "
-                f"primary views, {len(ordered)} total views …"
+                f"  Sub-volume ({n_loaded} views), core "
+                f"[{sv.core_min[0]:.1f},{sv.core_min[1]:.1f},"
+                f"{sv.core_min[2]:.1f}]-"
+                f"[{sv.core_max[0]:.1f},{sv.core_max[1]:.1f},"
+                f"{sv.core_max[2]:.1f}]"
             )
-            points_arr, normals_arr, colors_arr = fuser.fuse()
-            context.log_memory("fused cluster data in memory")
-            points = np.asarray(points_arr, dtype=np.float32)
-            normals = np.asarray(normals_arr, dtype=np.float32)
-            colors = np.asarray(colors_arr, dtype=np.uint8)
+
+            if n_loaded == 0:
+                return
+
+            # Count actual voxels on GPU.
+            n_voxels = fuser.count_voxels()
+            if n_voxels > max_voxels:
+                logger.info(
+                    f"  → {n_voxels} voxels > budget "
+                    f"{max_voxels}, splitting …"
+                )
+                del fuser
+                # Binary split along longest core axis.
+                spans = sv.core_max - sv.core_min
+                axis = int(np.argmax(spans))
+                mid = (sv.core_min[axis] + sv.core_max[axis]) / 2.0
+                margin = trunc_factor_cfg * voxel_size
+
+                # Left half.
+                left_core_max = sv.core_max.copy()
+                left_core_max[axis] = mid
+                left_ext_min = (
+                    sv.core_min - margin
+                ).astype(np.float32)
+                left_ext_max = (
+                    left_core_max + margin
+                ).astype(np.float32)
+                left_views = {
+                    sid for sid in sv.view_ids
+                    if sid in fusable_set
+                }
+                left_sv = _SubVolume(
+                    core_min=sv.core_min.copy(),
+                    core_max=left_core_max.astype(np.float32),
+                    ext_min=left_ext_min,
+                    ext_max=left_ext_max,
+                    view_ids=left_views,
+                )
+
+                # Right half.
+                right_core_min = sv.core_min.copy()
+                right_core_min[axis] = mid
+                right_ext_min = (
+                    right_core_min - margin
+                ).astype(np.float32)
+                right_ext_max = (
+                    sv.core_max + margin
+                ).astype(np.float32)
+                right_sv = _SubVolume(
+                    core_min=right_core_min.astype(np.float32),
+                    core_max=sv.core_max.copy(),
+                    ext_min=right_ext_min,
+                    ext_max=right_ext_max,
+                    view_ids=left_views,  # same views
+                )
+
+                _fuse_subvolume(left_sv)
+                _fuse_subvolume(right_sv)
+                return
+
+            # Voxels within budget — proceed with integration.
+            refine_enabled = config[
+                "depthmap_fusion_svo_refine_enabled"
+            ]
+            if refine_enabled:
+                fuser.fuse_only()
+                fuser.refine(
+                    color_iters=config[
+                        "depthmap_fusion_svo_refine_color_iters"
+                    ],
+                    joint_iters=config[
+                        "depthmap_fusion_svo_refine_joint_iters"
+                    ],
+                    lambda_reg=config[
+                        "depthmap_fusion_svo_refine_lambda_reg"
+                    ],
+                )
+                pts_arr, nrm_arr, clr_arr = fuser.extract_points()
+            else:
+                pts_arr, nrm_arr, clr_arr = fuser.fuse()
+            pts = np.asarray(pts_arr, dtype=np.float32)
+            nrm = np.asarray(nrm_arr, dtype=np.float32)
+            clr = np.asarray(clr_arr, dtype=np.uint8)
+
+            if len(pts) > 0:
+                inside_core = np.all(
+                    (pts >= sv.core_min) & (pts <= sv.core_max),
+                    axis=1,
+                )
+                pts = pts[inside_core]
+                nrm = nrm[inside_core]
+                clr = clr[inside_core]
+
+            if len(pts) > 0:
+                all_points.append(pts)
+                all_normals.append(nrm)
+                all_colors.append(clr)
+                logger.info(
+                    f"    → {len(pts)} points extracted"
+                )
+
             del fuser
+
+        for sv in subvolumes:
+            _fuse_subvolume(sv)
             gc.collect()
+
+        view_cache.clear()
+
+        # Concatenate all sub-volume results.
+        if all_points:
+            points = np.concatenate(all_points)
+            normals = np.concatenate(all_normals)
+            colors = np.concatenate(all_colors)
+        else:
+            points = np.empty((0, 3), dtype=np.float32)
+            normals = np.empty((0, 3), dtype=np.float32)
+            colors = np.empty((0, 3), dtype=np.uint8)
+        logger.info(
+            f"Cluster {batch_num}: {len(points)} total fused points "
+            f"from {len(subvolumes)} sub-volume(s)"
+        )
+        context.log_memory("fused cluster data in memory")
 
         # Clip to cluster bbox with Voronoi deduplication.
         if len(points) > 0:

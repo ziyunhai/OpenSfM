@@ -431,8 +431,8 @@ class OpenSfMConfig:
     depthmap_sigma_spatial: float = 3.0
     # Color sigma for bilateral NCC weighting, in normalized [0,1] intensity units.
     depthmap_sigma_color: float = 25.0 / 255.0
-    # Weight for Census transform cost vs bilateral NCC (0 = NCC only, 1 = Census only).
-    depthmap_census_weight: float = 0.3
+    # Use Census transform as fallback when bilateral NCC fails (low-texture regions).
+    depthmap_use_census: bool = True
     # Number of multi-scale hierarchy levels (1 = full-res only, 2 = half+full,  3 = quarter+half+full, etc.).
     depthmap_hierarchy_levels: int = 3
     # Enable checkerboard bilateral median filter after PatchMatch iterations
@@ -454,32 +454,6 @@ class OpenSfMConfig:
     depthmap_neighbor_min_angle: float = 3.0
     # Maximum baseline angle (degrees) for neighbor selection.
     depthmap_neighbor_max_angle: float = 60.0
-    # Number of shots per incremental fusion batch (controls peak memory).
-    depthmap_fusion_batch_size: int = 50
-    # Minimum number of consistent views for a fused point
-    depthmap_fusion_min_consistent: int = 3
-    # Maximum reprojection error in pixels for fusion consistency
-    depthmap_fusion_max_reproj_error: float = 2.0
-    # Maximum relative depth error for fusion consistency
-    depthmap_fusion_max_depth_error: float = 0.01
-    # Maximum normal angle difference in degrees for fusion consistency
-    depthmap_fusion_max_normal_error: float = 10.0
-    # Border margin in pixels to skip near image edges during fusion
-    depthmap_fusion_border_margin: int = 10
-    # Number of threads for fusion
-    depthmap_fusion_num_threads: int = 8
-    # Statistical Outlier Removal: k-nearest-neighbors count (0 = disabled)
-    depthmap_fusion_sor_knn: int = 0
-    # SOR standard-deviation multiplier (points beyond mean + factor*std removed)
-    depthmap_fusion_sor_stddev_factor: float = 2.5
-    # Behind-depth factor for asymmetric depth tolerance (0.0–1.0).
-    # Scales the depth tolerance on the "behind" side of a source surface.
-    # Lower values reject points that lie behind a known surface more
-    # aggressively, suppressing ghost / double wall artifacts.
-    depthmap_fusion_behind_depth_factor: float = 0.3
-    # Fusion backend: "depthmap" (classic per-pixel) or "svo" (TSDF voxel).
-    # The SVO backend naturally suppresses double-wall artifacts.
-    depthmap_fusion_backend: str = "svo"
     # SVO voxel size in world units (meters). Smaller = finer but more memory.
     depthmap_fusion_svo_voxel_size: float = 0.05
     # SVO truncation factor: truncation_distance = factor * voxel_size.

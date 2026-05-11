@@ -22,7 +22,7 @@ struct DepthmapParams {
   float sigma_spatial = 3.0f;
   float sigma_color = 3.0f / 255.0f;
   int top_k = 4;
-  float census_weight = 0.3f;
+  bool use_census = true;
   float depth_min = 0.0f;
   float depth_max = 1.0f;
   int hierarchy_levels = 1;

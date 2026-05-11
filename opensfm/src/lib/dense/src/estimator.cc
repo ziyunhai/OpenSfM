@@ -438,7 +438,7 @@ void DepthmapEstimator::RandomInit(int width, int height) {
   k_random_init_.setArg(arg++, params_.sigma_spatial);
   k_random_init_.setArg(arg++, params_.sigma_color);
   k_random_init_.setArg(arg++, params_.top_k);
-  k_random_init_.setArg(arg++, params_.census_weight);
+  k_random_init_.setArg(arg++, params_.use_census ? 1.0f : 0.0f);
   k_random_init_.setArg(arg++, cl_low_depths_);
 
   cl::NDRange global(static_cast<size_t>((width + 15) / 16 * 16),
@@ -476,7 +476,7 @@ void DepthmapEstimator::PriorReinit(int width, int height) {
   k_prior_reinit_.setArg(arg++, params_.sigma_spatial);
   k_prior_reinit_.setArg(arg++, params_.sigma_color);
   k_prior_reinit_.setArg(arg++, params_.top_k);
-  k_prior_reinit_.setArg(arg++, params_.census_weight);
+  k_prior_reinit_.setArg(arg++, params_.use_census ? 1.0f : 0.0f);
   k_prior_reinit_.setArg(arg++, cl_prior_planes_);
   k_prior_reinit_.setArg(arg++, cl_plane_masks_);
   // Cost-parity arguments: match acmmp_patchmatch's total cost.
@@ -520,7 +520,7 @@ void DepthmapEstimator::RunIteration(int iter, int width, int height) {
     k.setArg(arg++, params_.sigma_spatial);
     k.setArg(arg++, params_.sigma_color);
     k.setArg(arg++, params_.top_k);
-    k.setArg(arg++, params_.census_weight);
+    k.setArg(arg++, params_.use_census ? 1.0f : 0.0f);
     k.setArg(arg++, color_flag);
     k.setArg(arg++, iter);
     k.setArg(arg++, params_.smooth_weight);
