@@ -15,11 +15,11 @@ namespace dense {
 /// Parameters for the PatchMatch PatchMatch algorithm.
 struct DepthmapParams {
   int max_iterations = 3;
-  int patch_size = 11;
+  int patch_size = 5;
   int num_images = 17;
   int max_image_size = 3200;
   int radius_increment = 2;
-  float sigma_spatial = 5.0f;
+  float sigma_spatial = 3.0f;
   float sigma_color = 3.0f / 255.0f;
   int top_k = 4;
   float census_weight = 0.3f;
@@ -27,6 +27,9 @@ struct DepthmapParams {
   float depth_max = 1.0f;
   int hierarchy_levels = 1;
   float smooth_weight = 0.0f;
+  bool checkerboard_filter = false;
+  int speckle_min_size = 100;  // Remove connected components smaller than this
+  int gap_max_size = 7;        // Interpolate gaps up to this many pixels
 };
 
 /// Result of an PatchMatch depth estimation.
@@ -75,6 +78,12 @@ class DepthmapEstimator {
   void UploadPreviousDepths(int width, int height);
   void ReadBackResults(DepthmapResult* result, int width, int height,
                        bool apply_median = true);
+  static void RemoveSmallSegments(ImageF& depth, PixelData3f& normal, int width,
+                                  int height, int min_segment_size,
+                                  float depth_diff_threshold);
+  static void GapInterpolation(ImageF& depth, PixelData3f& normal, int width,
+                               int height, int max_gap_size,
+                               float depth_diff_threshold);
 
   // Images stay as cv::Mat for OpenCL upload and cv::resize.
   std::vector<cv::Mat> images_;
@@ -119,6 +128,8 @@ class DepthmapEstimator {
   cl::Buffer cl_plane_masks_;
   cl::Buffer cl_prev_depths_;
   cl_uint cl_prev_depth_mask_ = 0u;
+  cl::Buffer
+      cl_low_depths_;  // Upsampled coarse-level depths for prior blending
 
   // Host-side prior data for confidence computation.
   ImageF prior_depths_;    // (H, W) — prior depth per pixel

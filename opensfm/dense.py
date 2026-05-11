@@ -623,6 +623,9 @@ def _setup_cluster_params(
     cluster.set_census_weight(config["depthmap_census_weight"])
     cluster.set_hierarchy_levels(config["depthmap_hierarchy_levels"])
     cluster.set_smooth_weight(config["depthmap_smooth_weight"])
+    cluster.set_checkerboard_filter(config["depthmap_checkerboard_filter"])
+    cluster.set_speckle_min_size(config["depthmap_speckle_min_size"])
+    cluster.set_gap_max_size(config["depthmap_gap_max_size"])
     cluster.set_geom_consistency_weight(
         config["depthmap_geom_consistency_weight"]
     )

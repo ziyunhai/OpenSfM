@@ -203,7 +203,9 @@ void SVOFuser::Refine(int color_iters, int joint_iters, float lambda_reg) {
     to_row_major(Kinv, cam.Kinv);
     to_row_major(Rinv, cam.Rinv);
     to_row_major(Rf, cam.R);
-    cam.t[0] = tf.x(); cam.t[1] = tf.y(); cam.t[2] = tf.z();
+    cam.t[0] = tf.x();
+    cam.t[1] = tf.y();
+    cam.t[2] = tf.z();
     cam.cam_pos[0] = cam_pos.x();
     cam.cam_pos[1] = cam_pos.y();
     cam.cam_pos[2] = cam_pos.z();
@@ -250,8 +252,8 @@ void SVOFuser::Refine(int color_iters, int joint_iters, float lambda_reg) {
     depth_offset += npix;
   }
 
-  integrator_->PrepareRefinement(cameras, packed_colors, packed_depths,
-                                 descs, n_views);
+  integrator_->PrepareRefinement(cameras, packed_colors, packed_depths, descs,
+                                 n_views);
 
   const float lambda_decay = 0.95f;
   integrator_->Refine(color_iters, joint_iters, lambda_reg, lambda_decay,

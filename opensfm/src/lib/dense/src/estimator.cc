@@ -189,6 +189,31 @@ void DepthmapEstimator::RunLevel(int level, int total_levels,
 
   UploadData();
 
+  // Upload coarse-level depths for depth-prior blending in textureless regions.
+  {
+    auto& ctx = opencl::CLContext::Instance().Device(device_idx_).context();
+    auto& queue = opencl::CLContext::Instance().Device(device_idx_).queue();
+    const int npix = w * h;
+    cl_int err;
+    cl_low_depths_ =
+        cl::Buffer(ctx, CL_MEM_READ_ONLY, sizeof(float) * npix, nullptr, &err);
+    opencl::CheckCL(err, "low_depths alloc");
+    if (prev_level_w_ > 0 && prev_level_result_.depth.size() > 0) {
+      // Bilinearly interpolate coarse depth to current resolution.
+      cv::Mat coarse_cv(prev_level_h_, prev_level_w_, CV_32F,
+                        const_cast<float*>(prev_level_result_.depth.data()));
+      cv::Mat upsampled;
+      cv::resize(coarse_cv, upsampled, cv::Size(w, h), 0, 0, cv::INTER_LINEAR);
+      queue.enqueueWriteBuffer(cl_low_depths_, CL_TRUE, 0, sizeof(float) * npix,
+                               upsampled.data);
+    } else {
+      // Level 0 or no previous data: fill with zeros (disables prior).
+      std::vector<float> zeros(npix, 0.0f);
+      queue.enqueueWriteBuffer(cl_low_depths_, CL_TRUE, 0, sizeof(float) * npix,
+                               zeros.data());
+    }
+  }
+
   if (level == 0 && prev_level_w_ == 0) {
     RandomInit(w, h);
   } else if (prev_level_w_ > 0) {
@@ -209,7 +234,9 @@ void DepthmapEstimator::RunLevel(int level, int total_levels,
   for (int i = 0; i < params_.max_iterations; ++i) {
     RunIteration(i, w, h);
   }
-  RunCheckerboardFilter(w, h);
+  if (params_.checkerboard_filter) {
+    RunCheckerboardFilter(w, h);
+  }
 
   auto& dev = opencl::CLContext::Instance().Device(device_idx_);
   const int npix = w * h;
@@ -412,6 +439,7 @@ void DepthmapEstimator::RandomInit(int width, int height) {
   k_random_init_.setArg(arg++, params_.sigma_color);
   k_random_init_.setArg(arg++, params_.top_k);
   k_random_init_.setArg(arg++, params_.census_weight);
+  k_random_init_.setArg(arg++, cl_low_depths_);
 
   cl::NDRange global(static_cast<size_t>((width + 15) / 16 * 16),
                      static_cast<size_t>((height + 15) / 16 * 16));
@@ -456,6 +484,7 @@ void DepthmapEstimator::PriorReinit(int width, int height) {
   k_prior_reinit_.setArg(arg++, cl_prev_depths_);
   k_prior_reinit_.setArg(arg++, cl_prev_depth_mask_);
   k_prior_reinit_.setArg(arg++, geom_weight_);
+  k_prior_reinit_.setArg(arg++, cl_low_depths_);
 
   cl::NDRange global(static_cast<size_t>((width + 15) / 16 * 16),
                      static_cast<size_t>((height + 15) / 16 * 16));
@@ -502,6 +531,7 @@ void DepthmapEstimator::RunIteration(int iter, int width, int height) {
     // Planar prior arguments.
     k.setArg(arg++, cl_prior_planes_);
     k.setArg(arg++, cl_plane_masks_);
+    k.setArg(arg++, cl_low_depths_);
   };
 
   cl::NDRange global(static_cast<size_t>((width + 15) / 16 * 16),
@@ -1016,6 +1046,18 @@ void DepthmapEstimator::ReadBackResults(DepthmapResult* result, int width,
     }
   }
 
+  // ---- Speckle removal: BFS flood-fill, remove small segments ----
+  if (params_.speckle_min_size > 0) {
+    RemoveSmallSegments(result->depth, result->normal, width, height,
+                        params_.speckle_min_size, 0.01f);
+  }
+
+  // ---- Gap interpolation: fill small holes row-wise + column-wise ----
+  if (params_.gap_max_size > 0) {
+    GapInterpolation(result->depth, result->normal, width, height,
+                     params_.gap_max_size, 0.025f);
+  }
+
   // ---- Surface confidence: logistic on photometric cost ----
   // P(surface) = sigmoid(-(cost - c0) / lambda)
   // Cost already captures match quality; prior is used for PatchMatch guidance,
@@ -1037,6 +1079,192 @@ void DepthmapEstimator::ReadBackResults(DepthmapResult* result, int width,
   }
 }
 
+// =====================================================================
+// Speckle removal: BFS flood-fill to find connected components of
+// similar depth, then zero out components smaller than min_segment_size.
+// depth_diff_threshold is the relative depth difference threshold.
+// =====================================================================
+void DepthmapEstimator::RemoveSmallSegments(ImageF& depth, PixelData3f& normal,
+                                            int width, int height,
+                                            int min_segment_size,
+                                            float depth_diff_threshold) {
+  const int npix = width * height;
+  std::vector<bool> visited(npix, false);
+  std::vector<int> segment;
+  segment.reserve(1024);
+
+  // 4-connectivity offsets: right, left, down, up
+  const int dx[4] = {1, -1, 0, 0};
+  const int dy[4] = {0, 0, 1, -1};
+
+  int total_removed = 0;
+
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      int idx = y * width + x;
+      if (visited[idx] || depth(y, x) <= 0.0f) {
+        visited[idx] = true;
+        continue;
+      }
+
+      // BFS flood fill
+      segment.clear();
+      segment.push_back(idx);
+      visited[idx] = true;
+      int head = 0;
+
+      while (head < static_cast<int>(segment.size())) {
+        int cur = segment[head++];
+        int cy = cur / width;
+        int cx = cur % width;
+        float d_cur = depth(cy, cx);
+
+        for (int dir = 0; dir < 4; ++dir) {
+          int nx = cx + dx[dir];
+          int ny = cy + dy[dir];
+          if (nx < 0 || nx >= width || ny < 0 || ny >= height) {
+            continue;
+          }
+          int nidx = ny * width + nx;
+          if (visited[nidx]) {
+            continue;
+          }
+          float d_nbr = depth(ny, nx);
+          if (d_nbr <= 0.0f) {
+            visited[nidx] = true;
+            continue;
+          }
+          // Relative depth similarity check
+          float max_d = std::max(d_cur, d_nbr);
+          if (std::abs(d_cur - d_nbr) / max_d < depth_diff_threshold) {
+            visited[nidx] = true;
+            segment.push_back(nidx);
+          }
+        }
+      }
+
+      // Remove small segments
+      if (static_cast<int>(segment.size()) < min_segment_size) {
+        for (int pidx : segment) {
+          int py = pidx / width;
+          int px = pidx % width;
+          depth(py, px) = 0.0f;
+          normal.col(pidx).setZero();
+        }
+        total_removed += static_cast<int>(segment.size());
+      }
+    }
+  }
+
+  if (total_removed > 0) {
+    std::cerr << "[PatchMatch] Speckle removal: " << total_removed
+              << " pixels removed (min segment " << min_segment_size << ")\n";
+  }
+}
+
+// =====================================================================
+// Gap interpolation: scan row-wise then column-wise, linearly
+// interpolate depth and normal for small gaps bounded by similar depths.
+// depth_diff_threshold is the relative depth difference threshold for
+// the gap boundary pixels.
+// =====================================================================
+void DepthmapEstimator::GapInterpolation(ImageF& depth, PixelData3f& normal,
+                                         int width, int height,
+                                         int max_gap_size,
+                                         float depth_diff_threshold) {
+  int total_filled = 0;
+
+  // 1. Row-wise (horizontal gaps)
+  for (int y = 0; y < height; ++y) {
+    int gap_start = -1;
+    for (int x = 0; x < width; ++x) {
+      float d = depth(y, x);
+      if (d <= 0.0f) {
+        if (gap_start < 0) {
+          gap_start = x;
+        }
+        continue;
+      }
+      // We hit a valid pixel after a gap
+      if (gap_start >= 0) {
+        int gap_len = x - gap_start;
+        int left_x = gap_start - 1;
+        if (left_x >= 0 && gap_len <= max_gap_size) {
+          float d_left = depth(y, left_x);
+          float d_right = d;
+          float max_d = std::max(d_left, d_right);
+          if (std::abs(d_left - d_right) / max_d < depth_diff_threshold) {
+            // Linearly interpolate depth and normal
+            Vec3f n_left = normal.col(y * width + left_x);
+            Vec3f n_right = normal.col(y * width + x);
+            for (int gx = gap_start; gx < x; ++gx) {
+              float t = static_cast<float>(gx - left_x) /
+                        static_cast<float>(x - left_x);
+              depth(y, gx) = d_left + t * (d_right - d_left);
+              Vec3f n_interp = (1.0f - t) * n_left + t * n_right;
+              float nlen = n_interp.norm();
+              if (nlen > 1e-6f) {
+                n_interp /= nlen;
+              }
+              normal.col(y * width + gx) = n_interp;
+              ++total_filled;
+            }
+          }
+        }
+      }
+      gap_start = -1;
+    }
+  }
+
+  // 2. Column-wise (vertical gaps)
+  for (int x = 0; x < width; ++x) {
+    int gap_start = -1;
+    for (int y = 0; y < height; ++y) {
+      float d = depth(y, x);
+      if (d <= 0.0f) {
+        if (gap_start < 0) {
+          gap_start = y;
+        }
+        continue;
+      }
+      if (gap_start >= 0) {
+        int gap_len = y - gap_start;
+        int top_y = gap_start - 1;
+        if (top_y >= 0 && gap_len <= max_gap_size) {
+          float d_top = depth(top_y, x);
+          float d_bottom = d;
+          float max_d = std::max(d_top, d_bottom);
+          if (std::abs(d_top - d_bottom) / max_d < depth_diff_threshold) {
+            Vec3f n_top = normal.col(top_y * width + x);
+            Vec3f n_bottom = normal.col(y * width + x);
+            for (int gy = gap_start; gy < y; ++gy) {
+              float t = static_cast<float>(gy - top_y) /
+                        static_cast<float>(y - top_y);
+              // Only fill if still empty (don't overwrite row-wise fills)
+              if (depth(gy, x) <= 0.0f) {
+                depth(gy, x) = d_top + t * (d_bottom - d_top);
+                Vec3f n_interp = (1.0f - t) * n_top + t * n_bottom;
+                float nlen = n_interp.norm();
+                if (nlen > 1e-6f) {
+                  n_interp /= nlen;
+                }
+                normal.col(gy * width + x) = n_interp;
+                ++total_filled;
+              }
+            }
+          }
+        }
+      }
+      gap_start = -1;
+    }
+  }
+
+  if (total_filled > 0) {
+    std::cerr << "[PatchMatch] Gap interpolation: " << total_filled
+              << " pixels filled (max gap " << max_gap_size << ")\n";
+  }
+}
+
 void DepthmapEstimator::ReleaseGpuBuffers() {
   // Release GPU buffers (host-pinned memory on many OpenCL implementations).
   for (int i = 0; i < static_cast<int>(cl_images_.size()); i++) {
@@ -1051,6 +1279,7 @@ void DepthmapEstimator::ReleaseGpuBuffers() {
   cl_prior_planes_ = cl::Buffer();
   cl_plane_masks_ = cl::Buffer();
   cl_prev_depths_ = cl::Buffer();
+  cl_low_depths_ = cl::Buffer();
   cl_prev_depth_mask_ = 0u;
 }
 

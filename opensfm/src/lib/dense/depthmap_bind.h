@@ -27,6 +27,9 @@ class DepthmapClusterEstimatorWrapper {
   void SetTopK(int k) { params_.top_k = k; }
   void SetCensusWeight(float w) { params_.census_weight = w; }
   void SetSmoothWeight(float w) { params_.smooth_weight = w; }
+  void SetCheckerboardFilter(bool v) { params_.checkerboard_filter = v; }
+  void SetSpeckleMinSize(int v) { params_.speckle_min_size = v; }
+  void SetGapMaxSize(int v) { params_.gap_max_size = v; }
   void SetGeomConsistencyWeight(float w) {
     cluster_.SetGeomConsistencyWeight(w);
   }
@@ -173,6 +176,9 @@ class DepthmapClusterEstimatorWrapper {
   void SetTopK(int) {}
   void SetCensusWeight(float) {}
   void SetSmoothWeight(float) {}
+  void SetCheckerboardFilter(bool) {}
+  void SetSpeckleMinSize(int) {}
+  void SetGapMaxSize(int) {}
   void SetGeomConsistencyWeight(float) {}
   void SetDevice(int) {}
   int BeginRefView(const Mat3d&, const Mat3d&, const Vec3d&,

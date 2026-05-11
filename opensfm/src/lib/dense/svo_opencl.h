@@ -108,26 +108,26 @@ class SVOIntegratorCL {
   struct ImageDesc {
     int32_t width;
     int32_t height;
-    int32_t offset;   // byte offset into packed color buffer
+    int32_t offset;  // byte offset into packed color buffer
     int32_t _pad;
   };
   static_assert(sizeof(ImageDesc) == 16, "ImageDesc must be 16 bytes");
 
   // Upload all view color images and cameras to GPU for refinement.
   // Must be called after Initialize() + Integrate() (hash table populated).
-  void PrepareRefinement(
-      const std::vector<SVOCameraGPU>& cameras,
-      const std::vector<uint8_t>& packed_colors,
-      const std::vector<float>& packed_depths,
-      const std::vector<ImageDesc>& image_descs,
-      int n_views);
+  void PrepareRefinement(const std::vector<SVOCameraGPU>& cameras,
+                         const std::vector<uint8_t>& packed_colors,
+                         const std::vector<float>& packed_depths,
+                         const std::vector<ImageDesc>& image_descs,
+                         int n_views);
 
   // Run photometric refinement on the GPU hash table in-place.
   // Phase 1: color-only (color_iters), Phase 2: joint SDF+color (joint_iters).
-  // lambda_reg: initial regularization weight, decayed by lambda_decay per iter.
-  void Refine(int color_iters, int joint_iters,
-              float lambda_reg, float lambda_decay,
-              float voxel_size, float trunc_dist, float min_weight);
+  // lambda_reg: initial regularization weight, decayed by lambda_decay per
+  // iter.
+  void Refine(int color_iters, int joint_iters, float lambda_reg,
+              float lambda_decay, float voxel_size, float trunc_dist,
+              float min_weight);
 
  private:
   void BuildKernels();
@@ -167,12 +167,13 @@ class SVOIntegratorCL {
   cl::Kernel k_refine_clear_;
   cl::Kernel k_refine_accumulate_;
   cl::Kernel k_refine_update_;
-  cl::Buffer cl_refine_grad_;       // 4 floats/slot: grad_d, grad_r, grad_g, grad_b
-  cl::Buffer cl_refine_adam_;       // 8 floats/slot: m_d, v_d, m_r, v_r, m_g, v_g, m_b, v_b
-  cl::Buffer cl_color_images_;     // packed RGB for all views
-  cl::Buffer cl_depth_images_;     // packed depth maps for all views (visibility)
-  cl::Buffer cl_cameras_array_;    // N × SVOCameraGPU
-  cl::Buffer cl_image_descs_;      // N × ImageDesc
+  cl::Buffer cl_refine_grad_;  // 4 floats/slot: grad_d, grad_r, grad_g, grad_b
+  cl::Buffer
+      cl_refine_adam_;  // 8 floats/slot: m_d, v_d, m_r, v_r, m_g, v_g, m_b, v_b
+  cl::Buffer cl_color_images_;   // packed RGB for all views
+  cl::Buffer cl_depth_images_;   // packed depth maps for all views (visibility)
+  cl::Buffer cl_cameras_array_;  // N × SVOCameraGPU
+  cl::Buffer cl_image_descs_;    // N × ImageDesc
   int n_refine_views_ = 0;
   bool refine_prepared_ = false;
 

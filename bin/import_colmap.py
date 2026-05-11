@@ -77,7 +77,8 @@ def compute_and_save_undistorted_reconstruction(
         urec.add_camera(ucamera)
         ushot = osfm_u.get_shot_with_different_camera(urec, shot, image_format)
         if tracks_manager:
-            osfm_u.add_subshot_tracks(tracks_manager, utracks_manager, shot, ushot)
+            osfm_u.add_subshot_tracks(
+                tracks_manager, utracks_manager, shot, ushot)
         undistorted_shots.append(ushot)
 
         image = data.load_image(shot.id, unchanged=True, anydepth=True)
@@ -216,9 +217,11 @@ def import_features(db, data, image_map, camera_map):
     for row in cursor:
         image_id, n_rows, n_cols, arr = row
         filename, _ = image_map[image_id]
-        descriptors = np.fromstring(arr, dtype=np.uint8).reshape((n_rows, n_cols))
+        descriptors = np.fromstring(
+            arr, dtype=np.uint8).reshape((n_rows, n_cols))
         kp = keypoints[image_id]
-        features_data = features.FeaturesData(kp, descriptors, colors[image_id], None)
+        features_data = features.FeaturesData(
+            kp, descriptors, colors[image_id], None)
         data.save_features(filename, features_data)
 
     cursor.close()
@@ -229,7 +232,8 @@ def import_matches(db, data, image_map):
     cursor = db.cursor()
     min_matches = 1
     cursor.execute(
-        "SELECT pair_id, data FROM two_view_geometries WHERE rows>=?;", (min_matches,)
+        "SELECT pair_id, data FROM two_view_geometries WHERE rows>=?;", (
+            min_matches,)
     )
 
     matches_per_im1 = {m[0]: {} for m in image_map.values()}
@@ -264,7 +268,8 @@ def import_cameras_reconstruction(path_cameras, rec):
             n_params = camera_models[camera_model_id][1]
             for _ in range(n_params):
                 params.append(unpack("<d", f.read(8))[0])
-            cam = cam_from_colmap_params(camera_model_id, width, height, params)
+            cam = cam_from_colmap_params(
+                camera_model_id, width, height, params)
             cam.id = str(camera_id)
             rec.add_camera(cam)
 
@@ -395,7 +400,8 @@ def import_images_reconstruction(path_images, keypoints, rec):
             q /= np.linalg.norm(q)
             t = np.array([t0, t1, t2])
 
-            pose = pygeometry.Pose(rotation=quaternion_to_angle_axis(q), translation=t)
+            pose = pygeometry.Pose(
+                rotation=quaternion_to_angle_axis(q), translation=t)
             shot = rec.create_shot(filename, str(camera_id), pose)
             image_ix_to_shot_id[image_ix] = shot.id
 
@@ -416,7 +422,8 @@ def import_images_reconstruction(path_images, keypoints, rec):
                         int(b),
                         point2d_ix,
                     )
-                    tracks_manager.add_observation(shot.id, str(point3d_id), obs)
+                    tracks_manager.add_observation(
+                        shot.id, str(point3d_id), obs)
 
     return tracks_manager, image_ix_to_shot_id
 
@@ -445,10 +452,11 @@ def import_depthmaps_from_fused_pointcloud(udata, urec, image_ix_to_shot_id, pat
     points, normals, colors = read_colmap_ply(path_ply)
 
     # Read visibility file
-    points_seen = read_vis(path_ply.with_suffix(".ply.vis"), image_ix_to_shot_id)
+    points_seen = read_vis(path_ply.with_suffix(
+        ".ply.vis"), image_ix_to_shot_id)
 
     # Project to shots and save as depthmaps
-    max_size = udata.config["depthmap_resolution"]
+    max_size = udata.config["depthmap_max_image_size"]
     for shot_id, points_seen_ixs in points_seen.items():
         logger.info("Projecting shot {}".format(shot_id))
         project_pointcloud_save_depth(
@@ -472,7 +480,8 @@ def project_pointcloud_save_depth(udata, urec, points, shot_id, max_sz):
 
     points_2d = shot.project_many(points)
 
-    pixel_coords = features.denormalized_image_coordinates(points_2d, w, h).astype(int)
+    pixel_coords = features.denormalized_image_coordinates(
+        points_2d, w, h).astype(int)
     # Filter out points that fall out of the image
     # <<< aren't we supposed to have points that are visible from this image only??!?!
     mask = np.ones(pixel_coords.shape[0], dtype=bool)
@@ -484,7 +493,8 @@ def project_pointcloud_save_depth(udata, urec, points, shot_id, max_sz):
 
     # Compute the depth
     distances = np.linalg.norm(points - shot.pose.get_origin(), axis=1)
-    viewing_angles = np.arctan2(np.linalg.norm(points_2d, axis=1), shot.camera.focal)
+    viewing_angles = np.arctan2(np.linalg.norm(
+        points_2d, axis=1), shot.camera.focal)
     depths = distances * np.cos(viewing_angles)
     depths[depths > udata.config["depthmap_max_depth"]] = 0
 
@@ -506,7 +516,8 @@ def project_pointcloud_save_depth(udata, urec, points, shot_id, max_sz):
     rgb, sm = depth_colormap(depth_image)
     plt.imshow(rgb)
     small_colorbar(plt.gca(), mappable=sm)
-    filepath = Path(udata.data_path) / "plot_depthmaps" / "{}.png".format(shot_id)
+    filepath = Path(udata.data_path) / "plot_depthmaps" / \
+        "{}.png".format(shot_id)
     filepath.parent.mkdir(exist_ok=True, parents=True)
     plt.savefig(filepath, dpi=300)
     plt.close(fig)
@@ -528,7 +539,8 @@ def main():
     parser = argparse.ArgumentParser(
         description="Convert COLMAP database to OpenSfM dataset"
     )
-    parser.add_argument("database", help="path to the database to be processed")
+    parser.add_argument(
+        "database", help="path to the database to be processed")
     parser.add_argument("images", help="path to the images")
     args = parser.parse_args()
     logger.info(f"Converting {args.database} to COLMAP format")
@@ -540,14 +552,16 @@ def main():
     export_folder.mkdir(exist_ok=True)
     images_path = export_folder / "images"
     if not images_path.exists():
-        os.symlink(os.path.abspath(args.images), images_path, target_is_directory=True)
+        os.symlink(os.path.abspath(args.images),
+                   images_path, target_is_directory=True)
 
     # Copy the config if this is an colmap export of an opensfm export
     if (
         p_db.parent.name == "colmap_export"
         and not (export_folder / "config.yaml").exists()
     ):
-        os.symlink(p_db.parent.parent / "config.yaml", export_folder / "config.yaml")
+        os.symlink(p_db.parent.parent / "config.yaml",
+                   export_folder / "config.yaml")
 
     data = dataset.DataSet(export_folder)
     db = sqlite3.connect(p_db.as_posix())
@@ -600,12 +614,14 @@ def main():
             )
         else:
             logger.info(
-                "Not importing dense reconstruction: Didn't find {}".format(path_ply)
+                "Not importing dense reconstruction: Didn't find {}".format(
+                    path_ply)
             )
 
     else:
         logger.info(
-            "Didn't find some of the reconstruction files at {}".format(p_db.parent)
+            "Didn't find some of the reconstruction files at {}".format(
+                p_db.parent)
         )
 
     db.close()

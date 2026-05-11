@@ -61,8 +61,7 @@ class SVOFuser {
                      std::vector<Vec3<uint8_t>>* fused_colors);
 
   // Legacy API: Fuse + ExtractPoints in one call (backward compat).
-  void Fuse(std::vector<Vec3f>* fused_points,
-            std::vector<Vec3f>* fused_normals,
+  void Fuse(std::vector<Vec3f>* fused_points, std::vector<Vec3f>* fused_normals,
             std::vector<Vec3<uint8_t>>* fused_colors);
 
  private:

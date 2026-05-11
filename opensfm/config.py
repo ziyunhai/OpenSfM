@@ -399,20 +399,18 @@ class OpenSfMConfig:
     ##################################
     # Params for depth estimation (PatchMatch OpenCL)
     ##################################
-    # Resolution of panorama sub-views during undistortion
-    depthmap_resolution: int = 640
     # Number of neighboring views considered as candidates
     depthmap_num_neighbors: int = 10
     # Number of neighboring views used for each depthmap
-    depthmap_num_matching_views: int = 4
+    depthmap_num_matching_views: int = 6
     # Minimum depth in meters.  Set to 0 to auto-infer from the reconstruction.
     depthmap_min_depth: float = 0
     # Maximum depth in meters.  Set to 0 to auto-infer from the reconstruction.
     depthmap_max_depth: float = 0
     # Maximum number of PatchMatch iterations
     depthmap_max_iterations: int = 4
-    # Correlation patch size (should be odd, typically 11)
-    depthmap_patch_size: int = 5
+    # Correlation patch window size (must be odd)
+    depthmap_patch_size: int = 9
     # Maximum image dimension for processing (longer side)
     depthmap_max_image_size: int = 3200
     # Maximum PatchMatch cost to keep a pixel (0 = disabled)
@@ -430,21 +428,27 @@ class OpenSfMConfig:
     # Save per-shot raw/clean PLYs and per-cluster debug PLYs (slow, for debugging only).
     depthmap_save_debug_ply: bool = True
     # Spatial sigma for bilateral NCC weighting
-    depthmap_sigma_spatial: float = 5.0
+    depthmap_sigma_spatial: float = 3.0
     # Color sigma for bilateral NCC weighting, in normalized [0,1] intensity units.
-    depthmap_sigma_color: float = 3.0 / 255.0
+    depthmap_sigma_color: float = 25.0 / 255.0
     # Weight for Census transform cost vs bilateral NCC (0 = NCC only, 1 = Census only).
     depthmap_census_weight: float = 0.3
     # Number of multi-scale hierarchy levels (1 = full-res only, 2 = half+full,  3 = quarter+half+full, etc.).
     depthmap_hierarchy_levels: int = 3
+    # Enable checkerboard bilateral median filter after PatchMatch iterations
+    depthmap_checkerboard_filter: bool = False
+    # Minimum connected component size in pixels; smaller segments are removed as speckle noise
+    depthmap_speckle_min_size: int = 0
+    # Maximum gap size in pixels for linear depth interpolation (0 = disabled)
+    depthmap_gap_max_size: int = 15
     # Depth/normal smoothness weight for PatchMatch
-    depthmap_smooth_weight: float = 0.05
+    depthmap_smooth_weight: float = 0.1
     # Weight for geometric consistency cost (0 = disabled). Applied per source view.
-    depthmap_geom_consistency_weight: float = 0.05
+    depthmap_geom_consistency_weight: float = 0
     # Maximum number of reference views per cluster for geometric consistency.
     depthmap_cluster_max_size: int = 8
     # Use SfM points to seed a Delaunay planar prior before PatchMatch iterations
-    depthmap_sfm_planar_prior: bool = True
+    depthmap_sfm_planar_prior: bool = False
     # Minimum baseline angle (degrees) for neighbor selection.
     # Views with avg baseline < this are excluded from best-neighbors.
     depthmap_neighbor_min_angle: float = 3.0
@@ -453,7 +457,7 @@ class OpenSfMConfig:
     # Number of shots per incremental fusion batch (controls peak memory).
     depthmap_fusion_batch_size: int = 50
     # Minimum number of consistent views for a fused point
-    depthmap_fusion_min_consistent: int = 4
+    depthmap_fusion_min_consistent: int = 3
     # Maximum reprojection error in pixels for fusion consistency
     depthmap_fusion_max_reproj_error: float = 2.0
     # Maximum relative depth error for fusion consistency
@@ -496,7 +500,7 @@ class OpenSfMConfig:
     depthmap_cluster_bbox_margin: float = 0.01
     # Photometric TSDF refinement (Zollhöfer 2015 / Pons-Keriven 2007).
     # Enable in-place SDF+color refinement after SVO fusion.
-    depthmap_fusion_svo_refine_enabled: bool = True
+    depthmap_fusion_svo_refine_enabled: bool = False
     # Number of color-only refinement iterations (phase 1).
     depthmap_fusion_svo_refine_color_iters: int = 20
     # Number of joint SDF+color iterations (phase 2).

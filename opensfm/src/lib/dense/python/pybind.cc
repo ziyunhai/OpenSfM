@@ -74,6 +74,12 @@ PYBIND11_MODULE(pydense, m) {
            &dense::DepthmapClusterEstimatorWrapper::SetCensusWeight)
       .def("set_smooth_weight",
            &dense::DepthmapClusterEstimatorWrapper::SetSmoothWeight)
+      .def("set_checkerboard_filter",
+           &dense::DepthmapClusterEstimatorWrapper::SetCheckerboardFilter)
+      .def("set_speckle_min_size",
+           &dense::DepthmapClusterEstimatorWrapper::SetSpeckleMinSize)
+      .def("set_gap_max_size",
+           &dense::DepthmapClusterEstimatorWrapper::SetGapMaxSize)
       .def("set_geom_consistency_weight",
            &dense::DepthmapClusterEstimatorWrapper::SetGeomConsistencyWeight)
       .def("set_device", &dense::DepthmapClusterEstimatorWrapper::SetDevice)
