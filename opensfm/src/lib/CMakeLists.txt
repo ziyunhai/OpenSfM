@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.15)
 
 project(opensfm C CXX)
 
+option(OPENSFM_ENABLE_COVERAGE "Enable coverage instrumentation for supported compilers." off)
+
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING
       "Choose the type of build, options are: None Debug Release RelWithDebInfo MinSizeRel."
@@ -26,6 +28,15 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_DEBUG "${opensfm_SOURCE_DIR}/../..")
 
 ####### Compilation Options #######
 # Note: Common options and definitions are in ../cmake/OpenSfMCommon.cmake
+
+if(OPENSFM_ENABLE_COVERAGE)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        add_compile_options(-O0 -g --coverage)
+        add_link_options(--coverage)
+    else()
+        message(FATAL_ERROR "OPENSFM_ENABLE_COVERAGE requires a GNU-compatible compiler")
+    endif()
+endif()
 
 ####### Find Dependencies #######
 # Note: Common dependencies are in ../cmake/OpenSfMCommon.cmake

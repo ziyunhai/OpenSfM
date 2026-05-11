@@ -1,0 +1,100 @@
+name: Coverage
+
+on:
+  push:
+    paths-ignore:
+      - badges/**
+  pull_request:
+
+jobs:
+  coverage:
+    name: Build coverage reports
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Setup Miniconda
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          environment-file: conda.yml
+          activate-environment: opensfm
+
+      - name: Build OpenSfM with coverage instrumentation
+        shell: bash -l {0}
+        run: |
+          rm -rf cmake_build
+          pip install \
+            --config-settings=cmake.define.OPENSFM_ENABLE_COVERAGE=ON \
+            --config-settings=cmake.define.OPENSFM_BUILD_TESTS=ON \
+            -e '.[test]'
+
+      - name: Run C++ tests
+        shell: bash -l {0}
+        run: cd cmake_build && ctest --output-on-failure
+
+      - name: Run Python tests with coverage
+        shell: bash -l {0}
+        run: |
+          if [[ -f "$CONDA_PREFIX/lib/libtcmalloc.so" ]]; then
+            export LD_PRELOAD="$CONDA_PREFIX/lib/libtcmalloc.so"
+          fi
+          python -m pytest \
+            opensfm/test \
+            --cov=opensfm \
+            --cov-config=.coveragerc \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage-python.xml \
+            -m "not slow"
+
+      - name: Generate C++ coverage report
+        shell: bash -l {0}
+        run: |
+          gcovr \
+            --root . \
+            cmake_build \
+            --filter 'opensfm/src/lib/' \
+            --exclude 'opensfm/src/lib/third_party/' \
+            --exclude '.*/test/.*' \
+            --exclude 'opensfm/src/lib/testing_main.cc$' \
+            --xml-pretty \
+            --output coverage-cpp.xml \
+            --print-summary
+
+      - name: Generate SVG coverage badge
+        shell: bash -l {0}
+        run: |
+          python .github/scripts/generate_coverage_badge.py \
+            coverage-python.xml \
+            coverage-cpp.xml \
+            --output badges/coverage.svg \
+            --summary-json badges/coverage-summary.json
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-artifacts
+          path: |
+            coverage-cpp.xml
+            coverage-python.xml
+            badges/coverage.svg
+            badges/coverage-summary.json
+
+      - name: Commit coverage badge
+        if: github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
+        shell: bash -l {0}
+        run: |
+          if [[ -z "$(git status --porcelain badges/)" ]]; then
+            echo "Coverage badge is unchanged"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add badges/coverage.svg badges/coverage-summary.json
+          git commit -m "Update coverage badge [skip ci]"
+          git push origin HEAD:${GITHUB_REF_NAME}

@@ -41,6 +41,7 @@ def lund_path(tmpdir_factory: Any) -> str:
 
     args = argparse.Namespace()
     args.dataset = path
+    args.force = True
 
     data = dataset.DataSet(path)
     commands.extract_metadata.Command().run(data, args)

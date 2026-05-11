@@ -13,6 +13,8 @@ set(ROBUST_FILES
     src/absolute_pose_known_rotation_model.cc
     src/relative_rotation_model.cc
     src/relative_pose_model.cc
+    src/similarity_model.cc
+    src/triangulation_model.cc
     src/line_model.cc
     src/instanciations.cc
 )

@@ -1,0 +1,11 @@
+[run]
+branch = True
+relative_files = True
+source =
+    opensfm
+omit =
+    opensfm/test/*
+
+[report]
+omit =
+    opensfm/test/*
