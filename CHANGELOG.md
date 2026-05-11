@@ -1,16 +1,30 @@
 # Changelog
 
 
-## [Unreleased]
+## 0.8
+
+### Added
+  - Added benchmarking module for qualitative assessment over dataset repositories
+  - Updated camera database : fc300s, fc300x, m3m, m3e, fc3170, fc3411, fc7203, fc7303, fc8482, sensefly aeria x, sensefly s.o.d.a.
+  - Quality report generation
+  - Native rig support
+  - rerun export
+  - Support for EXIF OPK angles (DJI and sensefly) 
+  - Support for EXIF per-image Lat/lon/Alt (DJI and sensefly) accuracy
+  
+### Improved
+ - Much faster processing of large datasets
+ - Much better memory scaling and handling
+ - Better accuracy in general
+ - Improved robustness of weak overlap datasets
+ - Better handling of missing GPS images
+ - SfM point cloud cleaning
 
 ### Breaking
  - Main datastructures moved to C++ with Python bindings
  - Drop Python 2 support.  OpenSfM 0.5.x is the latest to support Python2.
  - Undistorted image file names only append the image format if it does not match the distorted image source
  - Undistorted shot ids now match the undistorted image file names and may not match the source shot ids
-
-### Added
- - The file `undistorted/undistorted_shot_ids.json` stores a map from the original shot ids to their corresponding list of undistorted shot ids.
 
 
 ## 0.5.1
