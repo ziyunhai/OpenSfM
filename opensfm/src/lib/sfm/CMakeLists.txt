@@ -30,6 +30,7 @@ target_include_directories(sfm PUBLIC ${opensfm_SOURCE_DIR})
 if (OPENSFM_BUILD_TESTS)
     set(SFM_TEST_FILES
         test/tracks_helpers_test.cc
+        test/map_helpers_test.cc
     )
     add_executable(sfm_test ${SFM_TEST_FILES})
     target_include_directories(sfm_test PRIVATE ${opensfm_SOURCE_DIR})

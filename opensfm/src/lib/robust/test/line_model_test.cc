@@ -147,7 +147,9 @@ TEST(RobustEstimatorLine, ShouldStopWhenHighInlierRatio) {
   params.use_iteration_reduction = true;
 
   ScoreInfo<Line::Type> score;
-  for (int i = 0; i < 90; ++i) score.inliers_indices.push_back(i);
+  for (int i = 0; i < 90; ++i) {
+    score.inliers_indices.push_back(i);
+  }
 
   EXPECT_TRUE(ShouldStop<Line>(params, score, 100, 50));
 }
@@ -158,7 +160,9 @@ TEST(RobustEstimatorLine, ShouldNotStopWhenLowInlierRatio) {
   params.use_iteration_reduction = true;
 
   ScoreInfo<Line::Type> score;
-  for (int i = 0; i < 10; ++i) score.inliers_indices.push_back(i);
+  for (int i = 0; i < 10; ++i) {
+    score.inliers_indices.push_back(i);
+  }
 
   EXPECT_FALSE(ShouldStop<Line>(params, score, 100, 5));
 }
@@ -168,7 +172,9 @@ TEST(RobustEstimatorLine, DisabledIterationReductionNeverStops) {
   params.use_iteration_reduction = false;
 
   ScoreInfo<Line::Type> score;
-  for (int i = 0; i < 99; ++i) score.inliers_indices.push_back(i);
+  for (int i = 0; i < 99; ++i) {
+    score.inliers_indices.push_back(i);
+  }
 
   EXPECT_FALSE(ShouldStop<Line>(params, score, 100, 1000));
 }
@@ -180,7 +186,9 @@ TEST(RobustEstimatorLine, DisabledIterationReductionNeverStops) {
 TEST(RandomSampler, GeneratesCorrectSampleSize) {
   RandomSamplesGenerator<std::mt19937> gen(42);
   std::vector<Eigen::Vector2d> data;
-  for (int i = 0; i < 50; ++i) data.push_back(Eigen::Vector2d(i, i));
+  for (int i = 0; i < 50; ++i) {
+    data.push_back(Eigen::Vector2d(i, i));
+  }
 
   auto samples = gen.GetRandomSamples<Line>(data, Line::MINIMAL_SAMPLES);
   EXPECT_EQ(samples.size(), static_cast<size_t>(Line::MINIMAL_SAMPLES));
@@ -188,7 +196,9 @@ TEST(RandomSampler, GeneratesCorrectSampleSize) {
 
 TEST(RandomSampler, DeterministicWithSameSeed) {
   std::vector<Eigen::Vector2d> data;
-  for (int i = 0; i < 50; ++i) data.push_back(Eigen::Vector2d(i, i * 2));
+  for (int i = 0; i < 50; ++i) {
+    data.push_back(Eigen::Vector2d(i, i * 2));
+  }
 
   RandomSamplesGenerator<std::mt19937> gen1(123);
   auto s1 = gen1.GetRandomSamples<Line>(data, 2);

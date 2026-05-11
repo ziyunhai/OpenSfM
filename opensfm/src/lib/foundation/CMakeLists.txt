@@ -34,6 +34,7 @@ if (OPENSFM_BUILD_TESTS)
     set(FOUNDATION_TEST_FILES
         test/newton_raphson_test.cc
         test/union_find_test.cc
+        test/interpolation_numeric_test.cc
     )
     add_executable(foundation_test ${FOUNDATION_TEST_FILES})
     target_include_directories(foundation_test PRIVATE ${opensfm_SOURCE_DIR} ${GMOCK_INCLUDE_DIRS})

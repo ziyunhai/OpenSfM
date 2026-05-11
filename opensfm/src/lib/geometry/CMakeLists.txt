@@ -35,7 +35,11 @@ if (OPENSFM_BUILD_TESTS)
         test/camera_functions_test.cc
         test/covariance_test.cc
         test/point_test.cc
+        test/similarity_test.cc
         test/triangulation_test.cc
+        test/rotation_test.cc
+        test/essential_pose_test.cc
+        test/absolute_pose_test.cc
         )
     add_executable(geometry_test ${GEOMETRY_TEST_FILES})
     target_include_directories(geometry_test PRIVATE ${opensfm_SOURCE_DIR})

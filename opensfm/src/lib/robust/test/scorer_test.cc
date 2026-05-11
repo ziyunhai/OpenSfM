@@ -98,8 +98,8 @@ TEST(LMedSScoring, ComputesMedianBasedThreshold) {
   // median index = floor(4 * 0.5) = 2 → nth_element picks 0.5
   // mad = 1.4826 * 0.5 = 0.7413
   // threshold = 2.5 * 0.7413 = 1.85325
-  std::vector<E> errors = {E::Constant(0.1), E::Constant(0.2),
-                           E::Constant(0.5), E::Constant(3.0)};
+  std::vector<E> errors = {E::Constant(0.1), E::Constant(0.2), E::Constant(0.5),
+                           E::Constant(3.0)};
 
   ScoreInfo<int> best;
   auto result = scorer.Score(errors.begin(), errors.end(), best);

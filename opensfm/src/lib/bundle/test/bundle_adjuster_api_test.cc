@@ -162,8 +162,8 @@ TEST(BundleAdjusterAPI, ReportWrappersMatchCeresSummary) {
   ba.AddReconstruction("rec0", false);
   ba.AddReconstructionInstance("rec0", 1.0, "rig0");
   ba.AddReconstructionInstance("rec0", 1.0, "rig1");
-  ba.AddRigInstancePositionPrior("rig0", Vec3d(0, 0, -5),
-                                 Vec3d::Constant(0.1), "0");
+  ba.AddRigInstancePositionPrior("rig0", Vec3d(0, 0, -5), Vec3d::Constant(0.1),
+                                 "0");
 
   ba.SetMaxNumIterations(5);
   ba.SetNumThreads(1);
@@ -185,8 +185,7 @@ TEST(BundleAdjusterAPI, SetCameraBiasUpdatesStoredBias) {
   BundleAdjuster ba;
   PopulateToyBundleScene(ba);
 
-  geometry::Similarity bias(Vec3d(0.1, 0.2, 0.3), Vec3d(0.01, 0.02, 0.03),
-                            1.5);
+  geometry::Similarity bias(Vec3d(0.1, 0.2, 0.3), Vec3d(0.01, 0.02, 0.03), 1.5);
   ba.SetCameraBias("cam0", bias);
 
   ExpectSimilarityNear(ba.GetBias("cam0"), bias);
@@ -270,11 +269,11 @@ TEST(BundleAdjusterAPI, LinearMotionCanBeAdded) {
   // Add a third rig instance for the triplet
   geometry::Pose rig2_pose;
   rig2_pose.SetOrigin(Vec3d(2, 0, -5));
-  ba.AddRigInstance("rig2", rig2_pose, {{"shot2", "cam0"}},
-                    {{"shot2", "RC0"}}, false);
+  ba.AddRigInstance("rig2", rig2_pose, {{"shot2", "cam0"}}, {{"shot2", "RC0"}},
+                    false);
 
-  EXPECT_NO_THROW(ba.AddLinearMotion("shot0", "shot1", "shot2", 0.5,
-                                     0.01, 0.01));
+  EXPECT_NO_THROW(
+      ba.AddLinearMotion("shot0", "shot1", "shot2", 0.5, 0.01, 0.01));
 }
 
 // ============================================================================
@@ -288,8 +287,8 @@ TEST(BundleAdjusterAPI, ReprojectionErrorsComputedWhenEnabled) {
   ba.AddReconstruction("rec0", false);
   ba.AddReconstructionInstance("rec0", 1.0, "rig0");
   ba.AddReconstructionInstance("rec0", 1.0, "rig1");
-  ba.AddRigInstancePositionPrior("rig0", Vec3d(0, 0, -5),
-                                 Vec3d::Constant(0.1), "0");
+  ba.AddRigInstancePositionPrior("rig0", Vec3d(0, 0, -5), Vec3d::Constant(0.1),
+                                 "0");
 
   ba.SetComputeReprojectionErrors(true);
   ba.SetMaxNumIterations(5);

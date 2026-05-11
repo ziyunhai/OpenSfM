@@ -346,3 +346,84 @@ TEST_F(TwoCamsFixture, PointRefinement) {
       geometry::PointRefinement(centers, bearings, initial_point, 10);
   ASSERT_LT((refined - gt_point).norm(), 1e-6);
 }
+
+// ============================================================================
+// AngleBetweenVectors
+// ============================================================================
+
+TEST(AngleBetweenVectors, PerpendicularVectorsReturnPiOver2) {
+  Vec3d u(1, 0, 0);
+  Vec3d v(0, 1, 0);
+  EXPECT_NEAR(geometry::AngleBetweenVectors(u, v), M_PI / 2.0, 1e-12);
+}
+
+TEST(AngleBetweenVectors, ParallelVectorsReturnZero) {
+  Vec3d u(1, 2, 3);
+  Vec3d v = 5.0 * u;
+  EXPECT_NEAR(geometry::AngleBetweenVectors(u, v), 0.0, 1e-12);
+}
+
+TEST(AngleBetweenVectors, OppositeVectorsReturnZeroDueToClamp) {
+  // Implementation clamps |c| >= 1 to return 0 (anti-parallel edge case)
+  Vec3d u(1, 0, 0);
+  Vec3d v(-1, 0, 0);
+  // acos(-1) = pi, but if floating noise pushes |c| > 1, returns 0
+  double angle = geometry::AngleBetweenVectors(u, v);
+  EXPECT_TRUE(angle == 0.0 || std::abs(angle - M_PI) < 1e-12);
+}
+
+TEST(AngleBetweenVectors, KnownAngle45Degrees) {
+  Vec3d u(1, 0, 0);
+  Vec3d v(1, 1, 0);  // 45 degrees from u
+  EXPECT_NEAR(geometry::AngleBetweenVectors(u, v), M_PI / 4.0, 1e-12);
+}
+
+// ============================================================================
+// TriangulateBearingsRobust
+// ============================================================================
+
+TEST_F(FiveCamsFixture, TriangulateBearingsRobustInliersOnly) {
+  auto [success, point, inliers] = geometry::TriangulateBearingsRobust(
+      centers, bearings, 0.01, 0.01, 0.0, 10);
+  ASSERT_TRUE(success);
+  EXPECT_LT((point - gt_point).norm(), 1e-4);
+  EXPECT_EQ(static_cast<int>(inliers.size()), 5);
+}
+
+TEST_F(FiveCamsFixture, TriangulateBearingsRobustRejectsOutlier) {
+  // Corrupt one bearing to be a clear outlier
+  MatX3d corrupted_bearings = bearings;
+  corrupted_bearings.row(2) = Vec3d(0, 0, -1).normalized();
+
+  auto [success, point, inliers] = geometry::TriangulateBearingsRobust(
+      centers, corrupted_bearings, 0.01, 0.01, 0.0, 10);
+  ASSERT_TRUE(success);
+  EXPECT_LT((point - gt_point).norm(), 0.1);
+  // Outlier index 2 should be excluded
+  EXPECT_THAT(inliers, testing::Not(testing::Contains(2)));
+  EXPECT_GE(static_cast<int>(inliers.size()), 4);
+}
+
+TEST(TriangulateBearingsRobust, FailsWithOnlyOneRay) {
+  MatX3d centers(1, 3);
+  centers.row(0) = Vec3d(0, 0, 0);
+  MatX3d bearings(1, 3);
+  bearings.row(0) = Vec3d(0, 0, 1);
+
+  auto [success, point, inliers] = geometry::TriangulateBearingsRobust(
+      centers, bearings, 0.01, 0.01, 0.0, 10);
+  EXPECT_FALSE(success);
+}
+
+TEST(TriangulateBearingsRobust, FailsWithParallelRays) {
+  MatX3d centers(2, 3);
+  centers.row(0) = Vec3d(0, 0, 0);
+  centers.row(1) = Vec3d(1, 0, 0);
+  MatX3d bearings(2, 3);
+  bearings.row(0) = Vec3d(0, 0, 1);
+  bearings.row(1) = Vec3d(0, 0, 1);  // parallel
+
+  auto [success, point, inliers] = geometry::TriangulateBearingsRobust(
+      centers, bearings, 0.01, 0.5, 0.0, 10);
+  EXPECT_FALSE(success);
+}
