@@ -189,31 +189,6 @@ void DepthmapEstimator::RunLevel(int level, int total_levels,
 
   UploadData();
 
-  // Upload coarse-level depths for depth-prior blending in textureless regions.
-  {
-    auto& ctx = opencl::CLContext::Instance().Device(device_idx_).context();
-    auto& queue = opencl::CLContext::Instance().Device(device_idx_).queue();
-    const int npix = w * h;
-    cl_int err;
-    cl_low_depths_ =
-        cl::Buffer(ctx, CL_MEM_READ_ONLY, sizeof(float) * npix, nullptr, &err);
-    opencl::CheckCL(err, "low_depths alloc");
-    if (prev_level_w_ > 0 && prev_level_result_.depth.size() > 0) {
-      // Bilinearly interpolate coarse depth to current resolution.
-      cv::Mat coarse_cv(prev_level_h_, prev_level_w_, CV_32F,
-                        const_cast<float*>(prev_level_result_.depth.data()));
-      cv::Mat upsampled;
-      cv::resize(coarse_cv, upsampled, cv::Size(w, h), 0, 0, cv::INTER_LINEAR);
-      queue.enqueueWriteBuffer(cl_low_depths_, CL_TRUE, 0, sizeof(float) * npix,
-                               upsampled.data);
-    } else {
-      // Level 0 or no previous data: fill with zeros (disables prior).
-      std::vector<float> zeros(npix, 0.0f);
-      queue.enqueueWriteBuffer(cl_low_depths_, CL_TRUE, 0, sizeof(float) * npix,
-                               zeros.data());
-    }
-  }
-
   if (level == 0 && prev_level_w_ == 0) {
     RandomInit(w, h);
   } else if (prev_level_w_ > 0) {
@@ -439,7 +414,6 @@ void DepthmapEstimator::RandomInit(int width, int height) {
   k_random_init_.setArg(arg++, params_.sigma_color);
   k_random_init_.setArg(arg++, params_.top_k);
   k_random_init_.setArg(arg++, params_.use_census ? 1.0f : 0.0f);
-  k_random_init_.setArg(arg++, cl_low_depths_);
 
   cl::NDRange global(static_cast<size_t>((width + 15) / 16 * 16),
                      static_cast<size_t>((height + 15) / 16 * 16));
@@ -484,7 +458,6 @@ void DepthmapEstimator::PriorReinit(int width, int height) {
   k_prior_reinit_.setArg(arg++, cl_prev_depths_);
   k_prior_reinit_.setArg(arg++, cl_prev_depth_mask_);
   k_prior_reinit_.setArg(arg++, geom_weight_);
-  k_prior_reinit_.setArg(arg++, cl_low_depths_);
 
   cl::NDRange global(static_cast<size_t>((width + 15) / 16 * 16),
                      static_cast<size_t>((height + 15) / 16 * 16));
@@ -531,7 +504,6 @@ void DepthmapEstimator::RunIteration(int iter, int width, int height) {
     // Planar prior arguments.
     k.setArg(arg++, cl_prior_planes_);
     k.setArg(arg++, cl_plane_masks_);
-    k.setArg(arg++, cl_low_depths_);
   };
 
   cl::NDRange global(static_cast<size_t>((width + 15) / 16 * 16),
@@ -1279,7 +1251,6 @@ void DepthmapEstimator::ReleaseGpuBuffers() {
   cl_prior_planes_ = cl::Buffer();
   cl_plane_masks_ = cl::Buffer();
   cl_prev_depths_ = cl::Buffer();
-  cl_low_depths_ = cl::Buffer();
   cl_prev_depth_mask_ = 0u;
 }
 

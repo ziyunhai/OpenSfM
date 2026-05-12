@@ -361,8 +361,6 @@ a gap along every depth edge.
 | ---------------------- | ------- | -------------------------------------------------------------- |
 | `same_depth_threshold` | 0.01    | 1% relative tolerance — tight                                  |
 | `min_consistent_views` | 3       | Need 3 views agreeing (including ref) — 2 neighbors must agree |
-| `carving_threshold`    | 0.2     | 20% free-space margin — moderate                               |
-| `max_carved_views`     | 1       | Single carve vote kills pixel — aggressive                     |
 
 The `min_consistent_views` is clamped to `min(config_value, num_views)`.
 With only 3–4 visible neighbors (common at dataset edges), this means ALL

@@ -163,17 +163,10 @@ For each pixel in the reference depth:
 1. Backproject to 3D world point.
 2. Project into each neighbor view.
 3. Read neighbor's depth (bilinear interpolation from Image2D texture).
-4. **Space carving**: if neighbor depth > ref_projected_depth × (1 + `carving_threshold`),
-   count as a carve vote.
-5. **Forward depth check**: `|src_depth - projected_depth| < projected_depth × same_depth_threshold`.
-6. **Backward geometric consistency**: backproject neighbor pixel at neighbor
+4. **Forward depth check**: `|src_depth - projected_depth| < projected_depth × same_depth_threshold`.
+5. **Backward geometric consistency**: backproject neighbor pixel at neighbor
    depth to world, re-project to reference. Check both pixel distance (< 2 px)
    and depth agreement.
-7. **Decision**: keep pixel if `consistent >= min_consistent_views` AND
-   `carved < max_carved_views`.
-
-Default thresholds: `same_depth_threshold=0.01` (1%), `min_consistent_views=3`,
-`carving_threshold=0.2`, `max_carved_views=1`.
 
 ---
 
@@ -205,7 +198,5 @@ All per-cluster `fused_batch_XXXX.ply` files are concatenated into `fused.ply`.
 | `depthmap_max_cost`                | 0.9     | Raw   | Post-process: zero out high-cost pixels      |
 | `depthmap_same_depth_threshold`    | 0.01    | Clean | 1% relative depth tolerance                  |
 | `depthmap_min_consistent_views`    | 3       | Clean | Minimum cross-view agreement                 |
-| `depthmap_carving_threshold`       | 0.2     | Clean | Free-space carving threshold                 |
-| `depthmap_max_carved_views`        | 1       | Clean | Max carve votes before discard               |
 | `depthmap_cluster_max_size`        | 8       | Setup | Max views per geometric cluster              |
 | `depthmap_max_image_size`          | 3200    | Raw   | Max image dimension                          |

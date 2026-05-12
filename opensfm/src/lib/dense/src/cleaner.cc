@@ -27,14 +27,6 @@ void GPUDepthmapCleaner::SetMinConsistentViews(int n) {
   min_consistent_views_ = n;
 }
 
-void GPUDepthmapCleaner::SetCarvingThreshold(float t) {
-  carving_threshold_ = std::max(0.0f, t);
-}
-
-void GPUDepthmapCleaner::SetMaxCarvedViews(int n) {
-  max_carved_views_ = std::max(0, n);
-}
-
 void GPUDepthmapCleaner::SetDevice(int device_idx) { device_idx_ = device_idx; }
 
 int GPUDepthmapCleaner::AddView(const Mat3d& K, const Mat3d& R, const Vec3d& t,
@@ -162,8 +154,6 @@ cv::Mat GPUDepthmapCleaner::Clean(int ref_idx,
   k_clean_.setArg(arg++, num_views);
   k_clean_.setArg(arg++, same_depth_threshold_);
   k_clean_.setArg(arg++, effective_min);
-  k_clean_.setArg(arg++, carving_threshold_);
-  k_clean_.setArg(arg++, max_carved_views_);
 
   cl::NDRange global(static_cast<size_t>((w + 15) / 16 * 16),
                      static_cast<size_t>((h + 15) / 16 * 16));

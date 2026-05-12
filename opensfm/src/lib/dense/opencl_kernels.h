@@ -348,7 +348,6 @@ float compute_single_cost(
     float spatial_factor,
     float color_factor,
     float census_weight,
-    float low_depth,
     float plane_depth
 ) {
   const sampler_t samp = CLK_NORMALIZED_COORDS_FALSE |
@@ -412,7 +411,6 @@ int compute_cost_vector(
     float sigma_spatial,
     float sigma_color,
     float census_weight,
-    float low_depth,
     float *out_costs,
     read_only image2d_t src_img0,
     read_only image2d_t src_img1,
@@ -465,7 +463,7 @@ int compute_cost_vector(
     case I: out_costs[I] = compute_single_cost(ref_img, IMG, &cameras[I+1], \
         center_world, world_dx, world_dy, ref_center, \
         x, y, half_patch, spatial_factor, color_factor, census_weight, \
-        low_depth, depth); break;
+        depth); break;
 
   for (int i = 0; i < n_src; i++) {
     switch (i) {
@@ -508,7 +506,6 @@ float compute_initial_cost_and_views(
     float sigma_color,
     int top_k,
     float census_weight,
-    float low_depth,
     uint *out_selected,
     read_only image2d_t src_img0,
     read_only image2d_t src_img1,
@@ -537,7 +534,7 @@ float compute_initial_cost_and_views(
 
   compute_cost_vector(ref_img, cameras, num_images, x, y, plane,
                       half_patch, sigma_spatial, sigma_color, census_weight,
-                      low_depth, cost_vector,
+                      cost_vector,
                       src_img0, src_img1, src_img2, src_img3,
                       src_img4, src_img5, src_img6, src_img7,
                       src_img8, src_img9, src_img10, src_img11,
@@ -881,15 +878,13 @@ __kernel void acmmp_random_init(
     float sigma_spatial,
     float sigma_color,
     int top_k,
-    float census_weight,
-    __global const float *low_depths
+    float census_weight
 ) {
   int x = get_global_id(0);
   int y = get_global_id(1);
   if (x >= width || y >= height) return;
 
   int idx = y * width + x;
-  float low_depth = low_depths[idx];
 
   // Initialise PRNG state from pixel coordinates
   uint2 state = (uint2)(idx * 1099087573u + 2654435769u,
@@ -919,7 +914,7 @@ __kernel void acmmp_random_init(
   costs[idx] = compute_initial_cost_and_views(
       ref_img, cameras, num_images,
       x, y, plane, half_patch, sigma_spatial, sigma_color, top_k,
-      census_weight, low_depth, &sel,
+      census_weight, &sel,
       src_img0, src_img1, src_img2, src_img3,
       src_img4, src_img5, src_img6, src_img7,
       src_img8, src_img9, src_img10, src_img11,
@@ -978,15 +973,13 @@ __kernel void acmmp_prior_reinit(
     float smooth_weight,
     __global const float *prev_depths,
     uint prev_depth_mask,
-    float geom_weight,
-    __global const float *low_depths
+    float geom_weight
 ) {
   int x = get_global_id(0);
   int y = get_global_id(1);
   if (x >= width || y >= height) return;
 
   int idx = y * width + x;
-  float low_depth = low_depths[idx];
 
   // Only consider masked pixels (inside a Delaunay triangle).
   if (plane_masks[idx] == 0u) return;
@@ -1035,7 +1028,7 @@ __kernel void acmmp_prior_reinit(
     float cost = compute_initial_cost_and_views(
         ref_img, cameras, num_images,
         x, y, plane, half_patch, sigma_spatial, sigma_color, top_k,
-        census_weight, low_depth, &sel,
+        census_weight, &sel,
         src_img0, src_img1, src_img2, src_img3,
         src_img4, src_img5, src_img6, src_img7,
         src_img8, src_img9, src_img10, src_img11,
@@ -1060,7 +1053,7 @@ __kernel void acmmp_prior_reinit(
   for (int i = 0; i < MAX_SOURCES; i++) cost_vec[i] = 2.0f;
   compute_cost_vector(ref_img, cameras, num_images, x, y, plane,
       half_patch, sigma_spatial, sigma_color, census_weight,
-      low_depth, cost_vec,
+      cost_vec,
       src_img0, src_img1, src_img2, src_img3,
       src_img4, src_img5, src_img6, src_img7,
       src_img8, src_img9, src_img10, src_img11,
@@ -1136,8 +1129,7 @@ __kernel void acmmp_patchmatch(
     uint prev_depth_mask,
     float geom_weight,
     __global const PlaneHypothesis *prior_planes,
-    __global const uint *plane_masks,
-    __global const float *low_depths
+    __global const uint *plane_masks
 ) {
   int x = get_global_id(0);
   int y = get_global_id(1);
@@ -1145,7 +1137,6 @@ __kernel void acmmp_patchmatch(
   if (((x + y) & 1) != color_flag) return;
 
   int idx = y * width + x;
-  float low_depth = low_depths[idx];
   uint2 state = rand_states[idx];
   uint key = (uint)(idx + iteration * 7919 + 42);
   int n_src = min(num_images - 1, MAX_SOURCES);
@@ -1175,7 +1166,6 @@ __kernel void acmmp_patchmatch(
     positions[1] = best_p; flags[1] = true;
     compute_cost_vector(ref_img, cameras, num_images, x, y,
         planes[best_p], half_patch, sigma_spatial, sigma_color, census_weight,
-        low_depth,
         &cost_array[1 * MAX_SOURCES],
         src_img0, src_img1, src_img2, src_img3,
         src_img4, src_img5, src_img6, src_img7,
@@ -1196,7 +1186,6 @@ __kernel void acmmp_patchmatch(
     positions[3] = best_p; flags[3] = true;
     compute_cost_vector(ref_img, cameras, num_images, x, y,
         planes[best_p], half_patch, sigma_spatial, sigma_color, census_weight,
-        low_depth,
         &cost_array[3 * MAX_SOURCES],
         src_img0, src_img1, src_img2, src_img3,
         src_img4, src_img5, src_img6, src_img7,
@@ -1217,7 +1206,6 @@ __kernel void acmmp_patchmatch(
     positions[5] = best_p; flags[5] = true;
     compute_cost_vector(ref_img, cameras, num_images, x, y,
         planes[best_p], half_patch, sigma_spatial, sigma_color, census_weight,
-        low_depth,
         &cost_array[5 * MAX_SOURCES],
         src_img0, src_img1, src_img2, src_img3,
         src_img4, src_img5, src_img6, src_img7,
@@ -1238,7 +1226,6 @@ __kernel void acmmp_patchmatch(
     positions[7] = best_p; flags[7] = true;
     compute_cost_vector(ref_img, cameras, num_images, x, y,
         planes[best_p], half_patch, sigma_spatial, sigma_color, census_weight,
-        low_depth,
         &cost_array[7 * MAX_SOURCES],
         src_img0, src_img1, src_img2, src_img3,
         src_img4, src_img5, src_img6, src_img7,
@@ -1265,7 +1252,6 @@ __kernel void acmmp_patchmatch(
     positions[0] = best_p; flags[0] = true;
     compute_cost_vector(ref_img, cameras, num_images, x, y,
         planes[best_p], half_patch, sigma_spatial, sigma_color, census_weight,
-        low_depth,
         &cost_array[0 * MAX_SOURCES],
         src_img0, src_img1, src_img2, src_img3,
         src_img4, src_img5, src_img6, src_img7,
@@ -1294,7 +1280,6 @@ __kernel void acmmp_patchmatch(
     positions[2] = best_p; flags[2] = true;
     compute_cost_vector(ref_img, cameras, num_images, x, y,
         planes[best_p], half_patch, sigma_spatial, sigma_color, census_weight,
-        low_depth,
         &cost_array[2 * MAX_SOURCES],
         src_img0, src_img1, src_img2, src_img3,
         src_img4, src_img5, src_img6, src_img7,
@@ -1321,7 +1306,6 @@ __kernel void acmmp_patchmatch(
     positions[4] = best_p; flags[4] = true;
     compute_cost_vector(ref_img, cameras, num_images, x, y,
         planes[best_p], half_patch, sigma_spatial, sigma_color, census_weight,
-        low_depth,
         &cost_array[4 * MAX_SOURCES],
         src_img0, src_img1, src_img2, src_img3,
         src_img4, src_img5, src_img6, src_img7,
@@ -1348,7 +1332,6 @@ __kernel void acmmp_patchmatch(
     positions[6] = best_p; flags[6] = true;
     compute_cost_vector(ref_img, cameras, num_images, x, y,
         planes[best_p], half_patch, sigma_spatial, sigma_color, census_weight,
-        low_depth,
         &cost_array[6 * MAX_SOURCES],
         src_img0, src_img1, src_img2, src_img3,
         src_img4, src_img5, src_img6, src_img7,
@@ -1467,7 +1450,6 @@ __kernel void acmmp_patchmatch(
   for (int i = 0; i < MAX_SOURCES; i++) cost_vec_now[i] = 2.0f;
   compute_cost_vector(ref_img, cameras, num_images, x, y,
       planes[idx], half_patch, sigma_spatial, sigma_color, census_weight,
-      low_depth,
       cost_vec_now,
       src_img0, src_img1, src_img2, src_img3,
       src_img4, src_img5, src_img6, src_img7,
@@ -1613,7 +1595,6 @@ __kernel void acmmp_patchmatch(
       for (int ci = 0; ci < MAX_SOURCES; ci++) cv[ci] = 2.0f;
       compute_cost_vector(ref_img, cameras, num_images, x, y, cand,
           half_patch, sigma_spatial, sigma_color, census_weight,
-          low_depth,
           cv,
           src_img0, src_img1, src_img2, src_img3,
           src_img4, src_img5, src_img6, src_img7,
@@ -1998,9 +1979,7 @@ __kernel void acmmp_clean_depthmap(
     int width, int height,
     int num_views,
     float same_depth_threshold,
-    int min_consistent_views,
-    float carving_threshold,
-    int max_carved_views
+    int min_consistent_views
 ) {
   int x = get_global_id(0);
   int y = get_global_id(1);
@@ -2031,7 +2010,6 @@ __kernel void acmmp_clean_depthmap(
   float wz = ref_cam.R[2]*pcam_x + ref_cam.R[5]*pcam_y + ref_cam.R[8]*pcam_z;
 
   int consistent = 1;
-  int carved = 0;
   int n_src = min(num_views - 1, MAX_CLEAN_SOURCES);
 
   for (int v = 0; v < n_src; ++v) {
@@ -2056,14 +2034,6 @@ __kernel void acmmp_clean_depthmap(
         src8, src9, src10, src11, src12, src13, src14, src15);
 
     if (!(src_depth > 0.0f)) continue;
-
-    // Space carving: if neighbor's ray passes THROUGH the reference point
-    // (neighbor sees further away), the reference point is in free space
-    // from this view — a strong signal that it is a floater.
-    if (src_depth > sz * (1.0f + carving_threshold)) {
-      carved++;
-      continue;
-    }
 
     // Forward depth check.
     if (fabs(src_depth - sz) >= sz * same_depth_threshold) continue;
@@ -2099,7 +2069,7 @@ __kernel void acmmp_clean_depthmap(
     consistent++;
   }
 
-  int keep = (consistent >= min_consistent_views) && (carved < max_carved_views);
+  int keep = (consistent >= min_consistent_views);
   clean_depth[idx] = keep ? ref_depth : 0.0f;
 }
 

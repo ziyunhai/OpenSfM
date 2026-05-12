@@ -961,12 +961,6 @@ def _clean_views_batched_gpu(
         cleaner.set_min_consistent_views(
             config["depthmap_min_consistent_views"]
         )
-        cleaner.set_carving_threshold(
-            config["depthmap_carving_threshold"]
-        )
-        cleaner.set_max_carved_views(
-            config["depthmap_max_carved_views"]
-        )
         cleaner.set_device(device_idx)
         try:
             while True:

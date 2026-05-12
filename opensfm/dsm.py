@@ -18,13 +18,17 @@ def compute_dsm(
 ) -> None:
     """Generate a Digital Surface Model from cleaned depthmaps.
 
-    Two-pass GPU rasterization:
-      Pass 1 — weighted mean of back-projected depthmap pixels (weight =
-               confidence × max(0, normal_z_world)).
-      Pass 2 — re-scatter rejecting outliers that deviate from the pass-1
-               mean by more than ``dsm_outlier_threshold`` meters.
+    Streaming GPU mode-seeking rasterizer:
+      Each grid cell tracks N=3 altitude modes.  Incoming samples are
+      matched to existing modes (atomic running-mean); unmatched samples
+      go to a per-cell ring buffer that is analysed after each view to
+      detect new clusters.
 
-    Followed by optional bilateral smoothing and hole filling.
+      Finalization picks the HIGHEST mode with sufficient support,
+      yielding a true DSM (rooftops, canopy) rather than a DTM.
+
+    Followed by optional bilateral smoothing, median filter, and hole
+    filling.
     """
     config = data.config
 
@@ -76,14 +80,11 @@ def compute_dsm(
     rasterizer.set_gsd(gsd)
     rasterizer.set_bbox(min_xy, max_xy)
     rasterizer.set_device(0)
-    rasterizer.set_outlier_threshold(
-        config.get("dsm_outlier_threshold", 1.0)
+    rasterizer.set_mode_threshold(
+        config.get("dsm_mode_threshold", 1.0)
     )
     rasterizer.set_min_count(
         config.get("dsm_min_count", 3)
-    )
-    rasterizer.set_z_bias(
-        config.get("dsm_z_bias", 2.5)
     )
     rasterizer.set_bilateral(
         config.get("dsm_bilateral_enabled", True),
@@ -92,9 +93,9 @@ def compute_dsm(
     )
     rasterizer.begin()
 
-    # --- Pass 1: weighted mean ---
-    logger.info("Pass 1: scattering %d views", len(shots_with_dm))
-    for shot in shots_with_dm:
+    # --- Scatter all views + update modes after each ---
+    logger.info("Scattering %d views (mode-seeking)", len(shots_with_dm))
+    for i, shot in enumerate(shots_with_dm):
         depth, plane, _score, confidence = data.load_clean_depthmap(shot.id)
         if confidence is None:
             confidence = np.ones_like(depth)
@@ -108,106 +109,12 @@ def compute_dsm(
             plane.astype(np.float32, copy=False),
             confidence.astype(np.float32, copy=False),
         )
+        rasterizer.update_modes()
+        if (i + 1) % 10 == 0 or i + 1 == len(shots_with_dm):
+            logger.info("  %d / %d views processed", i + 1, len(shots_with_dm))
 
-    rasterizer.begin_pass2()
-
-    percentile: float = config.get("dsm_percentile", 0.75)
-    median_radius: int = config.get("dsm_median_radius", 1)
-
-    # --- Coarse P90 (2× GSD) for structure reference ---
-    coarse_gsd = gsd * 2.0
-    coarse_rast = pydense.DSMRasterizer()
-    coarse_rast.set_gsd(coarse_gsd)
-    coarse_rast.set_bbox(min_xy, max_xy)
-    coarse_rast.set_device(0)
-    coarse_rast.set_outlier_threshold(
-        config.get("dsm_outlier_threshold", 1.0)
-    )
-    coarse_rast.set_min_count(1)
-    coarse_rast.set_bilateral(False, 0, 0.0)
-    coarse_rast.begin()
-
-    logger.info("Coarse pass 1: scattering %d views at %.4f m/px",
-                len(shots_with_dm), coarse_gsd)
-    for shot in shots_with_dm:
-        depth, plane, _score, confidence = data.load_clean_depthmap(shot.id)
-        if confidence is None:
-            confidence = np.ones_like(depth)
-        h, w = depth.shape
-        K = np.asarray(shot.camera.get_K_in_pixel_coordinates(w, h))
-        R = np.asarray(shot.pose.get_rotation_matrix())
-        t = np.asarray(shot.pose.translation)
-        coarse_rast.scatter(
-            K, R, t,
-            depth.astype(np.float32, copy=False),
-            plane.astype(np.float32, copy=False),
-            confidence.astype(np.float32, copy=False),
-        )
-
-    coarse_rast.begin_pass2()
-
-    logger.info("Coarse pass 2: CPU P%.0f scatter", percentile * 100)
-    for shot in shots_with_dm:
-        depth, plane, _score, confidence = data.load_clean_depthmap(shot.id)
-        if confidence is None:
-            confidence = np.ones_like(depth)
-        h, w = depth.shape
-        K = np.asarray(shot.camera.get_K_in_pixel_coordinates(w, h))
-        R = np.asarray(shot.pose.get_rotation_matrix())
-        t = np.asarray(shot.pose.translation)
-        coarse_rast.scatter_cpu(
-            K, R, t,
-            depth.astype(np.float32, copy=False),
-            plane.astype(np.float32, copy=False),
-            confidence.astype(np.float32, copy=False),
-        )
-
-    coarse_grid: NDArray = coarse_rast.finish_percentile(percentile)
-    logger.info(
-        "Coarse grid: %d valid / %d total",
-        int(np.count_nonzero(~np.isnan(coarse_grid))),
-        coarse_grid.size,
-    )
-
-    # --- Upsample coarse P90 to fine resolution as reference ---
-    from scipy.ndimage import zoom
-
-    coarse_h, coarse_w = coarse_grid.shape
-    # Compute exact zoom factors to match fine grid dimensions.
-    zoom_y = height / coarse_h
-    zoom_x = width / coarse_w
-    ref_z = zoom(coarse_grid, (zoom_y, zoom_x), order=1).astype(np.float32)
-    # Trim/pad to exact fine grid size (rounding can cause ±1 mismatch).
-    ref_z = ref_z[:height, :width]
-    if ref_z.shape[0] < height or ref_z.shape[1] < width:
-        padded = np.full((height, width), np.nan, dtype=np.float32)
-        padded[: ref_z.shape[0], : ref_z.shape[1]] = ref_z
-        ref_z = padded
-
-    rasterizer.set_reference_z(ref_z)
-
-    # --- Fine pass 2: CPU P90 with coarse-informed rejection ---
-    logger.info(
-        "Fine pass 2: CPU P%.0f scatter (%d views, coarse-guided)",
-        percentile * 100,
-        len(shots_with_dm),
-    )
-    for shot in shots_with_dm:
-        depth, plane, _score, confidence = data.load_clean_depthmap(shot.id)
-        if confidence is None:
-            confidence = np.ones_like(depth)
-        h, w = depth.shape
-        K = np.asarray(shot.camera.get_K_in_pixel_coordinates(w, h))
-        R = np.asarray(shot.pose.get_rotation_matrix())
-        t = np.asarray(shot.pose.translation)
-        rasterizer.scatter_cpu(
-            K, R, t,
-            depth.astype(np.float32, copy=False),
-            plane.astype(np.float32, copy=False),
-            confidence.astype(np.float32, copy=False),
-        )
-
-    grid: NDArray = rasterizer.finish_percentile(percentile)
+    # --- Finalize (highest mode + bilateral) ---
+    grid: NDArray = rasterizer.finish()
     logger.info(
         "Rasterized: %d valid cells / %d total",
         int(np.count_nonzero(~np.isnan(grid))),
@@ -215,6 +122,7 @@ def compute_dsm(
     )
 
     # --- Post-process median filter ---
+    median_radius: int = config.get("dsm_median_radius", 1)
     if median_radius > 0:
         from scipy.ndimage import median_filter
 

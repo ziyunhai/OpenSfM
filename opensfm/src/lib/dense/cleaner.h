@@ -20,8 +20,6 @@ class GPUDepthmapCleaner {
 
   void SetSameDepthThreshold(float t);
   void SetMinConsistentViews(int n);
-  void SetCarvingThreshold(float t);
-  void SetMaxCarvedViews(int n);
   int AddView(const Mat3d& K, const Mat3d& R, const Vec3d& t,
               const ImageF& depth);
   cv::Mat Clean(int ref_idx, const std::vector<int>& neighbor_ids);
@@ -41,8 +39,6 @@ class GPUDepthmapCleaner {
   std::vector<ViewEntry> views_;
   float same_depth_threshold_ = 0.01f;
   int min_consistent_views_ = 3;
-  float carving_threshold_ = 0.2f;
-  int max_carved_views_ = 1;
   int device_idx_ = 0;
   bool kernel_built_ = false;
   cl::Program program_;

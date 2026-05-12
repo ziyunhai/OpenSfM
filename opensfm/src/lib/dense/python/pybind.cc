@@ -98,10 +98,6 @@ PYBIND11_MODULE(pydense, m) {
            &dense::DepthmapCleanerWrapper::SetSameDepthThreshold)
       .def("set_min_consistent_views",
            &dense::DepthmapCleanerWrapper::SetMinConsistentViews)
-      .def("set_carving_threshold",
-           &dense::DepthmapCleanerWrapper::SetCarvingThreshold)
-      .def("set_max_carved_views",
-           &dense::DepthmapCleanerWrapper::SetMaxCarvedViews)
       .def("set_device", &dense::DepthmapCleanerWrapper::SetDevice)
       .def("add_view", &dense::DepthmapCleanerWrapper::AddView)
       .def("clean", &dense::DepthmapCleanerWrapper::Clean)
@@ -114,24 +110,15 @@ PYBIND11_MODULE(pydense, m) {
       .def("set_bbox", &dense::DSMRasterizerWrapper::SetBBox, py::arg("min_xy"),
            py::arg("max_xy"))
       .def("set_device", &dense::DSMRasterizerWrapper::SetDevice)
-      .def("set_outlier_threshold",
-           &dense::DSMRasterizerWrapper::SetOutlierThreshold)
+      .def("set_mode_threshold", &dense::DSMRasterizerWrapper::SetModeThreshold)
       .def("set_min_count", &dense::DSMRasterizerWrapper::SetMinCount)
-      .def("set_z_bias", &dense::DSMRasterizerWrapper::SetZBias)
       .def("set_bilateral", &dense::DSMRasterizerWrapper::SetBilateral,
            py::arg("enabled"), py::arg("radius"), py::arg("range_sigma"))
       .def("begin", &dense::DSMRasterizerWrapper::Begin)
       .def("scatter", &dense::DSMRasterizerWrapper::Scatter, py::arg("K"),
            py::arg("R"), py::arg("t"), py::arg("depth"), py::arg("normal"),
            py::arg("confidence"))
-      .def("begin_pass2", &dense::DSMRasterizerWrapper::BeginPass2)
+      .def("update_modes", &dense::DSMRasterizerWrapper::UpdateModes)
       .def("finish", &dense::DSMRasterizerWrapper::Finish)
-      .def("scatter_cpu", &dense::DSMRasterizerWrapper::ScatterCPU,
-           py::arg("K"), py::arg("R"), py::arg("t"), py::arg("depth"),
-           py::arg("normal"), py::arg("confidence"))
-      .def("finish_percentile", &dense::DSMRasterizerWrapper::FinishPercentile,
-           py::arg("percentile"))
-      .def("set_reference_z", &dense::DSMRasterizerWrapper::SetReferenceZ,
-           py::arg("ref_z"))
       .def_static("is_available", &dense::DSMRasterizerWrapper::IsAvailable);
 }

@@ -128,8 +128,6 @@ class DepthmapEstimator {
   cl::Buffer cl_plane_masks_;
   cl::Buffer cl_prev_depths_;
   cl_uint cl_prev_depth_mask_ = 0u;
-  cl::Buffer
-      cl_low_depths_;  // Upsampled coarse-level depths for prior blending
 
   // Host-side prior data for confidence computation.
   ImageF prior_depths_;    // (H, W) — prior depth per pixel

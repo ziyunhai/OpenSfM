@@ -419,12 +419,6 @@ class OpenSfMConfig:
     depthmap_same_depth_threshold: float = 0.01
     # Min number of consistent views in clean stage
     depthmap_min_consistent_views: int = 3
-    # Relative depth threshold for space-carving in the clean stage:
-    # a neighbor counts as a carve vote when it sees something further
-    # by more than this fraction (e.g., 0.2 = 20% further).
-    depthmap_carving_threshold: float = 0.2
-    # Max number of carve votes a pixel may receive before it is discarded.
-    depthmap_max_carved_views: int = 1
     # Save per-shot raw/clean PLYs and per-cluster debug PLYs (slow, for debugging only).
     depthmap_save_debug_ply: bool = True
     # Spatial sigma for bilateral NCC weighting
@@ -440,7 +434,7 @@ class OpenSfMConfig:
     # Minimum connected component size in pixels; smaller segments are removed as speckle noise
     depthmap_speckle_min_size: int = 0
     # Maximum gap size in pixels for linear depth interpolation (0 = disabled)
-    depthmap_gap_max_size: int = 15
+    depthmap_gap_max_size: int = 0
     # Depth/normal smoothness weight for PatchMatch
     depthmap_smooth_weight: float = 0.1
     # Weight for geometric consistency cost (0 = disabled). Applied per source view.
@@ -455,7 +449,7 @@ class OpenSfMConfig:
     # Maximum baseline angle (degrees) for neighbor selection.
     depthmap_neighbor_max_angle: float = 60.0
     # SVO voxel size in world units (meters). Smaller = finer but more memory.
-    depthmap_fusion_svo_voxel_size: float = 0.05
+    depthmap_fusion_svo_voxel_size: float = 0.1
     # SVO truncation factor: truncation_distance = factor * voxel_size.
     depthmap_fusion_svo_trunc_factor: float = 12
     # SVO minimum weight for extracting points
@@ -497,19 +491,13 @@ class OpenSfMConfig:
     ##################################
     # Ground sample distance in meters/pixel. 0 = auto from voxel size.
     dsm_gsd: float = 0.0
-    # Outlier rejection threshold in meters: points farther from the
-    # pass-1 weighted mean are discarded in the second scatter pass.
-    dsm_outlier_threshold: float = 1.0
-    # Minimum number of depthmap pixel contributions per cell.  Cells with
-    # fewer observations become nodata, filtering sparse/rogue pixels.
+    # Mode-seeking threshold in meters: incoming Z samples closer than
+    # this to an existing mode are merged; farther samples go to the
+    # ring buffer for new-mode detection.
+    dsm_mode_threshold: float = 1.0
+    # Minimum number of depthmap pixel contributions per mode.  Modes
+    # with fewer observations are discarded during finalization.
     dsm_min_count: int = 3
-    # Exponential Z-bias (softmax) for the second scatter pass.  Upweights
-    # above-mean observations to approximate an upper percentile, reducing
-    # concavity bleeding at courtyards and overhangs.
-    #   0   = plain weighted mean (no bias)
-    #   2.5 = approximate P90 (default)
-    #   5+  = approaches pure max
-    dsm_z_bias: float = 2.5
     # Enable edge-preserving bilateral smoothing on the DSM grid.
     dsm_bilateral_enabled: bool = True
     # Bilateral filter spatial radius in pixels.
@@ -522,8 +510,6 @@ class OpenSfMConfig:
     dsm_fill_max_radius: int = 3
     # Use Delaunay triangulation to fill larger interior holes after dilation.
     dsm_fill_triangulate: bool = True
-    # Percentile for per-cell Z selection (0.5 = median, 0.9 = P90).
-    dsm_percentile: float = 0.75
     # Post-process median filter radius (0 = disabled, 1 = 3x3, 2 = 5x5).
     dsm_median_radius: int = 1
 

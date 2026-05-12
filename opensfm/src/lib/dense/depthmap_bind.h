@@ -120,8 +120,6 @@ class DepthmapCleanerWrapper {
  public:
   void SetSameDepthThreshold(float t) { cleaner_.SetSameDepthThreshold(t); }
   void SetMinConsistentViews(int n) { cleaner_.SetMinConsistentViews(n); }
-  void SetCarvingThreshold(float t) { cleaner_.SetCarvingThreshold(t); }
-  void SetMaxCarvedViews(int n) { cleaner_.SetMaxCarvedViews(n); }
   void SetDevice(int idx) { cleaner_.SetDevice(idx); }
 
   void AddView(const Mat3d& K, const Mat3d& R, const Vec3d& t,
@@ -211,8 +209,6 @@ class DepthmapCleanerWrapper {
  public:
   void SetSameDepthThreshold(float) {}
   void SetMinConsistentViews(int) {}
-  void SetCarvingThreshold(float) {}
-  void SetMaxCarvedViews(int) {}
   void SetDevice(int) {}
   void AddView(const Mat3d&, const Mat3d&, const Vec3d&,
                Eigen::Ref<const ImageF>) {
@@ -333,7 +329,7 @@ class SVOFuserWrapper {
   SVOFuser sf_;
 };
 
-// ---- DSM rasterizer wrapper (two-pass depthmap scatter + bilateral) ----
+// ---- DSM rasterizer wrapper (streaming mode-seeking + bilateral) ----
 
 #ifdef OPENSFM_HAVE_OPENCL
 
@@ -348,16 +344,15 @@ class DSMRasterizerWrapper {
     has_bbox_ = true;
   }
   void SetDevice(int idx) { device_idx_ = idx; }
-  void SetOutlierThreshold(float meters) { outlier_threshold_ = meters; }
+  void SetModeThreshold(float meters) { mode_threshold_ = meters; }
   void SetMinCount(int n) { min_count_ = n; }
-  void SetZBias(float alpha) { z_bias_ = alpha; }
   void SetBilateral(bool enabled, int radius, float range_sigma) {
     bilateral_enabled_ = enabled;
     bilateral_radius_ = radius;
     bilateral_range_ = range_sigma;
   }
 
-  // Allocate GPU grids and prepare for pass-1 scatter.
+  // Allocate GPU grids and prepare for scatter.
   void Begin() {
     if (!has_bbox_ || gsd_ <= 0.0f) {
       throw std::runtime_error(
@@ -370,28 +365,28 @@ class DSMRasterizerWrapper {
       throw std::runtime_error("DSMRasterizer: degenerate grid size");
     }
 
-    const size_t ncells = static_cast<size_t>(grid_h_) * grid_w_;
+    ncells_ = static_cast<size_t>(grid_h_) * grid_w_;
 
     auto& dev = opencl::CLContext::Instance().Device(device_idx_);
-    prog_ = dev.GetOrBuildProgram("dsm_rasterizer_v2", kDSMKernelSource);
+    prog_ = dev.GetOrBuildProgram("dsm_mode_v1", kDSMKernelSource);
 
     auto& ctx = dev.context();
-    const size_t int_bytes = ncells * sizeof(int32_t);
-    const size_t float_bytes = ncells * sizeof(float);
 
-    cl_sum_zw_ = cl::Buffer(ctx, CL_MEM_READ_WRITE, int_bytes);
-    cl_sum_w_ = cl::Buffer(ctx, CL_MEM_READ_WRITE, int_bytes);
-    cl_count_ = cl::Buffer(ctx, CL_MEM_READ_WRITE, int_bytes);
-    cl_mean_z_ = cl::Buffer(ctx, CL_MEM_READ_WRITE, float_bytes);
-    cl_out_a_ = cl::Buffer(ctx, CL_MEM_READ_WRITE, float_bytes);
-    cl_out_b_ = cl::Buffer(ctx, CL_MEM_READ_WRITE, float_bytes);
+    // N_MODES=3, K_BUF=10
+    cl_mode_z_ =
+        cl::Buffer(ctx, CL_MEM_READ_WRITE, 3 * ncells_ * sizeof(int32_t));
+    cl_mode_count_ =
+        cl::Buffer(ctx, CL_MEM_READ_WRITE, 3 * ncells_ * sizeof(int32_t));
+    cl_buf_z_ =
+        cl::Buffer(ctx, CL_MEM_READ_WRITE, 10 * ncells_ * sizeof(int32_t));
+    cl_buf_pos_ = cl::Buffer(ctx, CL_MEM_READ_WRITE, ncells_ * sizeof(int32_t));
+    cl_out_a_ = cl::Buffer(ctx, CL_MEM_READ_WRITE, ncells_ * sizeof(float));
+    cl_out_b_ = cl::Buffer(ctx, CL_MEM_READ_WRITE, ncells_ * sizeof(float));
 
-    ClearGrids();
-    in_pass2_ = false;
+    ClearAll();
   }
 
-  // Scatter one depthmap view.  In pass 1 calls dsm_backproject_scatter;
-  // after BeginPass2() calls dsm_reject_scatter.
+  // Scatter one depthmap view into the mode grid.
   void Scatter(const Mat3d& K, const Mat3d& R, const Vec3d& t,
                Eigen::Ref<const ImageF> depth,
                const py::array_t<float, py::array::c_style>& normal,
@@ -438,101 +433,75 @@ class DSMRasterizerWrapper {
                       21 * sizeof(float), cam);
 
     const float inv_gsd = 1.0f / gsd_;
+    const int ncells_i = static_cast<int>(ncells_);
+    const int fp_threshold = static_cast<int>(mode_threshold_ * 8192.0f);
+    const float min_normal_z = 0.35f;
     const size_t global = ((static_cast<size_t>(npx) + 255) / 256) * 256;
 
-    if (!in_pass2_) {
-      cl::Kernel k(prog_, "dsm_backproject_scatter");
-      k.setArg(0, cl_depth);
-      k.setArg(1, cl_normal);
-      k.setArg(2, cl_conf);
-      k.setArg(3, cl_cam);
-      k.setArg(4, cl_sum_zw_);
-      k.setArg(5, cl_sum_w_);
-      k.setArg(6, cl_count_);
-      k.setArg(7, origin_x_);
-      k.setArg(8, origin_y_);
-      k.setArg(9, inv_gsd);
-      k.setArg(10, grid_w_);
-      k.setArg(11, grid_h_);
-      k.setArg(12, w);
-      k.setArg(13, h);
+    cl::Kernel k(prog_, "dsm_scatter");
+    k.setArg(0, cl_depth);
+    k.setArg(1, cl_normal);
+    k.setArg(2, cl_conf);
+    k.setArg(3, cl_cam);
+    k.setArg(4, cl_mode_z_);
+    k.setArg(5, cl_mode_count_);
+    k.setArg(6, cl_buf_z_);
+    k.setArg(7, cl_buf_pos_);
+    k.setArg(8, origin_x_);
+    k.setArg(9, origin_y_);
+    k.setArg(10, inv_gsd);
+    k.setArg(11, grid_w_);
+    k.setArg(12, grid_h_);
+    k.setArg(13, w);
+    k.setArg(14, h);
+    k.setArg(15, ncells_i);
+    k.setArg(16, fp_threshold);
+    k.setArg(17, min_normal_z);
 
-      py::gil_scoped_release release;
-      q.enqueueNDRangeKernel(k, cl::NullRange, cl::NDRange(global),
-                             cl::NDRange(256));
-      q.finish();
-    } else {
-      cl::Kernel k(prog_, "dsm_reject_scatter");
-      k.setArg(0, cl_depth);
-      k.setArg(1, cl_normal);
-      k.setArg(2, cl_conf);
-      k.setArg(3, cl_cam);
-      k.setArg(4, cl_mean_z_);
-      k.setArg(5, cl_sum_zw_);
-      k.setArg(6, cl_sum_w_);
-      k.setArg(7, cl_count_);
-      k.setArg(8, origin_x_);
-      k.setArg(9, origin_y_);
-      k.setArg(10, inv_gsd);
-      k.setArg(11, grid_w_);
-      k.setArg(12, grid_h_);
-      k.setArg(13, w);
-      k.setArg(14, h);
-      k.setArg(15, outlier_threshold_);
-      k.setArg(16, z_bias_);
-
-      py::gil_scoped_release release;
-      q.enqueueNDRangeKernel(k, cl::NullRange, cl::NDRange(global),
-                             cl::NDRange(256));
-      q.finish();
-    }
+    py::gil_scoped_release release;
+    q.enqueueNDRangeKernel(k, cl::NullRange, cl::NDRange(global),
+                           cl::NDRange(256));
+    q.finish();
   }
 
-  // Finalize pass-1 mean, clear accumulators, switch to pass-2 mode.
-  void BeginPass2() {
+  // Analyse ring buffers and promote clusters to mode slots.
+  void UpdateModes() {
     auto& dev = opencl::CLContext::Instance().Device(device_idx_);
     auto& q = dev.queue();
-    const int ncells = grid_h_ * grid_w_;
+    const int ncells_i = static_cast<int>(ncells_);
+    const int fp_threshold = static_cast<int>(mode_threshold_ * 8192.0f);
+    const int min_buf_samples = 3;
+    const size_t global = ((ncells_ + 255) / 256) * 256;
 
-    // Finalize pass 1 → mean_z
-    cl::Kernel k_fin(prog_, "dsm_finalize");
-    k_fin.setArg(0, cl_sum_zw_);
-    k_fin.setArg(1, cl_sum_w_);
-    k_fin.setArg(2, cl_count_);
-    k_fin.setArg(3, cl_mean_z_);
-    k_fin.setArg(4, ncells);
-    // Pass 1 finalize uses min_count=1, min_weight=1 (lenient) so that
-    // the mean_z reference grid is as full as possible for outlier rejection.
-    k_fin.setArg(5, 1);
-    k_fin.setArg(6, 1);
-    const size_t global = ((static_cast<size_t>(ncells) + 255) / 256) * 256;
-    {
-      py::gil_scoped_release release;
-      q.enqueueNDRangeKernel(k_fin, cl::NullRange, cl::NDRange(global),
-                             cl::NDRange(256));
-      q.finish();
-    }
+    cl::Kernel k(prog_, "dsm_update_modes");
+    k.setArg(0, cl_mode_z_);
+    k.setArg(1, cl_mode_count_);
+    k.setArg(2, cl_buf_z_);
+    k.setArg(3, cl_buf_pos_);
+    k.setArg(4, ncells_i);
+    k.setArg(5, fp_threshold);
+    k.setArg(6, min_buf_samples);
 
-    ClearGrids();
-    in_pass2_ = true;
+    py::gil_scoped_release release;
+    q.enqueueNDRangeKernel(k, cl::NullRange, cl::NDRange(global),
+                           cl::NDRange(256));
+    q.finish();
   }
 
-  // Finalize pass 2, optional bilateral filter, download result.
+  // Finalize: pick highest mode, optional bilateral, download result.
   foundation::pyarray_f Finish() {
     auto& dev = opencl::CLContext::Instance().Device(device_idx_);
     auto& q = dev.queue();
-    const int ncells = grid_h_ * grid_w_;
-    const size_t global1d = ((static_cast<size_t>(ncells) + 255) / 256) * 256;
+    const int ncells_i = static_cast<int>(ncells_);
+    const size_t global1d = ((ncells_ + 255) / 256) * 256;
 
-    // Finalize pass 2 (biased weighted mean) → cl_out_a_
+    // Finalize → cl_out_a_
     cl::Kernel k_fin(prog_, "dsm_finalize");
-    k_fin.setArg(0, cl_sum_zw_);
-    k_fin.setArg(1, cl_sum_w_);
-    k_fin.setArg(2, cl_count_);
-    k_fin.setArg(3, cl_out_a_);
-    k_fin.setArg(4, ncells);
-    k_fin.setArg(5, min_count_);
-    k_fin.setArg(6, 1);  // min_weight = 1 (guard division by zero)
+    k_fin.setArg(0, cl_mode_z_);
+    k_fin.setArg(1, cl_mode_count_);
+    k_fin.setArg(2, cl_out_a_);
+    k_fin.setArg(3, ncells_i);
+    k_fin.setArg(4, min_count_);
     {
       py::gil_scoped_release release;
       q.enqueueNDRangeKernel(k_fin, cl::NullRange, cl::NDRange(global1d),
@@ -567,8 +536,8 @@ class DSMRasterizerWrapper {
     }
 
     // Download
-    const size_t float_bytes = static_cast<size_t>(ncells) * sizeof(float);
-    std::vector<float> host_grid(ncells);
+    const size_t float_bytes = ncells_ * sizeof(float);
+    std::vector<float> host_grid(ncells_);
     q.enqueueReadBuffer(*result_buf, CL_TRUE, 0, float_bytes, host_grid.data());
 
     return foundation::py_array_from_data(host_grid.data(), grid_h_, grid_w_);
@@ -578,188 +547,18 @@ class DSMRasterizerWrapper {
     return opencl::CLContext::Instance().IsAvailable();
   }
 
-  // ------------------------------------------------------------------
-  // CPU percentile path (debug / reference).
-  //
-  // After BeginPass2(), call ScatterCPU() for each view instead of
-  // Scatter().  Then call FinishPercentile(0.9) instead of Finish().
-  // ------------------------------------------------------------------
-
-  void ScatterCPU(const Mat3d& K, const Mat3d& R, const Vec3d& t,
-                  Eigen::Ref<const ImageF> depth,
-                  const py::array_t<float, py::array::c_style>& normal,
-                  Eigen::Ref<const ImageF> confidence) {
-    const int h = static_cast<int>(depth.rows());
-    const int w = static_cast<int>(depth.cols());
-
-    if (normal.ndim() != 3 || normal.shape(0) != h || normal.shape(1) != w ||
-        normal.shape(2) != 3) {
-      throw std::invalid_argument("normal must be (H, W, 3) float32");
-    }
-
-    const size_t ncells = static_cast<size_t>(grid_h_) * grid_w_;
-    if (cell_z_.empty()) {
-      cell_z_.resize(ncells);
-    }
-
-    // Download mean_z from GPU on first CPU scatter call (if no external
-    // reference was provided via SetReferenceZ).
-    if (host_mean_z_.empty()) {
-      host_mean_z_.resize(ncells);
-      auto& dev = opencl::CLContext::Instance().Device(device_idx_);
-      dev.queue().enqueueReadBuffer(
-          cl_mean_z_, CL_TRUE, 0, ncells * sizeof(float), host_mean_z_.data());
-    }
-
-    Eigen::Matrix3f Kinvf = K.cast<float>().inverse();
-    Eigen::Matrix3f Rinvf = R.cast<float>().transpose();
-    Eigen::Vector3f tf = t.cast<float>();
-
-    const float* dp = depth.data();
-    const float* np_data = normal.data();
-    const float inv_gsd = 1.0f / gsd_;
-
-    py::gil_scoped_release release;
-
-    for (int v = 0; v < h; ++v) {
-      for (int u = 0; u < w; ++u) {
-        const int idx = v * w + u;
-        const float d = dp[idx];
-        if (d <= 0.0f) {
-          continue;
-        }
-
-        const float fu = static_cast<float>(u);
-        const float fv = static_cast<float>(v);
-        Eigen::Vector3f cam_pt;
-        cam_pt.x() = (Kinvf(0, 0) * fu + Kinvf(0, 1) * fv + Kinvf(0, 2)) * d;
-        cam_pt.y() = (Kinvf(1, 0) * fu + Kinvf(1, 1) * fv + Kinvf(1, 2)) * d;
-        cam_pt.z() = (Kinvf(2, 0) * fu + Kinvf(2, 1) * fv + Kinvf(2, 2)) * d;
-
-        Eigen::Vector3f world = Rinvf * (cam_pt - tf);
-
-        const int gx =
-            static_cast<int>(std::floor((world.x() - origin_x_) * inv_gsd));
-        const int gy =
-            static_cast<int>(std::floor((world.y() - origin_y_) * inv_gsd));
-        if (gx < 0 || gx >= grid_w_ || gy < 0 || gy >= grid_h_) {
-          continue;
-        }
-
-        const int cell = gy * grid_w_ + gx;
-        const float mz = host_mean_z_[cell];
-        if (std::isnan(mz) || (mz - world.z()) > outlier_threshold_) {
-          continue;
-        }
-
-        const int nbase = idx * 3;
-        Eigen::Vector3f cn(np_data[nbase], np_data[nbase + 1],
-                           np_data[nbase + 2]);
-        const float wnz = Rinvf.row(2).dot(cn);
-        if (wnz < 0.3f) {
-          continue;
-        }
-
-        cell_z_[cell].push_back(world.z());
-      }
-    }
-  }
-
-  foundation::pyarray_f FinishPercentile(float percentile) {
-    const size_t ncells = static_cast<size_t>(grid_h_) * grid_w_;
-    std::vector<float> result(ncells, std::numeric_limits<float>::quiet_NaN());
-
-    {
-      py::gil_scoped_release release;
-      for (size_t i = 0; i < ncells; ++i) {
-        auto& zs = cell_z_[i];
-        if (static_cast<int>(zs.size()) < min_count_) {
-          continue;
-        }
-        std::sort(zs.begin(), zs.end());
-        const float rank = percentile * static_cast<float>(zs.size() - 1);
-        const int lo = static_cast<int>(rank);
-        const int hi = std::min(lo + 1, static_cast<int>(zs.size()) - 1);
-        const float frac = rank - static_cast<float>(lo);
-        result[i] = zs[lo] * (1.0f - frac) + zs[hi] * frac;
-      }
-    }
-
-    // CPU bilateral filter for the debug path.
-    if (bilateral_enabled_ && bilateral_radius_ > 0) {
-      std::vector<float> filtered(ncells,
-                                  std::numeric_limits<float>::quiet_NaN());
-      const float sigma_s = static_cast<float>(bilateral_radius_) / 2.0f;
-      const float inv_2ss = 1.0f / (2.0f * sigma_s * sigma_s);
-      const float inv_2sr = 1.0f / (2.0f * bilateral_range_ * bilateral_range_);
-
-      py::gil_scoped_release release;
-      for (int y = 0; y < grid_h_; ++y) {
-        for (int x = 0; x < grid_w_; ++x) {
-          const float center = result[y * grid_w_ + x];
-          if (std::isnan(center)) {
-            continue;
-          }
-          float sum_val = 0.0f, sum_wt = 0.0f;
-          for (int dy = -bilateral_radius_; dy <= bilateral_radius_; ++dy) {
-            const int ny = y + dy;
-            if (ny < 0 || ny >= grid_h_) {
-              continue;
-            }
-            for (int dx = -bilateral_radius_; dx <= bilateral_radius_; ++dx) {
-              const int nx = x + dx;
-              if (nx < 0 || nx >= grid_w_) {
-                continue;
-              }
-              const float nval = result[ny * grid_w_ + nx];
-              if (std::isnan(nval)) {
-                continue;
-              }
-              const float sd = static_cast<float>(dx * dx + dy * dy);
-              const float rd = center - nval;
-              const float wt = std::exp(-sd * inv_2ss - rd * rd * inv_2sr);
-              sum_val += nval * wt;
-              sum_wt += wt;
-            }
-          }
-          filtered[y * grid_w_ + x] =
-              (sum_wt > 0.0f) ? (sum_val / sum_wt)
-                              : std::numeric_limits<float>::quiet_NaN();
-        }
-      }
-      result = std::move(filtered);
-    }
-
-    cell_z_.clear();
-    cell_z_.shrink_to_fit();
-    host_mean_z_.clear();
-    host_mean_z_.shrink_to_fit();
-
-    return foundation::py_array_from_data(result.data(), grid_h_, grid_w_);
-  }
-
-  // Override the outlier-rejection reference grid with an external one
-  // (e.g., upsampled coarse P90).  Must match grid_h_ × grid_w_.
-  void SetReferenceZ(Eigen::Ref<const ImageF> ref_z) {
-    if (ref_z.rows() != grid_h_ || ref_z.cols() != grid_w_) {
-      throw std::invalid_argument("SetReferenceZ: shape must match grid");
-    }
-    const size_t ncells = static_cast<size_t>(grid_h_) * grid_w_;
-    host_mean_z_.resize(ncells);
-    std::memcpy(host_mean_z_.data(), ref_z.data(), ncells * sizeof(float));
-  }
-
  private:
-  void ClearGrids() {
+  void ClearAll() {
     auto& dev = opencl::CLContext::Instance().Device(device_idx_);
     auto& q = dev.queue();
-    const int ncells = grid_h_ * grid_w_;
-    cl::Kernel k(prog_, "dsm_clear_grid");
-    k.setArg(0, cl_sum_zw_);
-    k.setArg(1, cl_sum_w_);
-    k.setArg(2, cl_count_);
-    k.setArg(3, ncells);
-    const size_t global = ((static_cast<size_t>(ncells) + 255) / 256) * 256;
+    const int ncells_i = static_cast<int>(ncells_);
+    cl::Kernel k(prog_, "dsm_clear");
+    k.setArg(0, cl_mode_z_);
+    k.setArg(1, cl_mode_count_);
+    k.setArg(2, cl_buf_z_);
+    k.setArg(3, cl_buf_pos_);
+    k.setArg(4, ncells_i);
+    const size_t global = ((ncells_ + 255) / 256) * 256;
     q.enqueueNDRangeKernel(k, cl::NullRange, cl::NDRange(global),
                            cl::NDRange(256));
     q.finish();
@@ -772,8 +571,7 @@ class DSMRasterizerWrapper {
   float max_y_ = 0.0f;
   bool has_bbox_ = false;
   int device_idx_ = 0;
-  float outlier_threshold_ = 1.0f;
-  float z_bias_ = 2.5f;
+  float mode_threshold_ = 1.0f;
   int min_count_ = 3;
   int bilateral_radius_ = 2;
   float bilateral_range_ = 0.3f;
@@ -781,18 +579,14 @@ class DSMRasterizerWrapper {
 
   int grid_w_ = 0;
   int grid_h_ = 0;
-  bool in_pass2_ = false;
+  size_t ncells_ = 0;
   cl::Program prog_;
-  cl::Buffer cl_sum_zw_;
-  cl::Buffer cl_sum_w_;
-  cl::Buffer cl_count_;
-  cl::Buffer cl_mean_z_;
+  cl::Buffer cl_mode_z_;
+  cl::Buffer cl_mode_count_;
+  cl::Buffer cl_buf_z_;
+  cl::Buffer cl_buf_pos_;
   cl::Buffer cl_out_a_;
   cl::Buffer cl_out_b_;
-
-  // CPU percentile path storage.
-  std::vector<std::vector<float>> cell_z_;
-  std::vector<float> host_mean_z_;
 };
 
 #else  // !OPENSFM_HAVE_OPENCL
@@ -802,9 +596,8 @@ class DSMRasterizerWrapper {
   void SetGSD(float) {}
   void SetBBox(const Eigen::Vector2f&, const Eigen::Vector2f&) {}
   void SetDevice(int) {}
-  void SetOutlierThreshold(float) {}
+  void SetModeThreshold(float) {}
   void SetMinCount(int) {}
-  void SetZBias(float) {}
   void SetBilateral(bool, int, float) {}
   void Begin() {
     throw std::runtime_error("DSMRasterizer: OpenCL not available");
@@ -815,22 +608,10 @@ class DSMRasterizerWrapper {
                Eigen::Ref<const ImageF>) {
     throw std::runtime_error("DSMRasterizer: OpenCL not available");
   }
-  void BeginPass2() {
+  void UpdateModes() {
     throw std::runtime_error("DSMRasterizer: OpenCL not available");
   }
   foundation::pyarray_f Finish() {
-    throw std::runtime_error("DSMRasterizer: OpenCL not available");
-  }
-  void ScatterCPU(const Mat3d&, const Mat3d&, const Vec3d&,
-                  Eigen::Ref<const ImageF>,
-                  const py::array_t<float, py::array::c_style>&,
-                  Eigen::Ref<const ImageF>) {
-    throw std::runtime_error("DSMRasterizer: OpenCL not available");
-  }
-  foundation::pyarray_f FinishPercentile(float) {
-    throw std::runtime_error("DSMRasterizer: OpenCL not available");
-  }
-  void SetReferenceZ(Eigen::Ref<const ImageF>) {
     throw std::runtime_error("DSMRasterizer: OpenCL not available");
   }
   static bool IsAvailable() { return false; }
