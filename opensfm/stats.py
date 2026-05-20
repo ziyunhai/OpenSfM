@@ -181,7 +181,7 @@ def gcp_errors(
                          "y": gcp_horizontal_sd, "z": gcp_vertical_sd}
 
         # Determine role string
-        role_str = "Ground Control Point" if gcp.role == pymap.GroundControlPointRole.GCP else "Checkpoint"
+        role_str = "gcp" if gcp.role == pymap.GroundControlPointRole.GCP else "checkpoint"
 
         if result is None:
             # Count total projections with a valid shot
