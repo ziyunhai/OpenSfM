@@ -423,8 +423,6 @@ class Report:
             geo_string.append("GPS")
         if self._has_meaningful_gcp():
             geo_string.append("Ground Control Point")
-        if self._has_meaningful_cp():
-            geo_string.append("Check Point")
 
         ratio_shots = rec_shots / init_shots * 100 if init_shots > 0 else -1
         ratio_points = rec_points / init_points * 100 if init_points > 0 else -1
@@ -660,22 +658,16 @@ class Report:
         cp_only = gcp_errors.get("cp_only", {})
         if "average_error" in cp_only:
             rows = []
-            columns_names = ["Check Point", "Mean", "Sigma", "RMS Error", "Input Sigma"]
+            columns_names = ["Check Point", "Mean", "Sigma", "RMS Error"]
 
             # Compute per-axis average sigma from CP details
             gcp_details = gcp_errors.get("details", [])
-            cp_sigmas = [d["sigma"] for d in gcp_details if d["role"] == "Check Point"]
 
             for comp in ["x", "y", "z"]:
                 row = [comp.upper() + " Error (meters)"]
                 row.append(f"{cp_only['mean'][comp]:.3f}")
                 row.append(f"{cp_only['std'][comp]:.3f}")
                 row.append(f"{cp_only['error'][comp]:.3f}")
-                if cp_sigmas:
-                    avg_comp = float(np.mean([s[comp] for s in cp_sigmas]))
-                    row.append(f"{avg_comp:.3f}")
-                else:
-                    row.append("N/A")
                 rows.append(row)
 
             rows.append(
@@ -801,7 +793,7 @@ class Report:
             self._draw_graded_cell(inlier_text, col_sizes[5], inlier_pct, inlier_thresholds, row_bg)
 
             # Avg sigma cell
-            if sigma is not None:
+            if sigma is not None and role == "Ground Control Point":
                 avg_s = (sigma["x"] + sigma["y"] + sigma["z"]) / 3.0
                 sigma_text = f"{avg_s:.3f}"
             else:
