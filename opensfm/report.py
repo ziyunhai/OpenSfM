@@ -401,6 +401,11 @@ class Report:
             and "average_error" in self.stats["gcp_errors"]
         )
 
+    def _has_meaningful_cp(self) -> bool:
+        gcp_errors = self.stats.get("gcp_errors", {})
+        cp_only = gcp_errors.get("cp_only", {})
+        return "average_error" in cp_only
+
     def make_processing_summary(self) -> None:
         self._make_section("Processing Summary")
 
@@ -417,7 +422,9 @@ class Report:
         if self.stats["reconstruction_statistics"]["has_gps"]:
             geo_string.append("GPS")
         if self._has_meaningful_gcp():
-            geo_string.append("GCP")
+            geo_string.append("Ground Control Point")
+        if self._has_meaningful_cp():
+            geo_string.append("Check Point")
 
         ratio_shots = rec_shots / init_shots * 100 if init_shots > 0 else -1
         ratio_points = rec_points / init_points * 100 if init_points > 0 else -1
@@ -530,13 +537,26 @@ class Report:
 
         # GCP error graded row (based on GSD, same Z thresholds: good <= 3*GSD, avg <= 4*GSD, bad > 5*GSD)
         if self._has_meaningful_gcp() and gsd > 0:
-            gcp_avg_error = self.stats["gcp_errors"]["average_error"]
+            gcp_only = self.stats["gcp_errors"].get("gcp_only", {})
+            gcp_avg_error = gcp_only.get("average_error", self.stats["gcp_errors"]["average_error"])
             gcp_thresholds = (3.0 * gsd, 4.0 * gsd, 5.0 * gsd)
             self._make_graded_row_lower(
-                "GCP Error",
+                "Ground Control Point Error",
                 gcp_avg_error,
                 f"{gcp_avg_error:.3f} meters",
                 gcp_thresholds, col_sizes,
+            )
+
+        # CP error graded row
+        if self._has_meaningful_cp() and gsd > 0:
+            cp_only = self.stats["gcp_errors"]["cp_only"]
+            cp_avg_error = cp_only["average_error"]
+            cp_thresholds = (3.0 * gsd, 4.0 * gsd, 5.0 * gsd)
+            self._make_graded_row_lower(
+                "Check Point Error",
+                cp_avg_error,
+                f"{cp_avg_error:.3f} meters",
+                cp_thresholds, col_sizes,
             )
 
         self.pdf.set_xy(MARGIN, self.pdf.get_y() + TABLE_GAP)
@@ -566,21 +586,61 @@ class Report:
         self.pdf.set_xy(MARGIN, self.pdf.get_y() + SECTION_GAP)
 
     def make_gps_details(self) -> None:
-        self._make_section("GPS/GCP Errors Details")
+        self._make_section("GPS/Ground Control Point/Check Point Errors Details")
 
-        for error_type in ["gps", "gcp"]:
+        # GPS table
+        if "average_error" in self.stats.get("gps_errors", {}):
             rows = []
-            columns_names = [error_type.upper(), "Mean", "Sigma", "RMS Error"]
-            if "average_error" not in self.stats[error_type + "_errors"]:
-                continue
+            avg_gps_std = self.stats["gps_errors"].get("average_gps_std")
+            columns_names = ["GPS", "Mean", "Sigma", "RMS Error"]
+            if avg_gps_std:
+                columns_names.append("Input Sigma")
             for comp in ["x", "y", "z"]:
                 row = [comp.upper() + " Error (meters)"]
                 row.append(
-                    f"{self.stats[error_type + '_errors']['mean'][comp]:.3f}")
+                    f"{self.stats['gps_errors']['mean'][comp]:.3f}")
                 row.append(
-                    f"{self.stats[error_type + '_errors']['std'][comp]:.3f}")
+                    f"{self.stats['gps_errors']['std'][comp]:.3f}")
                 row.append(
-                    f"{self.stats[error_type + '_errors']['error'][comp]:.3f}")
+                    f"{self.stats['gps_errors']['error'][comp]:.3f}")
+                if avg_gps_std:
+                    row.append(f"{avg_gps_std[comp]:.3f}")
+                rows.append(row)
+
+            total_row = [
+                "Total",
+                "",
+                "",
+                f"{self.stats['gps_errors']['average_error']:.3f}",
+            ]
+            if avg_gps_std:
+                total_row.append("")
+            rows.append(total_row)
+
+            self._make_table(columns_names, rows)
+            self.pdf.set_xy(MARGIN, self.pdf.get_y() + TABLE_GAP)
+
+        # GCP table (optimization points only)
+        gcp_errors = self.stats.get("gcp_errors", {})
+        gcp_only = gcp_errors.get("gcp_only", {})
+        if "average_error" in gcp_only:
+            rows = []
+            columns_names = ["Ground Control Point", "Mean", "Sigma", "RMS Error", "Input Sigma"]
+
+            # Compute per-axis average sigma from GCP details
+            gcp_details = gcp_errors.get("details", [])
+            gcp_sigmas = [d["sigma"] for d in gcp_details if d["role"] == "Ground Control Point"]
+
+            for comp in ["x", "y", "z"]:
+                row = [comp.upper() + " Error (meters)"]
+                row.append(f"{gcp_only['mean'][comp]:.3f}")
+                row.append(f"{gcp_only['std'][comp]:.3f}")
+                row.append(f"{gcp_only['error'][comp]:.3f}")
+                if gcp_sigmas:
+                    avg_comp = float(np.mean([s[comp] for s in gcp_sigmas]))
+                    row.append(f"{avg_comp:.3f}")
+                else:
+                    row.append("N/A")
                 rows.append(row)
 
             rows.append(
@@ -588,22 +648,45 @@ class Report:
                     "Total",
                     "",
                     "",
-                    f"{self.stats[error_type + '_errors']['average_error']:.3f}",
+                    f"{gcp_only['average_error']:.3f}",
+                    "",
                 ]
             )
 
-            # For GPS, append a priori std dev row
-            if error_type == "gps":
-                avg_gps_std = self.stats["gps_errors"].get("average_gps_std")
-                if avg_gps_std:
-                    rows.append(
-                        [
-                            "Input Std Dev (meters)",
-                            f"{avg_gps_std['x']:.3f}",
-                            f"{avg_gps_std['y']:.3f}",
-                            f"{avg_gps_std['z']:.3f}",
-                        ]
-                    )
+            self._make_table(columns_names, rows)
+            self.pdf.set_xy(MARGIN, self.pdf.get_y() + TABLE_GAP)
+
+        # CP table (check points)
+        cp_only = gcp_errors.get("cp_only", {})
+        if "average_error" in cp_only:
+            rows = []
+            columns_names = ["Check Point", "Mean", "Sigma", "RMS Error", "Input Sigma"]
+
+            # Compute per-axis average sigma from CP details
+            gcp_details = gcp_errors.get("details", [])
+            cp_sigmas = [d["sigma"] for d in gcp_details if d["role"] == "Check Point"]
+
+            for comp in ["x", "y", "z"]:
+                row = [comp.upper() + " Error (meters)"]
+                row.append(f"{cp_only['mean'][comp]:.3f}")
+                row.append(f"{cp_only['std'][comp]:.3f}")
+                row.append(f"{cp_only['error'][comp]:.3f}")
+                if cp_sigmas:
+                    avg_comp = float(np.mean([s[comp] for s in cp_sigmas]))
+                    row.append(f"{avg_comp:.3f}")
+                else:
+                    row.append("N/A")
+                rows.append(row)
+
+            rows.append(
+                [
+                    "Total",
+                    "",
+                    "",
+                    f"{cp_only['average_error']:.3f}",
+                    "",
+                ]
+            )
 
             self._make_table(columns_names, rows)
             self.pdf.set_xy(MARGIN, self.pdf.get_y() + TABLE_GAP)
@@ -637,7 +720,7 @@ class Report:
         if not details:
             return
 
-        self._make_section("GCP Details")
+        self._make_section("GCP/CP Details")
 
         # GSD-based quality thresholds for error cells
         gsd = self.stats["reconstruction_statistics"].get("gsd", -1.0)
@@ -649,7 +732,7 @@ class Report:
         # Inlier ratio quality thresholds (as percentages: bad < 90, avg 90-95, good >= 95)
         inlier_thresholds = (90.0, 95.0, 100.0)
 
-        columns_names = ["GCP ID", "X Error (m)", "Y Error (m)", "Z Error (m)", "Inliers / Total"]
+        columns_names = ["ID", "Role", "X Error (m)", "Y Error (m)", "Z Error (m)", "Inliers / Total", "Avg Sigma (m)"]
         n_cols = len(columns_names)
         col_sizes = [int(CONTENT_WIDTH / n_cols)] * n_cols
         col_sizes[-1] = CONTENT_WIDTH - sum(col_sizes[:-1])
@@ -665,12 +748,18 @@ class Report:
             self.pdf.cell(size, CELL_HEIGHT, "  " + col, align="L")
         self.pdf.set_xy(MARGIN, self.pdf.get_y() + CELL_HEIGHT)
 
+        # Sort: Check Points first, then Ground Control Points
+        sorted_details = sorted(details, key=lambda d: (0 if d.get("role") == "Check Point" else 1, d["id"]))
+
         # Data rows
-        for row_idx, entry in enumerate(details):
+        for row_idx, entry in enumerate(sorted_details):
             gcp_id = entry["id"]
             error = entry["error"]
             n_inliers = entry["n_inliers"]
             n_total = entry["n_total"]
+            role = entry.get("role", "Ground Control Point")
+            role_short = "Check" if role == "Check Point" else "Control"
+            sigma = entry.get("sigma")
             row_bg = COLOR_TABLE_ROW_EVEN if row_idx % 2 == 0 else COLOR_TABLE_ROW_ODD
 
             # ID cell (label style)
@@ -681,8 +770,16 @@ class Report:
             self.pdf.rect(self.pdf.get_x(), self.pdf.get_y(), col_sizes[0], CELL_HEIGHT, style="FD")
             self.pdf.cell(col_sizes[0], CELL_HEIGHT, "  " + gcp_id, align="L")
 
+            # Role cell
+            self.pdf.set_fill_color(*row_bg)
+            self.pdf.set_text_color(*COLOR_TEXT)
+            self.pdf.set_font("Helvetica", "", FONT_BODY)
+            self.pdf.set_draw_color(*COLOR_TABLE_BORDER)
+            self.pdf.rect(self.pdf.get_x(), self.pdf.get_y(), col_sizes[1], CELL_HEIGHT, style="FD")
+            self.pdf.cell(col_sizes[1], CELL_HEIGHT, "  " + role_short, align="L")
+
             # X, Y, Z error cells with GSD-based quality dots
-            for col_idx, axis in enumerate(["x", "y", "z"], start=1):
+            for col_idx, axis in enumerate(["x", "y", "z"], start=2):
                 cell_text = f"{error[axis]:.3f}" if error is not None else "N/A"
                 thresholds = z_thresholds if axis == "z" else xy_thresholds
                 if error is not None and thresholds is not None:
@@ -701,7 +798,20 @@ class Report:
             # Inliers/Total cell with quality dot
             inlier_pct = (n_inliers / n_total * 100.0) if n_total > 0 else 0.0
             inlier_text = f"{n_inliers} / {n_total}"
-            self._draw_graded_cell(inlier_text, col_sizes[4], inlier_pct, inlier_thresholds, row_bg)
+            self._draw_graded_cell(inlier_text, col_sizes[5], inlier_pct, inlier_thresholds, row_bg)
+
+            # Avg sigma cell
+            if sigma is not None:
+                avg_s = (sigma["x"] + sigma["y"] + sigma["z"]) / 3.0
+                sigma_text = f"{avg_s:.3f}"
+            else:
+                sigma_text = "N/A"
+            self.pdf.set_fill_color(*row_bg)
+            self.pdf.set_text_color(*COLOR_TEXT)
+            self.pdf.set_font("Helvetica", "", FONT_BODY)
+            self.pdf.set_draw_color(*COLOR_TABLE_BORDER)
+            self.pdf.rect(self.pdf.get_x(), self.pdf.get_y(), col_sizes[6], CELL_HEIGHT, style="FD")
+            self.pdf.cell(col_sizes[6], CELL_HEIGHT, "  " + sigma_text, align="L")
 
             self.pdf.set_xy(MARGIN, self.pdf.get_y() + CELL_HEIGHT)
 

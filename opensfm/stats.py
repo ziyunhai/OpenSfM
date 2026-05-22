@@ -140,12 +140,13 @@ def opk_errors(reconstructions: List[types.Reconstruction]) -> Dict[str, Any]:
 def gcp_errors(
     data: DataSetBase, reconstructions: List[types.Reconstruction]
 ) -> Dict[str, Any]:
-    all_errors = []
-
     reference = data.load_reference()
     gcps = data.load_ground_control_points()
     if not gcps:
         return {}
+
+    gcp_horizontal_sd = data.config["gcp_horizontal_sd"]
+    gcp_vertical_sd = data.config["gcp_vertical_sd"]
 
     all_errors = []
     gcp_details: List[Dict[str, Any]] = []
@@ -163,6 +164,16 @@ def gcp_errors(
 
         gcp_enu = np.array(reference.to_topocentric(*gcp.lla_vec))
 
+        # Determine the std dev for this point
+        if gcp.std_dev is not None:
+            sd = gcp.std_dev
+            sigma_xyz = {"x": float(sd[0]), "y": float(sd[1]), "z": float(sd[2])}
+        else:
+            sigma_xyz = {"x": gcp_horizontal_sd, "y": gcp_horizontal_sd, "z": gcp_vertical_sd}
+
+        # Determine role string
+        role_str = "Ground Control Point" if gcp.role == pymap.GroundControlPointRole.GCP else "Check Point"
+
         if result is None:
             # Count total projections with a valid shot
             n_total = sum(
@@ -174,6 +185,8 @@ def gcp_errors(
                 "error": None,
                 "n_inliers": 0,
                 "n_total": n_total,
+                "role": role_str,
+                "sigma": sigma_xyz,
             })
             continue
 
@@ -185,10 +198,31 @@ def gcp_errors(
             "error": {"x": float(error[0]), "y": float(error[1]), "z": float(error[2])},
             "n_inliers": sum(inliers_mask),
             "n_total": len(inliers_mask),
+            "role": role_str,
+            "sigma": sigma_xyz,
         })
 
-    stats = _gps_gcp_opk_errors_stats(np.array(all_errors), ["x", "y", "z"])
+    # Separate GCP-only and CP-only errors
+    gcp_only_errors = [
+        e for e, d in zip(all_errors, [dd for dd in gcp_details if dd["error"] is not None])
+        if d["role"] == "Ground Control Point"
+    ]
+    cp_only_errors = [
+        e for e, d in zip(all_errors, [dd for dd in gcp_details if dd["error"] is not None])
+        if d["role"] == "Check Point"
+    ]
+
+    stats = _gps_gcp_opk_errors_stats(np.array(all_errors) if all_errors else np.array([]), ["x", "y", "z"])
     stats["details"] = gcp_details
+
+    # Add separate stats for GCP and CP
+    stats["gcp_only"] = _gps_gcp_opk_errors_stats(
+        np.array(gcp_only_errors) if gcp_only_errors else np.array([]), ["x", "y", "z"]
+    )
+    stats["cp_only"] = _gps_gcp_opk_errors_stats(
+        np.array(cp_only_errors) if cp_only_errors else np.array([]), ["x", "y", "z"]
+    )
+
     crs = data.load_gcp_coordinate_system()
     if crs:
         stats["coordinate_system"] = crs

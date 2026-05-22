@@ -498,6 +498,11 @@ size_t BAHelpers::AddGCPToBundle(
 
   size_t added_gcp_observations = 0;
   for (const auto& point : gcp) {
+    // Skip check points — they are not used in optimization
+    if (point.role_ == map::CHECKPOINT) {
+      continue;
+    }
+
     const auto point_id = "gcp-" + point.id_;
     Vec3d coordinates;
     std::vector<bool> inliers;
@@ -520,9 +525,14 @@ size_t BAHelpers::AddGCPToBundle(
     constexpr auto point_constant{false};
     ba.AddPoint(point_id, coordinates, point_constant);
     if (!point.lla_.empty()) {
-      const auto point_std = Vec3d(config["gcp_horizontal_sd"].cast<double>(),
-                                   config["gcp_horizontal_sd"].cast<double>(),
-                                   config["gcp_vertical_sd"].cast<double>());
+      Vec3d point_std;
+      if (point.std_dev_.has_value()) {
+        point_std = point.std_dev_.value();
+      } else {
+        point_std = Vec3d(config["gcp_horizontal_sd"].cast<double>(),
+                          config["gcp_horizontal_sd"].cast<double>(),
+                          config["gcp_vertical_sd"].cast<double>());
+      }
       ba.AddPointPrior(point_id, reference.ToTopocentric(point.GetLlaVec3d()),
                        point_std / prior_weight, point.has_altitude_);
     }

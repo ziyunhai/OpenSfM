@@ -91,12 +91,18 @@ std::vector<GroundControlPoint> ReadGcpJson(const std::string& content) {
     }
 
     GroundControlPoint gcp;
-    gcp.role_ = OPTIMIZATION;
+    gcp.role_ = GCP;
 
     // id
     std::string_view idSv;
     if (pointObj["id"].get_string().get(idSv) == simdjson::SUCCESS) {
       gcp.id_ = std::string(idSv);
+    }
+
+    // role (optional, defaults to GCP)
+    std::string_view roleSv;
+    if (pointObj["role"].get_string().get(roleSv) == simdjson::SUCCESS) {
+      gcp.role_ = RoleFromString(std::string(roleSv));
     }
 
     // position → lla
@@ -113,6 +119,19 @@ std::vector<GroundControlPoint> ReadGcpJson(const std::string& content) {
       } else {
         gcp.lla_["altitude"] = 0.0;
         gcp.has_altitude_ = false;
+      }
+
+      // per-point standard deviations (optional)
+      double lat_std = 0, lon_std = 0, alt_std = 0;
+      bool has_lat_std =
+          posObj["latitude_std"].get_double().get(lat_std) == simdjson::SUCCESS;
+      bool has_lon_std = posObj["longitude_std"].get_double().get(lon_std) ==
+                         simdjson::SUCCESS;
+      bool has_alt_std =
+          posObj["altitude_std"].get_double().get(alt_std) == simdjson::SUCCESS;
+
+      if (has_lat_std && has_lon_std && has_alt_std) {
+        gcp.std_dev_ = Vec3d(lon_std, lat_std, alt_std);
       }
     }
 
@@ -184,6 +203,7 @@ std::string WriteGcpJson(const std::vector<GroundControlPoint>& gcps) {
     }
     out << "    {\n";
     out << "      \"id\": \"" << jsonEscape(gcp.id_) << "\",\n";
+    out << "      \"role\": \"" << RoleToString(gcp.role_) << "\",\n";
 
     // position (LLA)
     auto latIt = gcp.lla_.find("latitude");
@@ -194,11 +214,15 @@ std::string WriteGcpJson(const std::vector<GroundControlPoint>& gcps) {
       out << "        \"latitude\": " << latIt->second << ",\n";
       out << "        \"longitude\": " << lonIt->second;
       if (gcp.has_altitude_ && altIt != gcp.lla_.end()) {
-        out << ",\n        \"altitude\": " << altIt->second << "\n";
-      } else {
-        out << "\n";
+        out << ",\n        \"altitude\": " << altIt->second;
       }
-      out << "      },\n";
+      if (gcp.std_dev_.has_value()) {
+        const auto& sd = gcp.std_dev_.value();
+        out << ",\n        \"latitude_std\": " << sd.y();
+        out << ",\n        \"longitude_std\": " << sd.x();
+        out << ",\n        \"altitude_std\": " << sd.z();
+      }
+      out << "\n      },\n";
     }
 
     // observations
@@ -315,7 +339,7 @@ std::vector<GroundControlPoint> ReadGcpList(
       gcp.id_ = gcpName.empty() ? ("unnamed-" + std::to_string(result.size()))
                                 : gcpName;
       gcp.has_altitude_ = hasAltitude;
-      gcp.role_ = OPTIMIZATION;
+      gcp.role_ = GCP;
       gcp.lla_["latitude"] = lat;
       gcp.lla_["longitude"] = lon;
       gcp.lla_["altitude"] = alt;

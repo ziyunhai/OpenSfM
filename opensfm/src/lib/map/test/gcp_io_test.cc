@@ -21,7 +21,7 @@ map::GroundControlPoint MakeTestGcp(const std::string& id, double lat,
   gcp.lla_["longitude"] = lon;
   gcp.lla_["altitude"] = alt;
   gcp.has_altitude_ = hasAlt;
-  gcp.role_ = map::OPTIMIZATION;
+  gcp.role_ = map::GCP;
   gcp.coordinates_ = Vec3d(lat, lon, alt);
   return gcp;
 }
