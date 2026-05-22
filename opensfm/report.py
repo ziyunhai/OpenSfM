@@ -551,7 +551,7 @@ class Report:
             cp_avg_error = cp_only["average_error"]
             cp_thresholds = (3.0 * gsd, 4.0 * gsd, 5.0 * gsd)
             self._make_graded_row_lower(
-                "Check Point Error",
+                "Checkpoint Error",
                 cp_avg_error,
                 f"{cp_avg_error:.3f} meters",
                 cp_thresholds, col_sizes,
@@ -584,7 +584,7 @@ class Report:
         self.pdf.set_xy(MARGIN, self.pdf.get_y() + SECTION_GAP)
 
     def make_gps_details(self) -> None:
-        self._make_section("GPS/Ground Control Point/Check Point Errors Details")
+        self._make_section("GPS/Ground Control Point/Checkpoint Errors Details")
 
         # GPS table
         if "average_error" in self.stats.get("gps_errors", {}):
@@ -658,7 +658,7 @@ class Report:
         cp_only = gcp_errors.get("cp_only", {})
         if "average_error" in cp_only:
             rows = []
-            columns_names = ["Check Point", "Mean", "Sigma", "RMS Error"]
+            columns_names = ["Checkpoint", "Mean", "Sigma", "RMS Error"]
 
             # Compute per-axis average sigma from CP details
             gcp_details = gcp_errors.get("details", [])
@@ -741,7 +741,7 @@ class Report:
         self.pdf.set_xy(MARGIN, self.pdf.get_y() + CELL_HEIGHT)
 
         # Sort: Check Points first, then Ground Control Points
-        sorted_details = sorted(details, key=lambda d: (0 if d.get("role") == "Check Point" else 1, d["id"]))
+        sorted_details = sorted(details, key=lambda d: (0 if d.get("role") == "Checkpoint" else 1, d["id"]))
 
         # Data rows
         for row_idx, entry in enumerate(sorted_details):
@@ -750,7 +750,7 @@ class Report:
             n_inliers = entry["n_inliers"]
             n_total = entry["n_total"]
             role = entry.get("role", "Ground Control Point")
-            role_short = "Check" if role == "Check Point" else "Control"
+            role_short = "Check" if role == "Checkpoint" else "Control"
             sigma = entry.get("sigma")
             row_bg = COLOR_TABLE_ROW_EVEN if row_idx % 2 == 0 else COLOR_TABLE_ROW_ODD
 

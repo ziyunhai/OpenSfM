@@ -172,7 +172,7 @@ def gcp_errors(
             sigma_xyz = {"x": gcp_horizontal_sd, "y": gcp_horizontal_sd, "z": gcp_vertical_sd}
 
         # Determine role string
-        role_str = "Ground Control Point" if gcp.role == pymap.GroundControlPointRole.GCP else "Check Point"
+        role_str = "Ground Control Point" if gcp.role == pymap.GroundControlPointRole.GCP else "Checkpoint"
 
         if result is None:
             # Count total projections with a valid shot
@@ -209,7 +209,7 @@ def gcp_errors(
     ]
     cp_only_errors = [
         e for e, d in zip(all_errors, [dd for dd in gcp_details if dd["error"] is not None])
-        if d["role"] == "Check Point"
+        if d["role"] == "Checkpoint"
     ]
 
     stats = _gps_gcp_opk_errors_stats(np.array(all_errors) if all_errors else np.array([]), ["x", "y", "z"])
