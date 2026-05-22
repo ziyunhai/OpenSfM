@@ -47,6 +47,18 @@ void SVOIntegratorCL::BuildKernels() {
   k_refine_update_ = cl::Kernel(program_, "svo_refine_update", &err);
   opencl::CheckCL(err, "kernel svo_refine_update");
 
+  k_raycast_ = cl::Kernel(program_, "svo_raycast", &err);
+  opencl::CheckCL(err, "kernel svo_raycast");
+
+  k_carve_vote_ = cl::Kernel(program_, "svo_carve_vote", &err);
+  opencl::CheckCL(err, "kernel svo_carve_vote");
+
+  k_prune_ = cl::Kernel(program_, "svo_prune", &err);
+  opencl::CheckCL(err, "kernel svo_prune");
+
+  k_clear_votes_ = cl::Kernel(program_, "svo_clear_votes", &err);
+  opencl::CheckCL(err, "kernel svo_clear_votes");
+
   // 1-byte dummy buffer used as placeholder when normal/color/mask is absent.
   cl_dummy_ =
       cl::Buffer(dev.context(), static_cast<cl_mem_flags>(CL_MEM_READ_ONLY),
@@ -119,6 +131,14 @@ void SVOIntegratorCL::Initialize(uint32_t capacity) {
   const size_t global = ((capacity_ + 255u) / 256u) * 256u;
   queue.enqueueNDRangeKernel(k_clear_, cl::NullRange, cl::NDRange(global),
                              cl::NDRange(256));
+
+  // Allocate and zero the overflow counter.
+  cl_overflow_ =
+      cl::Buffer(ctx, CL_MEM_READ_WRITE, sizeof(uint32_t), nullptr, &err);
+  opencl::CheckCL(err, "overflow counter buffer");
+  uint32_t zero = 0;
+  queue.enqueueWriteBuffer(cl_overflow_, CL_TRUE, 0, sizeof(uint32_t), &zero);
+
   queue.finish();
 }
 
@@ -244,6 +264,7 @@ void SVOIntegratorCL::Integrate(const Mat3f& K, const Mat3f& R, const Vec3f& t,
   int arg = 0;
   k_integrate_.setArg(arg++, cl_table_);
   k_integrate_.setArg(arg++, capacity_mask_);
+  k_integrate_.setArg(arg++, cl_overflow_);
   k_integrate_.setArg(arg++, cl_depth_);
   k_integrate_.setArg(arg++, has_normal ? cl_normal_ : cl_dummy_);
   k_integrate_.setArg(arg++, has_color ? cl_color_ : cl_dummy_);
@@ -333,14 +354,21 @@ void SVOIntegratorCL::InitializeCounting(uint32_t capacity) {
       cl::Buffer(ctx, CL_MEM_READ_WRITE, sizeof(uint32_t), nullptr, &err);
   opencl::CheckCL(err, "counter buffer");
 
+  // Overflow counter for counting pass.
+  cl_count_overflow_ =
+      cl::Buffer(ctx, CL_MEM_READ_WRITE, sizeof(uint32_t), nullptr, &err);
+  opencl::CheckCL(err, "count overflow buffer");
+
   // Camera params buffer (shared with integration path).
   cl_camera_ =
       cl::Buffer(ctx, CL_MEM_READ_ONLY, sizeof(SVOCameraGPU), nullptr, &err);
   opencl::CheckCL(err, "camera buffer (counting)");
 
-  // Zero the counter.
+  // Zero the counters.
   uint32_t zero = 0;
   queue.enqueueWriteBuffer(cl_counter_, CL_FALSE, 0, sizeof(uint32_t), &zero);
+  queue.enqueueWriteBuffer(cl_count_overflow_, CL_FALSE, 0, sizeof(uint32_t),
+                           &zero);
 
   // Clear the counting table.
   k_count_clear_.setArg(0, cl_count_table_);
@@ -401,6 +429,7 @@ void SVOIntegratorCL::Count(const Mat3f& K, const Mat3f& R, const Vec3f& t,
   k_count_.setArg(arg++, cl_count_table_);
   k_count_.setArg(arg++, count_mask_);
   k_count_.setArg(arg++, cl_counter_);
+  k_count_.setArg(arg++, cl_count_overflow_);
   k_count_.setArg(arg++, cl_depth_);
   k_count_.setArg(arg++, has_mask ? cl_mask_ : cl_dummy_);
   k_count_.setArg(arg++, static_cast<cl_int>(has_mask));
@@ -436,7 +465,38 @@ uint32_t SVOIntegratorCL::GetUniqueCount() const {
   auto& queue = dev.queue();
   uint32_t count = 0;
   queue.enqueueReadBuffer(cl_counter_, CL_TRUE, 0, sizeof(uint32_t), &count);
+
+  // Also read the counting overflow counter.
+  uint32_t overflow = 0;
+  queue.enqueueReadBuffer(cl_count_overflow_, CL_TRUE, 0, sizeof(uint32_t),
+                          &overflow);
+  if (overflow > 0) {
+    std::cerr << "[SVOIntegratorCL] WARNING: count pass dropped " << overflow
+              << " insertions (table too full)\n";
+  }
   return count;
+}
+
+uint32_t SVOIntegratorCL::GetOverflowCount() const {
+  if (capacity_ == 0) {
+    return 0;
+  }
+  auto& dev = opencl::CLContext::Instance().Device(device_idx_);
+  auto& queue = dev.queue();
+  uint32_t overflow = 0;
+  queue.enqueueReadBuffer(cl_overflow_, CL_TRUE, 0, sizeof(uint32_t),
+                          &overflow);
+  return overflow;
+}
+
+void SVOIntegratorCL::ResetOverflowCounter() {
+  if (capacity_ == 0) {
+    return;
+  }
+  auto& dev = opencl::CLContext::Instance().Device(device_idx_);
+  auto& queue = dev.queue();
+  uint32_t zero = 0;
+  queue.enqueueWriteBuffer(cl_overflow_, CL_TRUE, 0, sizeof(uint32_t), &zero);
 }
 
 VoxelMap SVOIntegratorCL::Download() const {
@@ -457,7 +517,8 @@ VoxelMap SVOIntegratorCL::Download() const {
 
   for (uint32_t i = 0; i < capacity_; ++i) {
     const auto& slot = host_table[i];
-    if (slot.key_ab == kEmptyKey || slot.count == 0) {
+    if (slot.key_ab == kEmptyKey || slot.key_c == kKeyCUninit ||
+        slot.count == 0) {
       continue;
     }
 
@@ -842,6 +903,197 @@ void SVOIntegratorCL::Refine(int color_iters, int joint_iters, float lambda_reg,
   cl_refine_grad_ = cl::Buffer();
   cl_refine_adam_ = cl::Buffer();
   refine_prepared_ = false;
+}
+
+// =====================================================================
+// Visibility pruning implementation
+// =====================================================================
+
+void SVOIntegratorCL::InitializeVisibilityPruning() {
+  BuildKernels();
+
+  if (capacity_ == 0) {
+    throw std::runtime_error(
+        "InitializeVisibilityPruning: hash table not initialized");
+  }
+
+  auto& dev = opencl::CLContext::Instance().Device(device_idx_);
+  cl::Context& ctx = dev.context();
+  cl::CommandQueue& queue = dev.queue();
+  cl_int err;
+
+  const size_t slots_bytes = capacity_ * sizeof(int32_t);
+
+  cl_carve_count_ =
+      cl::Buffer(ctx, CL_MEM_READ_WRITE, slots_bytes, nullptr, &err);
+  opencl::CheckCL(err, "carve_count buffer");
+
+  cl_support_count_ =
+      cl::Buffer(ctx, CL_MEM_READ_WRITE, slots_bytes, nullptr, &err);
+  opencl::CheckCL(err, "support_count buffer");
+
+  // Clear both counters.
+  k_clear_votes_.setArg(0, cl_carve_count_);
+  k_clear_votes_.setArg(1, cl_support_count_);
+  k_clear_votes_.setArg(2, capacity_);
+
+  size_t global = ((capacity_ + 255) / 256) * 256;
+  queue.enqueueNDRangeKernel(k_clear_votes_, cl::NullRange, cl::NDRange(global),
+                             cl::NDRange(256));
+  queue.finish();
+
+  visibility_initialized_ = true;
+}
+
+void SVOIntegratorCL::RaycastAndVote(const Mat3f& K, const Mat3f& R,
+                                     const Vec3f& t, const float* clean_depth,
+                                     int rows, int cols, float voxel_size,
+                                     float min_depth, float max_depth,
+                                     float min_weight, float carve_margin) {
+  if (!visibility_initialized_) {
+    throw std::runtime_error(
+        "RaycastAndVote: call InitializeVisibilityPruning first");
+  }
+
+  auto& dev = opencl::CLContext::Instance().Device(device_idx_);
+  cl::Context& ctx = dev.context();
+  cl::CommandQueue& queue = dev.queue();
+  cl_int err;
+
+  const size_t npix = static_cast<size_t>(rows) * cols;
+  const size_t pix_float_bytes = npix * sizeof(float);
+  const size_t pix_uint_bytes = npix * sizeof(uint32_t);
+  const float inv_voxel_size = 1.0f / voxel_size;
+
+  // Ensure per-frame buffers are large enough.
+  if (npix > raycast_pixels_) {
+    cl_rendered_depth_ =
+        cl::Buffer(ctx, CL_MEM_READ_WRITE, pix_float_bytes, nullptr, &err);
+    opencl::CheckCL(err, "rendered_depth buffer");
+    cl_hit_slot_ =
+        cl::Buffer(ctx, CL_MEM_READ_WRITE, pix_uint_bytes, nullptr, &err);
+    opencl::CheckCL(err, "hit_slot buffer");
+    cl_clean_depth_ =
+        cl::Buffer(ctx, CL_MEM_READ_ONLY, pix_float_bytes, nullptr, &err);
+    opencl::CheckCL(err, "clean_depth buffer");
+    raycast_pixels_ = npix;
+  }
+
+  // Upload clean depth.
+  queue.enqueueWriteBuffer(cl_clean_depth_, CL_FALSE, 0, pix_float_bytes,
+                           clean_depth);
+
+  // Upload camera.
+  SVOCameraGPU cam_gpu;
+  Eigen::Matrix3f Kinv = K.inverse();
+  Eigen::Matrix3f Rinv = R.transpose();
+  Eigen::Vector3f cam_pos = -Rinv * t;
+  for (int i = 0; i < 9; ++i) {
+    cam_gpu.Kinv[i] = Kinv.data()[i];
+  }
+  for (int i = 0; i < 9; ++i) {
+    cam_gpu.Rinv[i] = Rinv.data()[i];
+  }
+  for (int i = 0; i < 9; ++i) {
+    cam_gpu.R[i] = R.data()[i];
+  }
+  for (int i = 0; i < 3; ++i) {
+    cam_gpu.t[i] = t[i];
+  }
+  for (int i = 0; i < 3; ++i) {
+    cam_gpu.cam_pos[i] = cam_pos[i];
+  }
+  for (int i = 0; i < 3; ++i) {
+    cam_gpu._pad[i] = 0.0f;
+  }
+
+  // Reuse cl_camera_ buffer (already allocated by Integrate).
+  if (!cl_camera_()) {
+    cl_camera_ =
+        cl::Buffer(ctx, CL_MEM_READ_ONLY, sizeof(SVOCameraGPU), nullptr, &err);
+    opencl::CheckCL(err, "camera buffer for raycast");
+  }
+  queue.enqueueWriteBuffer(cl_camera_, CL_FALSE, 0, sizeof(SVOCameraGPU),
+                           &cam_gpu);
+
+  // --- Dispatch svo_raycast ---
+  int arg = 0;
+  k_raycast_.setArg(arg++, cl_table_);
+  k_raycast_.setArg(arg++, capacity_mask_);
+  k_raycast_.setArg(arg++, cl_rendered_depth_);
+  k_raycast_.setArg(arg++, cl_hit_slot_);
+  k_raycast_.setArg(arg++, cl_camera_);
+  k_raycast_.setArg(arg++, rows);
+  k_raycast_.setArg(arg++, cols);
+  k_raycast_.setArg(arg++, voxel_size);
+  k_raycast_.setArg(arg++, inv_voxel_size);
+  k_raycast_.setArg(arg++, min_depth);
+  k_raycast_.setArg(arg++, max_depth);
+  k_raycast_.setArg(arg++, min_weight);
+
+  cl::NDRange global_2d(((cols + 15) / 16) * 16, ((rows + 15) / 16) * 16);
+  cl::NDRange local_2d(16, 16);
+  queue.enqueueNDRangeKernel(k_raycast_, cl::NullRange, global_2d, local_2d);
+
+  // --- Dispatch svo_carve_vote ---
+  arg = 0;
+  k_carve_vote_.setArg(arg++, cl_rendered_depth_);
+  k_carve_vote_.setArg(arg++, cl_hit_slot_);
+  k_carve_vote_.setArg(arg++, cl_clean_depth_);
+  k_carve_vote_.setArg(arg++, cl_carve_count_);
+  k_carve_vote_.setArg(arg++, cl_support_count_);
+  k_carve_vote_.setArg(arg++, rows);
+  k_carve_vote_.setArg(arg++, cols);
+  k_carve_vote_.setArg(arg++, carve_margin);
+  k_carve_vote_.setArg(arg++, capacity_mask_);
+
+  queue.enqueueNDRangeKernel(k_carve_vote_, cl::NullRange, global_2d, local_2d);
+  queue.finish();
+}
+
+void SVOIntegratorCL::Prune(int carve_threshold, int support_min,
+                            float weight_penalty_per_vote) {
+  if (!visibility_initialized_) {
+    throw std::runtime_error("Prune: call InitializeVisibilityPruning first");
+  }
+
+  auto& dev = opencl::CLContext::Instance().Device(device_idx_);
+  cl::CommandQueue& queue = dev.queue();
+
+  int weight_penalty =
+      static_cast<int>(weight_penalty_per_vote * 128.0f);  // WEIGHT_SCALE
+
+  int arg = 0;
+  k_prune_.setArg(arg++, cl_table_);
+  k_prune_.setArg(arg++, cl_carve_count_);
+  k_prune_.setArg(arg++, cl_support_count_);
+  k_prune_.setArg(arg++, capacity_);
+  k_prune_.setArg(arg++, carve_threshold);
+  k_prune_.setArg(arg++, support_min);
+  k_prune_.setArg(arg++, weight_penalty);
+
+  size_t global = ((capacity_ + 255) / 256) * 256;
+  queue.enqueueNDRangeKernel(k_prune_, cl::NullRange, cl::NDRange(global),
+                             cl::NDRange(256));
+  queue.finish();
+}
+
+void SVOIntegratorCL::ClearVotes() {
+  if (!visibility_initialized_) {
+    return;
+  }
+
+  auto& dev = opencl::CLContext::Instance().Device(device_idx_);
+  cl::CommandQueue& queue = dev.queue();
+
+  k_clear_votes_.setArg(0, cl_carve_count_);
+  k_clear_votes_.setArg(1, cl_support_count_);
+  k_clear_votes_.setArg(2, capacity_);
+
+  size_t global = ((capacity_ + 255) / 256) * 256;
+  queue.enqueueNDRangeKernel(k_clear_votes_, cl::NullRange, cl::NDRange(global),
+                             cl::NDRange(256));
+  queue.finish();
 }
 
 }  // namespace dense

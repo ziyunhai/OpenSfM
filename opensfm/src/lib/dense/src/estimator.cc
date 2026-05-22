@@ -4,11 +4,19 @@
 
 #include <dense/opencl_kernels.h>
 
+// CL_DEVICE_IMAGE_PITCH_ALIGNMENT is part of cl_khr_image2d_from_buffer
+// but only formally in OpenCL 2.0+ headers.  Apple's 1.2 driver supports
+// the extension, so define the enum value if the header doesn't provide it.
+#ifndef CL_DEVICE_IMAGE_PITCH_ALIGNMENT
+#define CL_DEVICE_IMAGE_PITCH_ALIGNMENT 0x104A
+#endif
+
 #include <Eigen/SVD>
 #include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <numeric>
+#include <set>
 #include <unordered_map>
 
 namespace dense {
@@ -189,6 +197,9 @@ void DepthmapEstimator::RunLevel(int level, int total_levels,
 
   UploadData();
 
+  // SLIC segmentation: compute per-pixel segment labels for propagation gating.
+  RunSLIC(w, h);
+
   if (level == 0 && prev_level_w_ == 0) {
     RandomInit(w, h);
   } else if (prev_level_w_ > 0) {
@@ -214,6 +225,8 @@ void DepthmapEstimator::RunLevel(int level, int total_levels,
   }
 
   auto& dev = opencl::CLContext::Instance().Device(device_idx_);
+  dev.queue().finish();
+
   const int npix = w * h;
   std::vector<float> costs_dbg(npix);
   dev.queue().enqueueReadBuffer(cl_costs_, CL_TRUE, 0, sizeof(float) * npix,
@@ -268,6 +281,18 @@ void DepthmapEstimator::BuildKernels() {
   k_checkerboard_filter_black_ =
       cl::Kernel(program_, "acmmp_checkerboard_filter", &err);
   opencl::CheckCL(err, "kernel acmmp_checkerboard_filter (black)");
+
+  // SLIC segmentation kernels (separate program).
+  if (params_.segmentation_enabled) {
+    slic_program_ = dev.GetOrBuildProgram("slic", kSLICKernelSource);
+    k_slic_init_ = cl::Kernel(slic_program_, "slic_init_centers", &err);
+    opencl::CheckCL(err, "kernel slic_init_centers");
+    k_slic_assign_ = cl::Kernel(slic_program_, "slic_assign_pixels", &err);
+    opencl::CheckCL(err, "kernel slic_assign_pixels");
+    k_slic_update_ = cl::Kernel(slic_program_, "slic_update_centers", &err);
+    opencl::CheckCL(err, "kernel slic_update_centers");
+    slic_enabled_ = true;
+  }
 }
 
 // =====================================================================
@@ -286,37 +311,55 @@ void DepthmapEstimator::UploadData() {
 
   const int kTotalSlots = 1 + kMaxSources;  // 1 ref + MAX_SOURCES src
 
-  // Create image objects (CL_R + CL_FLOAT for linear interpolation).
-  cl_images_.clear();
-  for (int i = 0; i < num && i < kTotalSlots; i++) {
-    // Convert to float [0,1].
+  // Upload reference image as a separate Image2D.
+  {
     cv::Mat fimg;
-    images_[i].convertTo(fimg, CV_32F, 1.0 / 255.0);
+    images_[0].convertTo(fimg, CV_32F, 1.0 / 255.0);
+    cv::Mat himg;
+    fimg.convertTo(himg, CV_16F);
 
-    cl::ImageFormat fmt(CL_R, CL_FLOAT);
-    cl::Image2D img(ctx, CL_MEM_READ_ONLY, fmt, fimg.cols, fimg.rows, 0,
-                    nullptr, &err);
-    opencl::CheckCL(err, "Image2D upload");
+    cl::ImageFormat fmt(CL_R, CL_HALF_FLOAT);
+    cl_ref_img_ = cl::Image2D(ctx, CL_MEM_READ_ONLY, fmt, himg.cols, himg.rows,
+                              0, nullptr, &err);
+    opencl::CheckCL(err, "Image2D ref upload (half)");
     cl::array<cl::size_type, 3> origin = {{0, 0, 0}};
     cl::array<cl::size_type, 3> region = {
-        {static_cast<cl::size_type>(fimg.cols),
-         static_cast<cl::size_type>(fimg.rows), 1}};
-    queue.enqueueWriteImage(img, CL_TRUE, origin, region, fimg.step[0], 0,
-                            fimg.data);
-    cl_images_.push_back(std::move(img));
+        {static_cast<cl::size_type>(himg.cols),
+         static_cast<cl::size_type>(himg.rows), 1}};
+    queue.enqueueWriteImage(cl_ref_img_, CL_TRUE, origin, region, himg.step[0],
+                            0, himg.data);
   }
 
-  // Pad to kTotalSlots images (source images passed as individual kernel args).
-  while (static_cast<int>(cl_images_.size()) < kTotalSlots) {
-    // Create a 1x1 dummy image.
-    float dummy = 0.0f;
-    cl::ImageFormat fmt(CL_R, CL_FLOAT);
-    cl::Image2D img(ctx, CL_MEM_READ_ONLY, fmt, 1, 1, 0, nullptr, &err);
-    opencl::CheckCL(err, "Image2D dummy");
-    cl::array<cl::size_type, 3> origin = {{0, 0, 0}};
-    cl::array<cl::size_type, 3> region = {{1, 1, 1}};
-    queue.enqueueWriteImage(img, CL_TRUE, origin, region, 0, 0, &dummy);
-    cl_images_.push_back(std::move(img));
+  // Upload source images as Image2DArray (branchless texture indexing).
+  // Always allocate kMaxSources layers; unused layers are zeroed.
+  // Format: CL_HALF_FLOAT — halves texture bandwidth, enables read_imageh,
+  // and unlocks double-rate FP16 texture units on Apple Silicon.
+  {
+    cl::ImageFormat fmt(CL_R, CL_HALF_FLOAT);
+    cl_src_images_array_ = cl::Image2DArray(
+        ctx, CL_MEM_READ_ONLY, fmt, static_cast<cl::size_type>(kMaxSources),
+        static_cast<cl::size_type>(w), static_cast<cl::size_type>(h), 0, 0,
+        nullptr, &err);
+    opencl::CheckCL(err, "Image2DArray src_images (half)");
+
+    // Write each source image to its layer.
+    for (int i = 0; i < kMaxSources; i++) {
+      cv::Mat fimg;
+      if (i + 1 < num) {
+        images_[i + 1].convertTo(fimg, CV_32F, 1.0 / 255.0);
+      } else {
+        // Unused layer: zero-filled image at correct size.
+        fimg = cv::Mat::zeros(h, w, CV_32F);
+      }
+      cv::Mat himg;
+      fimg.convertTo(himg, CV_16F);
+      cl::array<cl::size_type, 3> origin = {
+          {0, 0, static_cast<cl::size_type>(i)}};
+      cl::array<cl::size_type, 3> region = {
+          {static_cast<cl::size_type>(w), static_cast<cl::size_type>(h), 1}};
+      queue.enqueueWriteImage(cl_src_images_array_, CL_TRUE, origin, region,
+                              himg.step[0], 0, himg.data);
+    }
   }
 
   // Upload cameras.
@@ -336,14 +379,107 @@ void DepthmapEstimator::UploadData() {
   queue.enqueueWriteBuffer(cl_cameras_, CL_TRUE, 0,
                            sizeof(CLCamera) * cams.size(), cams.data());
 
-  // Allocate plane hypotheses, costs, rand states.
-  cl_plane_hypotheses_ = cl::Buffer(ctx, CL_MEM_READ_WRITE,
-                                    sizeof(cl_float4) * npix, nullptr, &err);
-  opencl::CheckCL(err, "plane_hypotheses buffer");
+  // Compute per-source-view angle weights.
+  // Weight = sin(triangulation_angle) so that wide-baseline views dominate.
+  // Camera center = -R^T * t.
+  {
+    Vec3d c0 = -Rs_[0].transpose() * ts_[0];
+    std::vector<float> aw(kMaxSources, 0.0f);
+    for (int i = 0; i < std::min(num - 1, kMaxSources); i++) {
+      Vec3d ci = -Rs_[i + 1].transpose() * ts_[i + 1];
+      Vec3d baseline = ci - c0;
+      double blen = baseline.norm();
+      if (blen < 1e-12) {
+        aw[i] = 0.01f;  // degenerate: near-zero baseline
+      } else {
+        // Optical axis of ref camera is 3rd row of R (z-axis in cam frame).
+        Vec3d z0 = Rs_[0].row(2).transpose();
+        // Angle between baseline direction and ref optical axis.
+        double cos_angle = std::abs(z0.dot(baseline / blen));
+        // sin(angle) emphasises views with perpendicular baselines.
+        double sin_angle = std::sqrt(1.0 - cos_angle * cos_angle);
+        aw[i] = static_cast<float>(std::max(sin_angle, 0.01));
+      }
+    }
+    cl_angle_weights_ = cl::Buffer(ctx, CL_MEM_READ_ONLY,
+                                   sizeof(float) * kMaxSources, nullptr, &err);
+    opencl::CheckCL(err, "angle_weights buffer");
+    queue.enqueueWriteBuffer(cl_angle_weights_, CL_TRUE, 0,
+                             sizeof(float) * kMaxSources, aw.data());
+  }
 
-  cl_costs_ =
-      cl::Buffer(ctx, CL_MEM_READ_WRITE, sizeof(float) * npix, nullptr, &err);
-  opencl::CheckCL(err, "costs buffer");
+  // Allocate segment labels buffer (full-res ints).
+  // Filled with -1 (no gating) by default; RunSLIC() writes real labels.
+  {
+    std::vector<int> neg_ones(npix, -1);
+    cl_segment_labels_ =
+        cl::Buffer(ctx, CL_MEM_READ_ONLY, sizeof(int) * npix, nullptr, &err);
+    opencl::CheckCL(err, "segment_labels buffer");
+    queue.enqueueWriteBuffer(cl_segment_labels_, CL_TRUE, 0, sizeof(int) * npix,
+                             neg_ones.data());
+  }
+
+  // Allocate plane hypotheses, costs, rand states.
+  // Detect cl_khr_image2d_from_buffer for zero-copy buffer↔image aliasing.
+  // {
+  //   std::string extensions = dev.device().getInfo<CL_DEVICE_EXTENSIONS>();
+  //   use_image_from_buffer_ =
+  //       (extensions.find("cl_khr_image2d_from_buffer") != std::string::npos);
+  // }
+
+  if (use_image_from_buffer_) {
+    // Query row pitch alignment (in pixels).  Buffer rows must be aligned.
+    cl_uint pitch_align = 1;
+    dev.device().getInfo(CL_DEVICE_IMAGE_PITCH_ALIGNMENT, &pitch_align);
+    if (pitch_align < 1) {
+      pitch_align = 1;
+    }
+
+    size_t aligned_w_planes =
+        ((w + pitch_align - 1) / pitch_align) * pitch_align;
+    size_t aligned_w_costs =
+        ((w + pitch_align - 1) / pitch_align) * pitch_align;
+    size_t planes_pitch = aligned_w_planes * sizeof(cl_float4);
+    size_t costs_pitch = aligned_w_costs * sizeof(cl_float);
+
+    // Allocate buffers with pitch-aligned rows.
+    cl_plane_hypotheses_ =
+        cl::Buffer(ctx, CL_MEM_READ_WRITE, planes_pitch * h, nullptr, &err);
+    opencl::CheckCL(err, "plane_hypotheses buffer (aliased)");
+
+    cl_costs_ =
+        cl::Buffer(ctx, CL_MEM_READ_WRITE, costs_pitch * h, nullptr, &err);
+    opencl::CheckCL(err, "costs buffer (aliased)");
+
+    // Create Image2D objects aliasing the buffer memory (zero-copy).
+    cl::ImageFormat fmt_rgba(CL_RGBA, CL_FLOAT);
+    cl_planes_img_ = cl::Image2D(ctx, fmt_rgba, cl_plane_hypotheses_, w, h,
+                                 planes_pitch, &err);
+    opencl::CheckCL(err, "planes_img from buffer");
+
+    cl::ImageFormat fmt_r(CL_R, CL_FLOAT);
+    cl_costs_img_ = cl::Image2D(ctx, fmt_r, cl_costs_, w, h, costs_pitch, &err);
+    opencl::CheckCL(err, "costs_img from buffer");
+  } else {
+    // Fallback: separate buffer + image, synced via enqueueCopyBufferToImage.
+    cl_plane_hypotheses_ = cl::Buffer(ctx, CL_MEM_READ_WRITE,
+                                      sizeof(cl_float4) * npix, nullptr, &err);
+    opencl::CheckCL(err, "plane_hypotheses buffer");
+
+    cl_costs_ =
+        cl::Buffer(ctx, CL_MEM_READ_WRITE, sizeof(float) * npix, nullptr, &err);
+    opencl::CheckCL(err, "costs buffer");
+
+    cl::ImageFormat fmt_rgba(CL_RGBA, CL_FLOAT);
+    cl_planes_img_ =
+        cl::Image2D(ctx, CL_MEM_READ_WRITE, fmt_rgba, w, h, 0, nullptr, &err);
+    opencl::CheckCL(err, "planes_img");
+
+    cl::ImageFormat fmt_r(CL_R, CL_FLOAT);
+    cl_costs_img_ =
+        cl::Image2D(ctx, CL_MEM_READ_WRITE, fmt_r, w, h, 0, nullptr, &err);
+    opencl::CheckCL(err, "costs_img");
+  }
 
   cl_rand_states_ = cl::Buffer(ctx, CL_MEM_READ_WRITE, sizeof(cl_uint2) * npix,
                                nullptr, &err);
@@ -400,10 +536,8 @@ void DepthmapEstimator::RandomInit(int width, int height) {
   k_random_init_.setArg(arg++, cl_rand_states_);
   k_random_init_.setArg(arg++, cl_selected_views_);
   k_random_init_.setArg(arg++, cl_cameras_);
-  k_random_init_.setArg(arg++, cl_images_[0]);  // ref
-  for (int i = 0; i < kMaxSources; i++) {
-    k_random_init_.setArg(arg++, cl_images_[1 + i]);  // src i
-  }
+  k_random_init_.setArg(arg++, cl_ref_img_);
+  k_random_init_.setArg(arg++, cl_src_images_array_);
   k_random_init_.setArg(arg++, width);
   k_random_init_.setArg(arg++, height);
   k_random_init_.setArg(arg++, params_.depth_min);
@@ -414,12 +548,37 @@ void DepthmapEstimator::RandomInit(int width, int height) {
   k_random_init_.setArg(arg++, params_.sigma_color);
   k_random_init_.setArg(arg++, params_.top_k);
   k_random_init_.setArg(arg++, params_.use_census ? 1.0f : 0.0f);
+  k_random_init_.setArg(arg++, params_.center_color_weight);
 
   cl::NDRange global(static_cast<size_t>((width + 15) / 16 * 16),
                      static_cast<size_t>((height + 15) / 16 * 16));
   cl::NDRange local(16, 16);
   queue.enqueueNDRangeKernel(k_random_init_, cl::NullRange, global, local);
-  queue.finish();
+  // queue.finish();
+
+  SyncBuffersToImages(width, height);
+}
+
+// =====================================================================
+// Copy plane/cost buffers to their image2d_t counterparts for texture
+// cache reads.  When cl_khr_image2d_from_buffer is active, the images
+// alias the buffers directly — no copy needed, in-order queue ordering
+// guarantees visibility between kernels.
+// =====================================================================
+void DepthmapEstimator::SyncBuffersToImages(int width, int height) {
+  if (use_image_from_buffer_) {
+    return;  // zero-copy: images alias buffers
+  }
+
+  auto& queue = opencl::CLContext::Instance().Device(device_idx_).queue();
+  cl::array<cl::size_type, 3> origin = {{0, 0, 0}};
+  cl::array<cl::size_type, 3> region = {{static_cast<cl::size_type>(width),
+                                         static_cast<cl::size_type>(height),
+                                         1}};
+
+  queue.enqueueCopyBufferToImage(cl_plane_hypotheses_, cl_planes_img_, 0,
+                                 origin, region);
+  queue.enqueueCopyBufferToImage(cl_costs_, cl_costs_img_, 0, origin, region);
 }
 
 // =====================================================================
@@ -430,17 +589,19 @@ void DepthmapEstimator::PriorReinit(int width, int height) {
   auto& dev = opencl::CLContext::Instance().Device(device_idx_);
   auto& queue = dev.queue();
 
+  SyncBuffersToImages(width, height);
+
   int half_patch = params_.patch_size / 2;
   int arg = 0;
   k_prior_reinit_.setArg(arg++, cl_plane_hypotheses_);
   k_prior_reinit_.setArg(arg++, cl_costs_);
+  k_prior_reinit_.setArg(arg++, cl_planes_img_);
+  k_prior_reinit_.setArg(arg++, cl_costs_img_);
   k_prior_reinit_.setArg(arg++, cl_rand_states_);
   k_prior_reinit_.setArg(arg++, cl_selected_views_);
   k_prior_reinit_.setArg(arg++, cl_cameras_);
-  k_prior_reinit_.setArg(arg++, cl_images_[0]);
-  for (int i = 0; i < kMaxSources; i++) {
-    k_prior_reinit_.setArg(arg++, cl_images_[1 + i]);
-  }
+  k_prior_reinit_.setArg(arg++, cl_ref_img_);
+  k_prior_reinit_.setArg(arg++, cl_src_images_array_);
   k_prior_reinit_.setArg(arg++, width);
   k_prior_reinit_.setArg(arg++, height);
   k_prior_reinit_.setArg(arg++, params_.depth_min);
@@ -458,12 +619,13 @@ void DepthmapEstimator::PriorReinit(int width, int height) {
   k_prior_reinit_.setArg(arg++, cl_prev_depths_);
   k_prior_reinit_.setArg(arg++, cl_prev_depth_mask_);
   k_prior_reinit_.setArg(arg++, geom_weight_);
+  k_prior_reinit_.setArg(arg++, params_.center_color_weight);
 
   cl::NDRange global(static_cast<size_t>((width + 15) / 16 * 16),
                      static_cast<size_t>((height + 15) / 16 * 16));
   cl::NDRange local(16, 16);
   queue.enqueueNDRangeKernel(k_prior_reinit_, cl::NullRange, global, local);
-  queue.finish();
+  // queue.finish();
 }
 
 // =====================================================================
@@ -477,13 +639,13 @@ void DepthmapEstimator::RunIteration(int iter, int width, int height) {
     int arg = 0;
     k.setArg(arg++, cl_plane_hypotheses_);
     k.setArg(arg++, cl_costs_);
+    k.setArg(arg++, cl_planes_img_);
+    k.setArg(arg++, cl_costs_img_);
     k.setArg(arg++, cl_rand_states_);
     k.setArg(arg++, cl_selected_views_);
     k.setArg(arg++, cl_cameras_);
-    k.setArg(arg++, cl_images_[0]);
-    for (int i = 0; i < kMaxSources; i++) {
-      k.setArg(arg++, cl_images_[1 + i]);
-    }
+    k.setArg(arg++, cl_ref_img_);
+    k.setArg(arg++, cl_src_images_array_);
     k.setArg(arg++, width);
     k.setArg(arg++, height);
     k.setArg(arg++, params_.depth_min);
@@ -504,21 +666,39 @@ void DepthmapEstimator::RunIteration(int iter, int width, int height) {
     // Planar prior arguments.
     k.setArg(arg++, cl_prior_planes_);
     k.setArg(arg++, cl_plane_masks_);
+    // Edge-stopping propagation gate.
+    k.setArg(arg++, params_.edge_weight);
+    // Depth-discontinuity escape heuristic.
+    k.setArg(arg++, params_.escape_depth_ratio);
+    // Center-pixel color consensus and variance gate.
+    k.setArg(arg++, params_.center_color_weight);
+    k.setArg(arg++, params_.variance_gate);
+    // View-selection anchoring and far-propagation gradient gate.
+    k.setArg(arg++, params_.anchor_views);
+    k.setArg(arg++, params_.far_gradient_threshold);
+    // Per-source-view angle weights (sin of triangulation angle).
+    k.setArg(arg++, cl_angle_weights_);
+    // SLIC segment labels (per-pixel, full-res).
+    k.setArg(arg++, cl_segment_labels_);
   };
 
-  cl::NDRange global(static_cast<size_t>((width + 15) / 16 * 16),
+  // Dense checkerboard: launch half-width grid so all SIMD lanes are active.
+  int half_width = (width + 1) / 2;
+  cl::NDRange global(static_cast<size_t>((half_width + 15) / 16 * 16),
                      static_cast<size_t>((height + 15) / 16 * 16));
   cl::NDRange local(16, 16);
 
   // Red pass (x+y even)
+  SyncBuffersToImages(width, height);
   set_pm_args(k_patchmatch_red_, 0);
   queue.enqueueNDRangeKernel(k_patchmatch_red_, cl::NullRange, global, local);
-  queue.finish();
+  // queue.finish();
 
   // Black pass (x+y odd)
+  SyncBuffersToImages(width, height);
   set_pm_args(k_patchmatch_black_, 1);
   queue.enqueueNDRangeKernel(k_patchmatch_black_, cl::NullRange, global, local);
-  queue.finish();
+  // queue.finish();
 }
 
 // =====================================================================
@@ -531,27 +711,33 @@ void DepthmapEstimator::RunCheckerboardFilter(int width, int height) {
     int arg = 0;
     k.setArg(arg++, cl_plane_hypotheses_);
     k.setArg(arg++, cl_costs_);
+    k.setArg(arg++, cl_planes_img_);
+    k.setArg(arg++, cl_costs_img_);
     k.setArg(arg++, cl_cameras_);
     k.setArg(arg++, width);
     k.setArg(arg++, height);
     k.setArg(arg++, color_flag);
   };
 
-  cl::NDRange global(static_cast<size_t>((width + 15) / 16 * 16),
+  // Dense checkerboard: launch half-width grid so all SIMD lanes are active.
+  int half_width = (width + 1) / 2;
+  cl::NDRange global(static_cast<size_t>((half_width + 15) / 16 * 16),
                      static_cast<size_t>((height + 15) / 16 * 16));
   cl::NDRange local(16, 16);
 
   // Filter red pixels (reading from black neighbours).
+  SyncBuffersToImages(width, height);
   set_filter_args(k_checkerboard_filter_red_, 0);
   queue.enqueueNDRangeKernel(k_checkerboard_filter_red_, cl::NullRange, global,
                              local);
-  queue.finish();
+  // queue.finish();
 
   // Filter black pixels (reading from red neighbours).
+  SyncBuffersToImages(width, height);
   set_filter_args(k_checkerboard_filter_black_, 1);
   queue.enqueueNDRangeKernel(k_checkerboard_filter_black_, cl::NullRange,
                              global, local);
-  queue.finish();
+  // queue.finish();
 }
 
 // =====================================================================
@@ -653,7 +839,7 @@ void DepthmapEstimator::UpsampleDepthNormal(const DepthmapResult& coarse,
                      static_cast<size_t>((dst_h + 15) / 16 * 16));
   cl::NDRange local(16, 16);
   queue.enqueueNDRangeKernel(k_upsample_, cl::NullRange, global, local);
-  queue.finish();
+  // queue.finish();
 }
 
 // =====================================================================
@@ -1243,6 +1429,8 @@ void DepthmapEstimator::ReleaseGpuBuffers() {
     cl_images_[i] = cl::Image2D();
   }
   cl_images_.clear();
+  cl_ref_img_ = cl::Image2D();
+  cl_src_images_array_ = cl::Image2DArray();
   cl_cameras_ = cl::Buffer();
   cl_plane_hypotheses_ = cl::Buffer();
   cl_costs_ = cl::Buffer();
@@ -1252,6 +1440,7 @@ void DepthmapEstimator::ReleaseGpuBuffers() {
   cl_plane_masks_ = cl::Buffer();
   cl_prev_depths_ = cl::Buffer();
   cl_prev_depth_mask_ = 0u;
+  cl_angle_weights_ = cl::Buffer();
 }
 
 void DepthmapEstimator::ReleaseBuffers() {
@@ -1270,6 +1459,371 @@ void DepthmapEstimator::ReleaseBuffers() {
   prev_level_w_ = 0;
   prev_level_h_ = 0;
   prepared_ = false;
+}
+
+// =====================================================================
+// Run SLIC superpixel segmentation on the reference image and upload
+// per-pixel labels to cl_segment_labels_ for propagation gating.
+// Runs at half-resolution for speed, then upsamples labels to full-res.
+// =====================================================================
+void DepthmapEstimator::RunSLIC(int width, int height) {
+  if (!slic_enabled_) {
+    // Segmentation disabled: labels stay -1 (no gating).
+    return;
+  }
+
+  auto& dev = opencl::CLContext::Instance().Device(device_idx_);
+  auto& ctx = dev.context();
+  auto& queue = dev.queue();
+  cl_int err;
+
+  // Work at half resolution for speed.
+  const int hw = width / 2;
+  const int hh = height / 2;
+  const int grid_step = params_.slic_grid_step;
+  const float compactness = params_.slic_compactness;
+
+  // Downscale reference image to half-res float.
+  cv::Mat half_img;
+  cv::resize(images_[0], half_img, cv::Size(hw, hh), 0, 0, cv::INTER_AREA);
+  cv::Mat half_float;
+  half_img.convertTo(half_float, CV_32F, 1.0 / 255.0);
+
+  // Upload half-res image as Image2D (CL_R, CL_FLOAT).
+  cl::ImageFormat fmt(CL_R, CL_FLOAT);
+  cl::Image2D slic_img(ctx, CL_MEM_READ_ONLY, fmt, hw, hh, 0, nullptr, &err);
+  opencl::CheckCL(err, "SLIC half-res image");
+  cl::array<cl::size_type, 3> origin = {{0, 0, 0}};
+  cl::array<cl::size_type, 3> region = {
+      {static_cast<cl::size_type>(hw), static_cast<cl::size_type>(hh), 1}};
+  queue.enqueueWriteImage(slic_img, CL_TRUE, origin, region, half_float.step[0],
+                          0, half_float.data);
+
+  // Grid dimensions.
+  const int centers_x = (hw + grid_step - 1) / grid_step;
+  const int centers_y = (hh + grid_step - 1) / grid_step;
+  const int num_centers = centers_x * centers_y;
+
+  // SLICCenter struct: float x, y, intensity; int count → 16 bytes.
+  const size_t center_size = 16;
+  cl::Buffer cl_centers(ctx, CL_MEM_READ_WRITE, center_size * num_centers,
+                        nullptr, &err);
+  opencl::CheckCL(err, "SLIC centers buffer");
+
+  // Labels buffer at half-res.
+  const int hpix = hw * hh;
+  cl::Buffer cl_labels(ctx, CL_MEM_READ_WRITE, sizeof(int) * hpix, nullptr,
+                       &err);
+  opencl::CheckCL(err, "SLIC labels buffer");
+
+  // Initialize centers on grid.
+  {
+    int arg = 0;
+    k_slic_init_.setArg(arg++, cl_centers);
+    k_slic_init_.setArg(arg++, slic_img);
+    k_slic_init_.setArg(arg++, hw);
+    k_slic_init_.setArg(arg++, hh);
+    k_slic_init_.setArg(arg++, grid_step);
+    k_slic_init_.setArg(arg++, centers_x);
+    k_slic_init_.setArg(arg++, centers_y);
+
+    cl::NDRange global(static_cast<size_t>((centers_x + 15) / 16 * 16),
+                       static_cast<size_t>((centers_y + 15) / 16 * 16));
+    cl::NDRange local(16, 16);
+    queue.enqueueNDRangeKernel(k_slic_init_, cl::NullRange, global, local);
+  }
+
+  // Iterate: assign + update (5 iterations is standard for SLIC).
+  const int slic_iters = 5;
+  for (int it = 0; it < slic_iters; ++it) {
+    // Assign pixels to nearest center.
+    {
+      int arg = 0;
+      k_slic_assign_.setArg(arg++, cl_centers);
+      k_slic_assign_.setArg(arg++, cl_labels);
+      k_slic_assign_.setArg(arg++, slic_img);
+      k_slic_assign_.setArg(arg++, hw);
+      k_slic_assign_.setArg(arg++, hh);
+      k_slic_assign_.setArg(arg++, grid_step);
+      k_slic_assign_.setArg(arg++, centers_x);
+      k_slic_assign_.setArg(arg++, centers_y);
+      k_slic_assign_.setArg(arg++, compactness);
+
+      cl::NDRange global(static_cast<size_t>((hw + 15) / 16 * 16),
+                         static_cast<size_t>((hh + 15) / 16 * 16));
+      cl::NDRange local(16, 16);
+      queue.enqueueNDRangeKernel(k_slic_assign_, cl::NullRange, global, local);
+    }
+
+    // Update centers.
+    {
+      int arg = 0;
+      k_slic_update_.setArg(arg++, cl_centers);
+      k_slic_update_.setArg(arg++, cl_labels);
+      k_slic_update_.setArg(arg++, slic_img);
+      k_slic_update_.setArg(arg++, hw);
+      k_slic_update_.setArg(arg++, hh);
+      k_slic_update_.setArg(arg++, grid_step);
+      k_slic_update_.setArg(arg++, centers_x);
+      k_slic_update_.setArg(arg++, centers_y);
+
+      cl::NDRange global(static_cast<size_t>((centers_x + 15) / 16 * 16),
+                         static_cast<size_t>((centers_y + 15) / 16 * 16));
+      cl::NDRange local(16, 16);
+      queue.enqueueNDRangeKernel(k_slic_update_, cl::NullRange, global, local);
+    }
+  }
+
+  // Read back half-res labels.
+  queue.finish();
+  std::vector<int> half_labels(hpix);
+  queue.enqueueReadBuffer(cl_labels, CL_TRUE, 0, sizeof(int) * hpix,
+                          half_labels.data());
+
+  // Connectivity enforcement: BFS relabel small disconnected components.
+  // Any fragment with fewer pixels than grid_step*grid_step/4 gets merged
+  // into its largest adjacent segment.
+  {
+    const int min_size = grid_step * grid_step / 4;
+    std::vector<int> component(hpix, -1);
+    std::vector<int> stack;
+    stack.reserve(min_size * 2);
+    int next_comp = 0;
+
+    for (int i = 0; i < hpix; ++i) {
+      if (component[i] >= 0) {
+        continue;
+      }
+      // BFS flood fill for this connected component.
+      int label = half_labels[i];
+      stack.clear();
+      stack.push_back(i);
+      component[i] = next_comp;
+      int head = 0;
+      while (head < static_cast<int>(stack.size())) {
+        int p = stack[head++];
+        int px = p % hw;
+        int py = p / hw;
+        const int dx[] = {-1, 1, 0, 0};
+        const int dy[] = {0, 0, -1, 1};
+        for (int d = 0; d < 4; ++d) {
+          int nx = px + dx[d];
+          int ny = py + dy[d];
+          if (nx < 0 || nx >= hw || ny < 0 || ny >= hh) {
+            continue;
+          }
+          int ni = ny * hw + nx;
+          if (component[ni] >= 0) {
+            continue;
+          }
+          if (half_labels[ni] != label) {
+            continue;
+          }
+          component[ni] = next_comp;
+          stack.push_back(ni);
+        }
+      }
+      int comp_size = static_cast<int>(stack.size()) - 0;  // all pushed
+      // If too small, relabel the entire component to the majority neighbor.
+      if (comp_size < min_size) {
+        // Find most frequent adjacent label.
+        std::unordered_map<int, int> adj_count;
+        for (int si = 0; si < static_cast<int>(stack.size()); ++si) {
+          int p = stack[si];
+          int px_c = p % hw;
+          int py_c = p / hw;
+          const int dx2[] = {-1, 1, 0, 0};
+          const int dy2[] = {0, 0, -1, 1};
+          for (int d = 0; d < 4; ++d) {
+            int nx = px_c + dx2[d];
+            int ny = py_c + dy2[d];
+            if (nx < 0 || nx >= hw || ny < 0 || ny >= hh) {
+              continue;
+            }
+            int ni = ny * hw + nx;
+            if (half_labels[ni] != label) {
+              adj_count[half_labels[ni]]++;
+            }
+          }
+        }
+        int best_adj = label;
+        int best_cnt = 0;
+        for (auto& kv : adj_count) {
+          if (kv.second > best_cnt) {
+            best_cnt = kv.second;
+            best_adj = kv.first;
+          }
+        }
+        // Relabel.
+        for (int si = 0; si < static_cast<int>(stack.size()); ++si) {
+          half_labels[stack[si]] = best_adj;
+        }
+      }
+      next_comp++;
+    }
+  }
+
+  // Bottom-up RAG merge: greedily merge adjacent segments whose mean
+  // intensities differ by less than a threshold.  This collapses the
+  // over-segmented SLIC grid into perceptually coherent regions.
+  // {
+  //   const float* img_data = reinterpret_cast<const float*>(half_float.data);
+
+  //   // 1. Compact-relabel so labels are 0..N-1.
+  //   std::unordered_map<int, int> label_remap;
+  //   int n_seg = 0;
+  //   for (int i = 0; i < hpix; ++i) {
+  //     int lbl = half_labels[i];
+  //     if (label_remap.find(lbl) == label_remap.end()) {
+  //       label_remap[lbl] = n_seg++;
+  //     }
+  //     half_labels[i] = label_remap[lbl];
+  //   }
+
+  //   // 2. Compute per-segment mean intensity and pixel count.
+  //   std::vector<double> seg_sum(n_seg, 0.0);
+  //   std::vector<int> seg_count(n_seg, 0);
+  //   for (int i = 0; i < hpix; ++i) {
+  //     int s = half_labels[i];
+  //     seg_sum[s] += img_data[i];
+  //     seg_count[s]++;
+  //   }
+  //   std::vector<float> seg_mean(n_seg);
+  //   for (int s = 0; s < n_seg; ++s) {
+  //     seg_mean[s] = seg_count[s] > 0
+  //                       ? static_cast<float>(seg_sum[s] / seg_count[s])
+  //                       : 0.0f;
+  //   }
+
+  //   // 3. Build adjacency set (undirected edges between neighboring
+  //   segments).
+  //   // Use a union-find to track merges efficiently.
+  //   std::vector<int> parent(n_seg);
+  //   std::iota(parent.begin(), parent.end(), 0);
+  //   auto find = [&](int x) {
+  //     while (parent[x] != x) {
+  //       parent[x] = parent[parent[x]];
+  //       x = parent[x];
+  //     }
+  //     return x;
+  //   };
+
+  //   // Collect unique adjacent pairs.
+  //   std::set<std::pair<int, int>> adj_set;
+  //   for (int y = 0; y < hh; ++y) {
+  //     for (int x = 0; x < hw; ++x) {
+  //       int idx = y * hw + x;
+  //       int s = half_labels[idx];
+  //       if (x + 1 < hw) {
+  //         int s2 = half_labels[idx + 1];
+  //         if (s != s2) {
+  //           int a = std::min(s, s2), b = std::max(s, s2);
+  //           adj_set.insert({a, b});
+  //         }
+  //       }
+  //       if (y + 1 < hh) {
+  //         int s2 = half_labels[idx + hw];
+  //         if (s != s2) {
+  //           int a = std::min(s, s2), b = std::max(s, s2);
+  //           adj_set.insert({a, b});
+  //         }
+  //       }
+  //     }
+  //   }
+
+  //   // 4. Sort edges by color distance (ascending) and merge greedily.
+  //   // Merge threshold: segments with mean intensity difference < this
+  //   // are considered the same surface.  0.08 ≈ 20/255 intensity step.
+  //   const float merge_threshold = 0.08f;
+
+  //   struct Edge {
+  //     float dist;
+  //     int a, b;
+  //   };
+  //   std::vector<Edge> edges;
+  //   edges.reserve(adj_set.size());
+  //   for (auto& [a, b] : adj_set) {
+  //     float d = std::abs(seg_mean[a] - seg_mean[b]);
+  //     edges.push_back({d, a, b});
+  //   }
+  //   std::sort(edges.begin(), edges.end(),
+  //             [](const Edge& x, const Edge& y) { return x.dist < y.dist; });
+
+  //   // Greedy merge: merge the closest pair, update the merged segment's
+  //   // mean as a weighted average, then continue.
+  //   for (auto& e : edges) {
+  //     if (e.dist > merge_threshold) break;
+  //     int ra = find(e.a);
+  //     int rb = find(e.b);
+  //     if (ra == rb) continue;
+  //     // Check current merged means (they may have shifted from merges).
+  //     float mean_a = seg_mean[ra];
+  //     float mean_b = seg_mean[rb];
+  //     if (std::abs(mean_a - mean_b) > merge_threshold) continue;
+  //     // Merge rb into ra.
+  //     int ca = seg_count[ra], cb = seg_count[rb];
+  //     seg_mean[ra] = (mean_a * ca + mean_b * cb) / (ca + cb);
+  //     seg_count[ra] = ca + cb;
+  //     parent[rb] = ra;
+  //   }
+
+  //   // 5. Apply final relabeling.
+  //   for (int i = 0; i < hpix; ++i) {
+  //     half_labels[i] = find(half_labels[i]);
+  //   }
+
+  //   // Log merge stats.
+  //   std::set<int> unique_labels(half_labels.begin(), half_labels.end());
+  //   std::cerr << "[SLIC] After RAG merge: " << unique_labels.size()
+  //             << " segments (from " << n_seg << ")\n";
+  // }
+
+  // Upsample labels to full-res (nearest neighbor).
+  const int npix = width * height;
+  std::vector<int> full_labels(npix);
+  const float sx = static_cast<float>(hw) / width;
+  const float sy = static_cast<float>(hh) / height;
+  for (int y = 0; y < height; ++y) {
+    int hy = std::min(static_cast<int>(y * sy), hh - 1);
+    for (int x = 0; x < width; ++x) {
+      int hx = std::min(static_cast<int>(x * sx), hw - 1);
+      full_labels[y * width + x] = half_labels[hy * hw + hx];
+    }
+  }
+
+  // Upload to GPU.
+  queue.enqueueWriteBuffer(cl_segment_labels_, CL_TRUE, 0, sizeof(int) * npix,
+                           full_labels.data());
+
+  // Debug: save random-colored segmentation image.
+  if (!params_.debug_dir.empty()) {
+    // Assign a random but deterministic color to each segment label.
+    std::unordered_map<int, cv::Vec3b> color_map;
+    std::mt19937 color_rng(42);
+    cv::Mat debug_img(height, width, CV_8UC3);
+    for (int y = 0; y < height; ++y) {
+      for (int x = 0; x < width; ++x) {
+        int lbl = full_labels[y * width + x];
+        auto it = color_map.find(lbl);
+        if (it == color_map.end()) {
+          uint8_t r = static_cast<uint8_t>(color_rng() % 200 + 55);
+          uint8_t g = static_cast<uint8_t>(color_rng() % 200 + 55);
+          uint8_t b = static_cast<uint8_t>(color_rng() % 200 + 55);
+          color_map[lbl] = cv::Vec3b(b, g, r);
+          it = color_map.find(lbl);
+        }
+        debug_img.at<cv::Vec3b>(y, x) = it->second;
+      }
+    }
+    std::string fname = params_.debug_dir + "/slic_labels";
+    if (!params_.debug_shot_id.empty()) {
+      fname += "_" + params_.debug_shot_id;
+    }
+    fname += ".png";
+    cv::imwrite(fname, debug_img);
+    std::cerr << "[SLIC] Saved debug segmentation to " << fname << " ("
+              << color_map.size() << " segments)\n";
+  }
 }
 
 }  // namespace dense

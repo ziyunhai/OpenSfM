@@ -27,6 +27,17 @@ struct DepthmapParams {
   float depth_max = 1.0f;
   int hierarchy_levels = 1;
   float smooth_weight = 0.0f;
+  float edge_weight = 0.0f;
+  float escape_depth_ratio = 0.0f;   // >1 to enable (e.g. 1.5)
+  float center_color_weight = 0.0f;  // penalty for center-pixel color mismatch
+  float variance_gate = 0.0f;        // block propagation below this variance
+  int anchor_views = 0;              // fixed view anchors from prev iteration
+  float far_gradient_threshold = 0.0f;  // block far propagation across edges
+  bool segmentation_enabled = false;    // SLIC segmentation-gated propagation
+  int slic_grid_step = 25;              // grid step at half-res (pixels)
+  float slic_compactness = 20.0f;       // spatial vs color balance
+  std::string debug_dir;                // if non-empty, save debug images here
+  std::string debug_shot_id;            // shot ID for debug filenames
   bool checkerboard_filter = false;
   int speckle_min_size = 100;  // Remove connected components smaller than this
   int gap_max_size = 7;        // Interpolate gaps up to this many pixels
@@ -70,6 +81,7 @@ class DepthmapEstimator {
   void PriorReinit(int width, int height);
   void RunIteration(int iter, int width, int height);
   void RunCheckerboardFilter(int width, int height);
+  void SyncBuffersToImages(int width, int height);
   void BuildImagePyramid(float scale, std::vector<cv::Mat>& scaled_images,
                          std::vector<Mat3d>& scaled_Ks) const;
   void UpsampleDepthNormal(const DepthmapResult& coarse, int src_w, int src_h,
@@ -78,6 +90,7 @@ class DepthmapEstimator {
   void UploadPreviousDepths(int width, int height);
   void ReadBackResults(DepthmapResult* result, int width, int height,
                        bool apply_median = true);
+  void RunSLIC(int width, int height);
   static void RemoveSmallSegments(ImageF& depth, PixelData3f& normal, int width,
                                   int height, int min_segment_size,
                                   float depth_diff_threshold);
@@ -118,16 +131,34 @@ class DepthmapEstimator {
   cl::Kernel k_checkerboard_filter_red_;
   cl::Kernel k_checkerboard_filter_black_;
 
-  std::vector<cl::Image2D> cl_images_;
+  std::vector<cl::Image2D> cl_images_;  // [0]=ref, kept for clean kernel compat
+  cl::Image2D cl_ref_img_;              // Reference image (separate)
+  cl::Image2DArray cl_src_images_array_;  // Source images as 2D array texture
   cl::Buffer cl_cameras_;
   cl::Buffer cl_plane_hypotheses_;
   cl::Buffer cl_costs_;
+  cl::Image2D cl_planes_img_;  // Texture-cached view of plane hypotheses
+  cl::Image2D cl_costs_img_;   // Texture-cached view of costs
   cl::Buffer cl_rand_states_;
   cl::Buffer cl_selected_views_;
   cl::Buffer cl_prior_planes_;
   cl::Buffer cl_plane_masks_;
   cl::Buffer cl_prev_depths_;
   cl_uint cl_prev_depth_mask_ = 0u;
+  cl::Buffer cl_angle_weights_;   // per-source-view angle weight (kMaxSources)
+  cl::Buffer cl_segment_labels_;  // per-pixel SLIC segment label (full-res)
+
+  // SLIC segmentation kernels
+  cl::Program slic_program_;
+  cl::Kernel k_slic_init_;
+  cl::Kernel k_slic_assign_;
+  cl::Kernel k_slic_update_;
+  bool slic_enabled_ = false;
+
+  // Image-from-buffer zero-copy aliasing (cl_khr_image2d_from_buffer).
+  // When supported, planes_img_ and costs_img_ alias the buffer memory
+  // directly — SyncBuffersToImages becomes a no-op.
+  bool use_image_from_buffer_ = false;
 
   // Host-side prior data for confidence computation.
   ImageF prior_depths_;    // (H, W) — prior depth per pixel

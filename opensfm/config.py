@@ -402,7 +402,7 @@ class OpenSfMConfig:
     # Number of neighboring views considered as candidates
     depthmap_num_neighbors: int = 10
     # Number of neighboring views used for each depthmap
-    depthmap_num_matching_views: int = 6
+    depthmap_num_matching_views: int = 8
     # Minimum depth in meters.  Set to 0 to auto-infer from the reconstruction.
     depthmap_min_depth: float = 0
     # Maximum depth in meters.  Set to 0 to auto-infer from the reconstruction.
@@ -410,7 +410,7 @@ class OpenSfMConfig:
     # Maximum number of PatchMatch iterations
     depthmap_max_iterations: int = 4
     # Correlation patch window size (must be odd)
-    depthmap_patch_size: int = 9
+    depthmap_patch_size: int = 5
     # Maximum image dimension for processing (longer side)
     depthmap_max_image_size: int = 3200
     # Maximum PatchMatch cost to keep a pixel (0 = disabled)
@@ -419,6 +419,14 @@ class OpenSfMConfig:
     depthmap_same_depth_threshold: float = 0.01
     # Min number of consistent views in clean stage
     depthmap_min_consistent_views: int = 3
+    # Relative depth margin for space-carving votes; neighbor sees further by this fraction → carve vote.
+    depthmap_carving_threshold: float = 0.05
+    # Max carve votes a pixel can accumulate before being discarded.
+    depthmap_max_carved_views: int = 2
+    # Cosine threshold for grazing-angle detection (below → pixel is grazing, stricter filtering).
+    depthmap_grazing_cos_threshold: float = 0.2
+    # Depth ratio threshold for 3×3 edge detection (e.g. 1.10 → 10% discontinuity = edge pixel).
+    depthmap_edge_depth_ratio: float = 100.0
     # Save per-shot raw/clean PLYs and per-cluster debug PLYs (slow, for debugging only).
     depthmap_save_debug_ply: bool = True
     # Spatial sigma for bilateral NCC weighting
@@ -436,8 +444,44 @@ class OpenSfMConfig:
     # Maximum gap size in pixels for linear depth interpolation (0 = disabled)
     depthmap_gap_max_size: int = 0
     # Depth/normal smoothness weight for PatchMatch
-    depthmap_smooth_weight: float = 0.1
-    # Weight for geometric consistency cost (0 = disabled). Applied per source view.
+    depthmap_smooth_weight: float = 0
+    # Edge-stopping propagation gate weight (Perona-Malik). Penalizes adopting
+    # a neighbor hypothesis across a strong image gradient.  0 = disabled.
+    depthmap_propagation_edge_weight: float = 0
+    # Depth-discontinuity escape ratio for PatchMatch refinement.
+    # If a neighbor's depth exceeds current_depth × this ratio, an escape
+    # hypothesis is tried using the deeper neighbor's plane.  0 or ≤1 = disabled.
+    depthmap_escape_depth_ratio: float = 0
+    # Center-pixel color consensus weight.  Penalizes hypotheses where the
+    # projected center pixel in source views has different intensity than the
+    # reference.  Catches wrong-surface assignments.  0 = disabled.
+    depthmap_center_color_weight: float = 0
+    # Variance gate for propagation.  If the 3×3 local intensity variance
+    # (std-dev) is below this threshold, neighbor propagation is blocked
+    # (random refinement still works).  Prevents foreground leaking into
+    # textureless background.  0 = disabled.
+    depthmap_variance_gate: float = 0
+    # Number of views from previous iteration that are forcibly kept in the
+    # view selection (anchoring).  Prevents CDF from narrowing to only views
+    # that validate a potentially wrong hypothesis.  0 = disabled.
+    depthmap_anchor_views: int = 2
+    # Far-propagation gradient gate threshold.  If the max intensity step
+    # between current pixel and a far candidate (sampled at 4 points along
+    # the line) exceeds this, the far candidate is discarded.  Prevents
+    # propagation across object boundaries.  0 = disabled.
+    # Intensity is in [0, 1] so 0.1 = 10% step.
+    depthmap_far_gradient_threshold: float = 0
+    # SLIC segmentation-gated propagation: block PatchMatch propagation
+    # across superpixel boundaries to prevent foreground-background smear.
+    depthmap_segmentation_enabled: bool = False
+    # Grid step for SLIC superpixels (at half resolution). Larger = bigger segments.
+    depthmap_slic_grid_step: int = 15
+    # SLIC compactness: balances spatial vs color proximity.
+    # Higher values produce more regular (square-like) segments.
+    depthmap_slic_compactness: float = 60.0    # Mahalanobis distance threshold for per-segment outlier rejection
+    # during cleaning.  Points exceeding this in the segment's robust
+    # covariance are zeroed.  Lower = more aggressive filtering.
+    depthmap_slic_mahal_threshold: float = 3.0    # Weight for geometric consistency cost (0 = disabled). Applied per source view.
     depthmap_geom_consistency_weight: float = 0
     # Maximum number of reference views per cluster for geometric consistency.
     depthmap_cluster_max_size: int = 8
@@ -449,9 +493,9 @@ class OpenSfMConfig:
     # Maximum baseline angle (degrees) for neighbor selection.
     depthmap_neighbor_max_angle: float = 60.0
     # SVO voxel size in world units (meters). Smaller = finer but more memory.
-    depthmap_fusion_svo_voxel_size: float = 0.1
+    depthmap_fusion_svo_voxel_size: float = 0.02
     # SVO truncation factor: truncation_distance = factor * voxel_size.
-    depthmap_fusion_svo_trunc_factor: float = 12
+    depthmap_fusion_svo_trunc_factor: float = 8
     # SVO minimum weight for extracting points
     depthmap_fusion_svo_min_weight: float = 3
     # Maximum unique voxels per SVO sub-volume.
@@ -461,7 +505,7 @@ class OpenSfMConfig:
     depthmap_fusion_svo_max_voxels: int = 80_000_000
     # Number of extra neighbor shots per cluster shot for fusion augmentation.
     # Adds views from outside the cluster to improve boundary quality.
-    depthmap_fusion_svo_augment_neighbors: int = 2
+    depthmap_fusion_svo_augment_neighbors: int = 4
     # Coarse grid cell size multiplier for pre-scan (cell = factor * voxel_size).
     depthmap_fusion_svo_coarse_factor: int = 8
     # Relative margin added to each side of the per-cluster bounding box
@@ -475,6 +519,17 @@ class OpenSfMConfig:
     depthmap_fusion_svo_refine_joint_iters: int = 30
     # Initial Laplacian regularization weight (decayed ×0.95/iter).
     depthmap_fusion_svo_refine_lambda_reg: float = 0.01
+    # Visibility-based pruning of TSDF voxels (removes foreground smear).
+    # Enable raycast-vote-prune passes after SVO fusion.
+    depthmap_fusion_svo_prune_enabled: bool = False
+    # Number of raycast-vote-prune iterations (typically 1-2).
+    depthmap_fusion_svo_prune_iterations: int = 3
+    # Relative depth margin for carve votes (e.g. 0.05 = 5% further = carve).
+    depthmap_fusion_svo_prune_carve_margin: float = 0.05
+    # Min carve votes to trigger pruning of a voxel.
+    depthmap_fusion_svo_prune_carve_threshold: int = 1
+    # Min support votes to protect a voxel from pruning.
+    depthmap_fusion_svo_prune_support_min: int = 2
 
     ##################################
     # Params for octree point cloud tiling (viewer streaming)

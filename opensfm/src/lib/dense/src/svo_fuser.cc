@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 
 namespace dense {
@@ -142,7 +143,8 @@ void SVOFuser::Fuse() {
                          std::numeric_limits<uint32_t>::max()));
   capacity = std::max<uint32_t>(capacity, 1u << 20);
   std::cerr << "[SVOFuser] Voxel count " << last_voxel_count_ << " → capacity "
-            << capacity << "\n";
+            << capacity << "(" << float(capacity) / last_voxel_count_ * 100
+            << "%)\n";
 
   integrator_ = std::make_unique<SVOIntegratorCL>(device_idx_);
   integrator_->Initialize(capacity);
@@ -165,6 +167,14 @@ void SVOFuser::Fuse() {
     integrator_->Integrate(Kf, Rf, tf, sv.depth.data(), rows, cols, normal_ptr,
                            color_ptr, mask_ptr, weight_ptr, voxel_size_,
                            trunc_dist, bbox_min_ptr, bbox_max_ptr);
+  }
+
+  // Check for overflow (dropped contributions due to hash table exhaustion).
+  const uint32_t overflow = integrator_->GetOverflowCount();
+  if (overflow > 0) {
+    std::cerr << "[SVOFuser] WARNING: integration dropped " << overflow
+              << " contributions (hash table overflow, capacity="
+              << integrator_->capacity() << ")\n";
   }
 
   std::cerr << "[SVOFuser] Fuse complete, hash table alive on GPU\n";
@@ -261,6 +271,68 @@ void SVOFuser::Refine(int color_iters, int joint_iters, float lambda_reg) {
 
   std::cerr << "[SVOFuser] Refine complete (" << color_iters << " color + "
             << joint_iters << " joint iterations)\n";
+}
+
+void SVOFuser::PruneByVisibility(int iterations, float carve_margin,
+                                 int carve_threshold, int support_min) {
+  if (!integrator_) {
+    throw std::runtime_error(
+        "SVOFuser::PruneByVisibility: Fuse() must be called first");
+  }
+  if (views_.empty()) {
+    return;
+  }
+
+  integrator_->InitializeVisibilityPruning();
+
+  const float trunc_dist = voxel_size_ * trunc_factor_;
+  // Weight penalty per excess carve vote: kill a voxel that was integrated
+  // with min_weight_ if it gets carve_threshold + 1 excess votes.
+  const float weight_penalty = min_weight_ / 2.0f;
+
+  for (int iter = 0; iter < iterations; ++iter) {
+    if (iter > 0) {
+      integrator_->ClearVotes();
+    }
+
+    for (auto& view : views_) {
+      const int rows = static_cast<int>(view.depth.rows());
+      const int cols = static_cast<int>(view.depth.cols());
+      if (rows == 0 || cols == 0) {
+        continue;
+      }
+
+      // Compute depth range for this view.
+      float min_depth = std::numeric_limits<float>::max();
+      float max_depth = 0.0f;
+      const float* dptr = view.depth.data();
+      for (int i = 0; i < rows * cols; ++i) {
+        if (dptr[i] > 0.0f) {
+          min_depth = std::min(min_depth, dptr[i]);
+          max_depth = std::max(max_depth, dptr[i]);
+        }
+      }
+      if (max_depth <= 0.0f) {
+        continue;
+      }
+      // Extend range by truncation band.
+      min_depth = std::max(0.01f, min_depth - trunc_dist);
+      max_depth += trunc_dist;
+
+      // Convert camera from double to float.
+      Mat3f Kf = view.K.cast<float>();
+      Mat3f Rf = view.R.cast<float>();
+      Vec3f tf = view.t.cast<float>();
+
+      integrator_->RaycastAndVote(Kf, Rf, tf, view.depth.data(), rows, cols,
+                                  voxel_size_, min_depth, max_depth,
+                                  min_weight_, carve_margin);
+    }
+
+    integrator_->Prune(carve_threshold, support_min, weight_penalty);
+    std::cerr << "[SVOFuser] Visibility prune iteration " << (iter + 1) << "/"
+              << iterations << " complete\n";
+  }
 }
 
 void SVOFuser::ExtractPoints(std::vector<Vec3f>* fused_points,

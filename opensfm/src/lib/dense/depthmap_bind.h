@@ -27,6 +27,17 @@ class DepthmapClusterEstimatorWrapper {
   void SetTopK(int k) { params_.top_k = k; }
   void SetUseCensus(bool v) { params_.use_census = v; }
   void SetSmoothWeight(float w) { params_.smooth_weight = w; }
+  void SetEdgeWeight(float w) { params_.edge_weight = w; }
+  void SetEscapeDepthRatio(float r) { params_.escape_depth_ratio = r; }
+  void SetCenterColorWeight(float w) { params_.center_color_weight = w; }
+  void SetVarianceGate(float v) { params_.variance_gate = v; }
+  void SetAnchorViews(int n) { params_.anchor_views = n; }
+  void SetFarGradientThreshold(float t) { params_.far_gradient_threshold = t; }
+  void SetSegmentationEnabled(bool v) { params_.segmentation_enabled = v; }
+  void SetSLICGridStep(int v) { params_.slic_grid_step = v; }
+  void SetSLICCompactness(float v) { params_.slic_compactness = v; }
+  void SetDebugDir(const std::string& dir) { params_.debug_dir = dir; }
+  void SetDebugShotId(const std::string& id) { params_.debug_shot_id = id; }
   void SetCheckerboardFilter(bool v) { params_.checkerboard_filter = v; }
   void SetSpeckleMinSize(int v) { params_.speckle_min_size = v; }
   void SetGapMaxSize(int v) { params_.gap_max_size = v; }
@@ -121,10 +132,20 @@ class DepthmapCleanerWrapper {
   void SetSameDepthThreshold(float t) { cleaner_.SetSameDepthThreshold(t); }
   void SetMinConsistentViews(int n) { cleaner_.SetMinConsistentViews(n); }
   void SetDevice(int idx) { cleaner_.SetDevice(idx); }
+  void SetCarvingThreshold(float t) { cleaner_.SetCarvingThreshold(t); }
+  void SetMaxCarvedViews(int n) { cleaner_.SetMaxCarvedViews(n); }
+  void SetGrazingCosThreshold(float t) { cleaner_.SetGrazingCosThreshold(t); }
+  void SetEdgeDepthRatio(float r) { cleaner_.SetEdgeDepthRatio(r); }
 
   void AddView(const Mat3d& K, const Mat3d& R, const Vec3d& t,
                Eigen::Ref<const ImageF> depth) {
     cleaner_.AddView(K, R, t, depth);
+  }
+
+  void AddViewWithNormal(const Mat3d& K, const Mat3d& R, const Vec3d& t,
+                         Eigen::Ref<const ImageF> depth,
+                         Eigen::Ref<const PixelData3f> normal) {
+    cleaner_.AddView(K, R, t, depth, normal);
   }
 
   void Clear() { cleaner_.Clear(); }
@@ -140,6 +161,36 @@ class DepthmapCleanerWrapper {
     }
     return foundation::py_array_from_data(cleaned.ptr<float>(0), cleaned.rows,
                                           cleaned.cols);
+  }
+
+  foundation::pyarray_int ComputeSLIC(Eigen::Ref<const ImageU8> gray,
+                                      int grid_step, float compactness) {
+    cv::Mat gray_cv(static_cast<int>(gray.rows()),
+                    static_cast<int>(gray.cols()), CV_8U,
+                    const_cast<uint8_t*>(gray.data()));
+    cv::Mat labels;
+    {
+      py::gil_scoped_release release;
+      labels = cleaner_.ComputeSLIC(gray_cv, grid_step, compactness);
+    }
+    return foundation::py_array_from_data(labels.ptr<int>(0), labels.rows,
+                                          labels.cols);
+  }
+
+  foundation::pyarray_f FilterMahalanobis(Eigen::Ref<const ImageF> depth,
+                                          const Mat3d& K, float mahal_threshold,
+                                          int window_radius) {
+    cv::Mat depth_cv(static_cast<int>(depth.rows()),
+                     static_cast<int>(depth.cols()), CV_32F,
+                     const_cast<float*>(depth.data()));
+    cv::Mat result;
+    {
+      py::gil_scoped_release release;
+      result = cleaner_.FilterMahalanobis(depth_cv, K, mahal_threshold,
+                                          window_radius);
+    }
+    return foundation::py_array_from_data(result.ptr<float>(0), result.rows,
+                                          result.cols);
   }
 
   static bool IsAvailable() {
@@ -174,6 +225,17 @@ class DepthmapClusterEstimatorWrapper {
   void SetTopK(int) {}
   void SetUseCensus(bool) {}
   void SetSmoothWeight(float) {}
+  void SetEdgeWeight(float) {}
+  void SetEscapeDepthRatio(float) {}
+  void SetCenterColorWeight(float) {}
+  void SetVarianceGate(float) {}
+  void SetAnchorViews(int) {}
+  void SetFarGradientThreshold(float) {}
+  void SetSegmentationEnabled(bool) {}
+  void SetSLICGridStep(int) {}
+  void SetSLICCompactness(float) {}
+  void SetDebugDir(const std::string&) {}
+  void SetDebugShotId(const std::string&) {}
   void SetCheckerboardFilter(bool) {}
   void SetSpeckleMinSize(int) {}
   void SetGapMaxSize(int) {}
@@ -210,11 +272,27 @@ class DepthmapCleanerWrapper {
   void SetSameDepthThreshold(float) {}
   void SetMinConsistentViews(int) {}
   void SetDevice(int) {}
+  void SetCarvingThreshold(float) {}
+  void SetMaxCarvedViews(int) {}
+  void SetGrazingCosThreshold(float) {}
+  void SetEdgeDepthRatio(float) {}
   void AddView(const Mat3d&, const Mat3d&, const Vec3d&,
                Eigen::Ref<const ImageF>) {
     throw std::runtime_error("GPUDepthmapCleaner: OpenCL not available");
   }
+  void AddViewWithNormal(const Mat3d&, const Mat3d&, const Vec3d&,
+                         Eigen::Ref<const ImageF>,
+                         Eigen::Ref<const PixelData3f>) {
+    throw std::runtime_error("GPUDepthmapCleaner: OpenCL not available");
+  }
   foundation::pyarray_f Clean(int, const py::array_t<int>&) {
+    throw std::runtime_error("GPUDepthmapCleaner: OpenCL not available");
+  }
+  foundation::pyarray_int ComputeSLIC(Eigen::Ref<const ImageF>, int, float) {
+    throw std::runtime_error("GPUDepthmapCleaner: OpenCL not available");
+  }
+  foundation::pyarray_f FilterMahalanobis(Eigen::Ref<const ImageF>,
+                                          const Mat3d&, float, int) {
     throw std::runtime_error("GPUDepthmapCleaner: OpenCL not available");
   }
   void Clear() {}
@@ -305,6 +383,13 @@ class SVOFuserWrapper {
   void Refine(int color_iters, int joint_iters, float lambda_reg) {
     py::gil_scoped_release release;
     sf_.Refine(color_iters, joint_iters, lambda_reg);
+  }
+
+  void PruneByVisibility(int iterations, float carve_margin,
+                         int carve_threshold, int support_min) {
+    py::gil_scoped_release release;
+    sf_.PruneByVisibility(iterations, carve_margin, carve_threshold,
+                          support_min);
   }
 
   py::list ExtractPoints() {

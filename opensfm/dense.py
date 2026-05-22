@@ -46,7 +46,7 @@ from opensfm.dataset import UndistortedDataSet
 logger: logging.Logger = logging.getLogger(__name__)
 
 # Maximum concurrent clusters running on a single device.
-_MAX_PARALLEL_PER_DEVICE: int = 4
+_MAX_PARALLEL_PER_DEVICE: int = 1
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -70,6 +70,7 @@ def compute_depthmaps(
     # ─ 1.  Build clusters ────────────────────────────────────────────
     processable = list(set(reconstruction.shots.keys())
                        & set(graph.get_shot_ids()))
+    processable = list(sorted(processable))
     if not processable:
         logger.warning("No processable shots found for depthmap computation")
         return
@@ -262,9 +263,9 @@ def compute_depthmaps(
     context.log_memory("phase 2 cleaning done")
 
     # Remove raw depthmaps — no longer needed after cleaning.
-    for sid in processable:
-        data.io_handler.rm_if_exist(data.depthmap_file(sid, "raw.npz"))
-    logger.info("Removed raw depthmaps")
+    # for sid in processable:
+    #     data.io_handler.rm_if_exist(data.depthmap_file(sid, "raw.npz"))
+    # logger.info("Removed raw depthmaps")
 
     # ── 6.  Phase 3: Per-cluster fusion with N-hop neighbors ──────────
     #   Each cluster loads its cleaned depthmaps from disk on-demand.
@@ -612,6 +613,7 @@ def build_common_tracks(
 def _setup_cluster_params(
     cluster: Any,
     config: Dict[str, Any],
+    debug_dir: str = "",
 ) -> None:
     """Apply shared PatchMatch parameters to a cluster object."""
     cluster.set_max_iterations(config["depthmap_max_iterations"])
@@ -623,6 +625,17 @@ def _setup_cluster_params(
     cluster.set_use_census(config["depthmap_use_census"])
     cluster.set_hierarchy_levels(config["depthmap_hierarchy_levels"])
     cluster.set_smooth_weight(config["depthmap_smooth_weight"])
+    cluster.set_edge_weight(config["depthmap_propagation_edge_weight"])
+    cluster.set_escape_depth_ratio(config["depthmap_escape_depth_ratio"])
+    cluster.set_center_color_weight(config["depthmap_center_color_weight"])
+    cluster.set_variance_gate(config["depthmap_variance_gate"])
+    cluster.set_anchor_views(config["depthmap_anchor_views"])
+    cluster.set_far_gradient_threshold(config["depthmap_far_gradient_threshold"])
+    cluster.set_segmentation_enabled(config["depthmap_segmentation_enabled"])
+    cluster.set_slic_grid_step(config["depthmap_slic_grid_step"])
+    cluster.set_slic_compactness(config["depthmap_slic_compactness"])
+    if debug_dir:
+        cluster.set_debug_dir(debug_dir)
     cluster.set_checkerboard_filter(config["depthmap_checkerboard_filter"])
     cluster.set_speckle_min_size(config["depthmap_speckle_min_size"])
     cluster.set_gap_max_size(config["depthmap_gap_max_size"])
@@ -662,7 +675,11 @@ def _run_cluster_raw(
     max_size: int = config["depthmap_max_image_size"]
 
     cluster = pydense.DepthmapClusterEstimator()
-    _setup_cluster_params(cluster, config)
+    debug_dir = ""
+    if config.get("depthmap_save_debug_ply", False) and config.get("depthmap_segmentation_enabled", False):
+        debug_dir = data._depthmap_path()
+        os.makedirs(debug_dir, exist_ok=True)
+    _setup_cluster_params(cluster, config, debug_dir=debug_dir)
     cluster.set_device(device_idx)
 
     # -- Build cluster: add ref views and their source views --
@@ -891,7 +908,15 @@ def _clean_views_batched_gpu(
             K = shot.camera.get_K_in_pixel_coordinates(w, h)
             R = shot.pose.get_rotation_matrix()
             t = shot.pose.translation
-            cleaner.add_view(K, R, t, depth)
+            # Pass normals for ref shots (enables grazing-angle detection).
+            if sid in cluster_shots_set and normal is not None:
+                # PixelData3f expects (3, H*W) column-major (F-contiguous).
+                norm_3n = np.asfortranarray(
+                    normal.reshape(-1, 3).T.astype(np.float32)
+                )
+                cleaner.add_view_with_normal(K, R, t, depth, norm_3n)
+            else:
+                cleaner.add_view(K, R, t, depth)
 
             if sid in cluster_shots_set:
                 raw_normals[sid] = normal
@@ -901,6 +926,7 @@ def _clean_views_batched_gpu(
 
         # ── Clean each ref view and save to disk immediately ───────
         save_items = []
+        use_segment_filter = config.get("depthmap_segmentation_enabled", False)
         for sid in cluster_shots:
             nbr_indices = np.array(
                 [shot_to_idx[n] for n in per_ref_nbrs[sid]],
@@ -908,6 +934,36 @@ def _clean_views_batched_gpu(
             )
             cleaned_depth = cleaner.clean(shot_to_idx[sid], nbr_indices)
             cleaned_arr = np.asarray(cleaned_depth, dtype=np.float32)
+
+            # Per-segment robust Mahalanobis outlier rejection.
+            if use_segment_filter:
+                shot = reconstruction.shots[sid]
+                h_d, w_d = cleaned_arr.shape[:2]
+                K_mat = shot.camera.get_K_in_pixel_coordinates(w_d, h_d)
+                gray = cv2.cvtColor(
+                    data.load_undistorted_image(sid), cv2.COLOR_RGB2GRAY
+                )
+                # Resize gray to match depthmap dimensions.
+                if gray.shape[0] != h_d or gray.shape[1] != w_d:
+                    gray = cv2.resize(
+                        gray, (w_d, h_d), interpolation=cv2.INTER_AREA
+                    )
+                gray_f = gray.astype(np.float32) / 255.0
+                cleaner.compute_slic(
+                    gray_f,
+                    config["depthmap_slic_grid_step"],
+                    config["depthmap_slic_compactness"],
+                )
+                cleaned_arr = np.asarray(
+                    cleaner.filter_mahalanobis(
+                        cleaned_arr,
+                        K_mat,
+                        config["depthmap_mahalanobis_threshold"],
+                        config["depthmap_mahalanobis_window_radius"],
+                    ),
+                    dtype=np.float32,
+                )
+
             norm = raw_normals.pop(sid)
             conf = raw_confidence.pop(sid, None)
             score = np.zeros_like(cleaned_arr)
@@ -960,6 +1016,18 @@ def _clean_views_batched_gpu(
         )
         cleaner.set_min_consistent_views(
             config["depthmap_min_consistent_views"]
+        )
+        cleaner.set_carving_threshold(
+            config["depthmap_carving_threshold"]
+        )
+        cleaner.set_max_carved_views(
+            config["depthmap_max_carved_views"]
+        )
+        cleaner.set_grazing_cos_threshold(
+            config["depthmap_grazing_cos_threshold"]
+        )
+        cleaner.set_edge_depth_ratio(
+            config["depthmap_edge_depth_ratio"]
         )
         cleaner.set_device(device_idx)
         try:
@@ -1330,7 +1398,7 @@ def _split_into_subvolumes(
 
 def _fuse_per_cluster(
     data: UndistortedDataSet,
-    all_neighbors: Dict[str, List[pymap.Shot]],
+    neighbors: Dict[str, List[pymap.Shot]],
     clusters: List[List[str]],
     cluster_bboxes: List[Tuple[NDArray, NDArray]],
     processable: List[str],
@@ -1447,7 +1515,6 @@ def _fuse_per_cluster(
 
             return result
 
-        cluster_set = set(cluster_shots) & fusable_set
 
         # ── SVO fusion with sub-volume splitting ─────────────────
         voxel_size = config["depthmap_fusion_svo_voxel_size"]
@@ -1458,7 +1525,7 @@ def _fuse_per_cluster(
 
         # Step 1: Augment cluster with neighbor views.
         augmented = _augment_cluster_views(
-            cluster_shots, all_neighbors, fusable_set, n_augment,
+            cluster_shots, neighbors, fusable_set, n_augment,
         )
         n_extra = len(augmented) - len(cluster_shots)
         logger.info(
@@ -1596,19 +1663,38 @@ def _fuse_per_cluster(
             refine_enabled = config[
                 "depthmap_fusion_svo_refine_enabled"
             ]
-            if refine_enabled:
+            prune_enabled = config[
+                "depthmap_fusion_svo_prune_enabled"
+            ]
+            if refine_enabled or prune_enabled:
                 fuser.fuse_only()
-                fuser.refine(
-                    color_iters=config[
-                        "depthmap_fusion_svo_refine_color_iters"
-                    ],
-                    joint_iters=config[
-                        "depthmap_fusion_svo_refine_joint_iters"
-                    ],
-                    lambda_reg=config[
-                        "depthmap_fusion_svo_refine_lambda_reg"
-                    ],
-                )
+                if prune_enabled:
+                    fuser.prune_by_visibility(
+                        iterations=config[
+                            "depthmap_fusion_svo_prune_iterations"
+                        ],
+                        carve_margin=config[
+                            "depthmap_fusion_svo_prune_carve_margin"
+                        ],
+                        carve_threshold=config[
+                            "depthmap_fusion_svo_prune_carve_threshold"
+                        ],
+                        support_min=config[
+                            "depthmap_fusion_svo_prune_support_min"
+                        ],
+                    )
+                if refine_enabled:
+                    fuser.refine(
+                        color_iters=config[
+                            "depthmap_fusion_svo_refine_color_iters"
+                        ],
+                        joint_iters=config[
+                            "depthmap_fusion_svo_refine_joint_iters"
+                        ],
+                        lambda_reg=config[
+                            "depthmap_fusion_svo_refine_lambda_reg"
+                        ],
+                    )
                 pts_arr, nrm_arr, clr_arr = fuser.extract_points()
             else:
                 pts_arr, nrm_arr, clr_arr = fuser.fuse()
@@ -2004,6 +2090,127 @@ def scale_down_image(
     width = min(width, image.shape[1])
     height = min(height, image.shape[0])
     return scale_image(image, width, height, interpolation)
+
+
+def _segment_mahalanobis_filter(
+    depth: NDArray,
+    normal: NDArray,
+    image_gray: NDArray,
+    K: NDArray,
+    config: Dict[str, Any],
+) -> NDArray:
+    """Filter outlier depths per SLIC segment using robust Mahalanobis distance.
+
+    For each superpixel segment:
+      1. Backproject all valid depth pixels to 3D (camera frame).
+      2. Compute a robust covariance (trimmed to central 70% by depth).
+      3. Reject points with Mahalanobis distance > threshold.
+
+    This naturally rejects foreground smear: if a segment is mostly a
+    background plane, leaked foreground points will have high Mahalanobis
+    distance and get zeroed.
+
+    Args:
+        depth: (H, W) float32 depthmap.
+        normal: (H, W, 3) float32 normals (unused for now, kept for API).
+        image_gray: (H, W) uint8 grayscale reference image.
+        K: (3, 3) intrinsic matrix.
+        config: Configuration dict with SLIC parameters.
+
+    Returns:
+        Filtered depth (H, W) float32 with outliers zeroed.
+    """
+    h, w = depth.shape[:2]
+    grid_step: int = config.get("depthmap_slic_grid_step", 25)
+    compactness: float = config.get("depthmap_slic_compactness", 20.0)
+    mahal_threshold: float = config.get("depthmap_slic_mahal_threshold", 3.0)
+    min_segment_pts: int = max(16, grid_step * grid_step // 4)
+
+    # Run SLIC on the grayscale image (convert to LAB-like for cv2).
+    # cv2.ximgproc.createSuperpixelSLIC needs a color image.
+    img_color = cv2.cvtColor(image_gray, cv2.COLOR_GRAY2BGR)
+    slic = cv2.ximgproc.createSuperpixelSLIC(
+        img_color, cv2.ximgproc.SLIC, grid_step, compactness
+    )
+    slic.iterate(5)
+    slic.enforceLabelConnectivity(min_segment_pts)
+    labels = slic.getLabels()  # (H, W) int32
+    n_segments = slic.getNumberOfSuperpixels()
+
+    # Precompute pixel → 3D (camera frame).
+    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    valid = depth > 0
+    Z = depth.copy()
+    X = Z * (xx - cx) / fx
+    Y = Z * (yy - cy) / fy
+
+    # Stack into (H, W, 3) for easy indexing.
+    pts_3d = np.stack([X, Y, Z], axis=-1)  # (H, W, 3)
+
+    # Process each segment.
+    filtered = depth.copy()
+    n_rejected = 0
+
+    for seg_id in range(n_segments):
+        mask = (labels == seg_id) & valid
+        n_pts = int(np.count_nonzero(mask))
+        if n_pts < min_segment_pts:
+            continue
+
+        # Extract 3D points for this segment.
+        pts = pts_3d[mask]  # (N, 3)
+
+        # Robust covariance: trim to central 70% by depth (Z coord)
+        # to exclude outliers from the covariance estimate.
+        z_vals = pts[:, 2]
+        z_lo = np.percentile(z_vals, 15)
+        z_hi = np.percentile(z_vals, 85)
+        inlier_mask = (z_vals >= z_lo) & (z_vals <= z_hi)
+        n_inliers = int(np.count_nonzero(inlier_mask))
+        if n_inliers < 4:
+            continue
+
+        pts_trimmed = pts[inlier_mask]
+        mean = np.mean(pts_trimmed, axis=0)
+        centered = pts_trimmed - mean
+
+        # Compute covariance matrix.
+        cov = (centered.T @ centered) / (n_inliers - 1)
+
+        # Regularize to avoid singular matrix.
+        cov += np.eye(3, dtype=np.float32) * 1e-8
+
+        # Invert covariance.
+        try:
+            cov_inv = np.linalg.inv(cov)
+        except np.linalg.LinAlgError:
+            continue
+
+        # Mahalanobis distance for ALL points in segment (not just trimmed).
+        diff = pts - mean  # (N, 3)
+        # mahal² = diff @ cov_inv @ diff.T, computed row-wise.
+        mahal_sq = np.sum(diff @ cov_inv * diff, axis=1)  # (N,)
+
+        # Reject points exceeding threshold.
+        outliers = mahal_sq > (mahal_threshold * mahal_threshold)
+        n_out = int(np.count_nonzero(outliers))
+        if n_out > 0:
+            # Map back to image coordinates.
+            seg_indices = np.where(mask)
+            out_y = seg_indices[0][outliers]
+            out_x = seg_indices[1][outliers]
+            filtered[out_y, out_x] = 0.0
+            n_rejected += n_out
+
+    if n_rejected > 0:
+        logger.debug(
+            f"Segment Mahalanobis filter: rejected {n_rejected} pixels "
+            f"({100.0 * n_rejected / max(1, int(np.count_nonzero(valid))):.1f}%) "
+            f"across {n_segments} segments"
+        )
+
+    return filtered
 
 
 def _save_depthmap_as_ply(

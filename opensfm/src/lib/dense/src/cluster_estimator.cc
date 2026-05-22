@@ -87,10 +87,14 @@ void DepthmapClusterEstimator::Run(std::vector<DepthmapResult>* results) {
 
   // Prepare all estimators.
   int n_levels = 0;
-  for (auto& entry : refs_) {
+  for (int i = 0; i < K; ++i) {
+    auto& entry = refs_[i];
     DepthmapParams p = params_;
     p.depth_min = entry.depth_min;
     p.depth_max = entry.depth_max;
+    if (!p.debug_dir.empty() && p.debug_shot_id.empty()) {
+      p.debug_shot_id = std::to_string(i);
+    }
     entry.estimator.SetDevice(device_idx_);
     entry.estimator.SetParams(p);
     entry.estimator.SetGeomConsistencyWeight(geom_weight_);

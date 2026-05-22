@@ -31,6 +31,9 @@ PYBIND11_MODULE(pydense, m) {
       .def("fuse_only", &dense::SVOFuserWrapper::FuseOnly)
       .def("refine", &dense::SVOFuserWrapper::Refine, py::arg("color_iters"),
            py::arg("joint_iters"), py::arg("lambda_reg"))
+      .def("prune_by_visibility", &dense::SVOFuserWrapper::PruneByVisibility,
+           py::arg("iterations"), py::arg("carve_margin"),
+           py::arg("carve_threshold"), py::arg("support_min"))
       .def("extract_points", &dense::SVOFuserWrapper::ExtractPoints);
 
   py::class_<dense::DepthmapClusterEstimatorWrapper>(m,
@@ -53,6 +56,28 @@ PYBIND11_MODULE(pydense, m) {
            &dense::DepthmapClusterEstimatorWrapper::SetUseCensus)
       .def("set_smooth_weight",
            &dense::DepthmapClusterEstimatorWrapper::SetSmoothWeight)
+      .def("set_edge_weight",
+           &dense::DepthmapClusterEstimatorWrapper::SetEdgeWeight)
+      .def("set_escape_depth_ratio",
+           &dense::DepthmapClusterEstimatorWrapper::SetEscapeDepthRatio)
+      .def("set_center_color_weight",
+           &dense::DepthmapClusterEstimatorWrapper::SetCenterColorWeight)
+      .def("set_variance_gate",
+           &dense::DepthmapClusterEstimatorWrapper::SetVarianceGate)
+      .def("set_anchor_views",
+           &dense::DepthmapClusterEstimatorWrapper::SetAnchorViews)
+      .def("set_far_gradient_threshold",
+           &dense::DepthmapClusterEstimatorWrapper::SetFarGradientThreshold)
+      .def("set_segmentation_enabled",
+           &dense::DepthmapClusterEstimatorWrapper::SetSegmentationEnabled)
+      .def("set_slic_grid_step",
+           &dense::DepthmapClusterEstimatorWrapper::SetSLICGridStep)
+      .def("set_slic_compactness",
+           &dense::DepthmapClusterEstimatorWrapper::SetSLICCompactness)
+      .def("set_debug_dir",
+           &dense::DepthmapClusterEstimatorWrapper::SetDebugDir)
+      .def("set_debug_shot_id",
+           &dense::DepthmapClusterEstimatorWrapper::SetDebugShotId)
       .def("set_checkerboard_filter",
            &dense::DepthmapClusterEstimatorWrapper::SetCheckerboardFilter)
       .def("set_speckle_min_size",
@@ -99,8 +124,21 @@ PYBIND11_MODULE(pydense, m) {
       .def("set_min_consistent_views",
            &dense::DepthmapCleanerWrapper::SetMinConsistentViews)
       .def("set_device", &dense::DepthmapCleanerWrapper::SetDevice)
+      .def("set_carving_threshold",
+           &dense::DepthmapCleanerWrapper::SetCarvingThreshold)
+      .def("set_max_carved_views",
+           &dense::DepthmapCleanerWrapper::SetMaxCarvedViews)
+      .def("set_grazing_cos_threshold",
+           &dense::DepthmapCleanerWrapper::SetGrazingCosThreshold)
+      .def("set_edge_depth_ratio",
+           &dense::DepthmapCleanerWrapper::SetEdgeDepthRatio)
       .def("add_view", &dense::DepthmapCleanerWrapper::AddView)
+      .def("add_view_with_normal",
+           &dense::DepthmapCleanerWrapper::AddViewWithNormal)
       .def("clean", &dense::DepthmapCleanerWrapper::Clean)
+      .def("compute_slic", &dense::DepthmapCleanerWrapper::ComputeSLIC)
+      .def("filter_mahalanobis",
+           &dense::DepthmapCleanerWrapper::FilterMahalanobis)
       .def("clear", &dense::DepthmapCleanerWrapper::Clear)
       .def_static("is_available", &dense::DepthmapCleanerWrapper::IsAvailable);
 

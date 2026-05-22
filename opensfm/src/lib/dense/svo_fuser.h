@@ -54,6 +54,18 @@ class SVOFuser {
   // Must be called after Fuse().
   void Refine(int color_iters, int joint_iters, float lambda_reg);
 
+  // Visibility-based pruning of the TSDF hash table.
+  // Raycasts the hash table from each integrated view, compares with its
+  // clean depth map, and prunes voxels with too many carve votes.
+  // Must be called after Fuse().
+  // Parameters:
+  //   iterations: number of raycast-vote-prune passes (typically 1-2)
+  //   carve_margin: relative depth margin for carve votes (e.g. 0.05)
+  //   carve_threshold: min carve votes to trigger pruning
+  //   support_min: min support votes to be safe from pruning
+  void PruneByVisibility(int iterations, float carve_margin,
+                         int carve_threshold, int support_min);
+
   // Extract surface points from the (possibly refined) hash table.
   // Returns [points, normals, colors].
   void ExtractPoints(std::vector<Vec3f>* fused_points,

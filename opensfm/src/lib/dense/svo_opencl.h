@@ -13,8 +13,7 @@ namespace dense {
 // Must match kernel-side VoxelSlot exactly (48 bytes).
 struct GPUVoxelSlot {
   uint32_t key_ab;   // packed (x+32768)<<16 | (y+32768), EMPTY = 0xFFFFFFFF
-  int32_t key_c;     // z coordinate
-  int32_t ready;     // initialisation flag
+  int32_t key_c;     // z coordinate, UNINIT = 0x80000000
   int32_t count;     // observation count
   int32_t sum_tsdf;  // fixed-point TSDF accumulator
   int32_t sum_nx;    // fixed-point normal.x accumulator
@@ -24,16 +23,18 @@ struct GPUVoxelSlot {
   int32_t sum_g;
   int32_t sum_b;
   int32_t sum_weight;  // accumulated confidence weight (WEIGHT_SCALE units)
+  int32_t _pad;
 };
 static_assert(sizeof(GPUVoxelSlot) == 48, "GPUVoxelSlot must be 48 bytes");
 
-// Must match kernel-side CountSlot exactly (12 bytes).
+static constexpr int32_t kKeyCUninit = static_cast<int32_t>(0x80000000);
+
+// Must match kernel-side CountSlot exactly (8 bytes).
 struct GPUCountSlot {
   uint32_t key_ab;
   int32_t key_c;
-  int32_t ready;
 };
-static_assert(sizeof(GPUCountSlot) == 12, "GPUCountSlot must be 12 bytes");
+static_assert(sizeof(GPUCountSlot) == 8, "GPUCountSlot must be 8 bytes");
 
 // Must match kernel-side SVOCamera exactly (144 bytes).
 // All matrices stored in row-major order.
@@ -101,6 +102,13 @@ class SVOIntegratorCL {
   // Read back the unique voxel count from the GPU counter.
   uint32_t GetUniqueCount() const;
 
+  // Read back the overflow (dropped contribution) count from the GPU counter.
+  // Returns 0 if no overflow occurred (deterministic integration).
+  uint32_t GetOverflowCount() const;
+
+  // Reset the overflow counter to zero (call before each Integrate batch).
+  void ResetOverflowCounter();
+
   uint32_t capacity() const { return capacity_; }
 
   // --- Photometric refinement ---
@@ -129,6 +137,24 @@ class SVOIntegratorCL {
               float lambda_decay, float voxel_size, float trunc_dist,
               float min_weight);
 
+  // --- Visibility pruning ---
+  // Initialize carve/support vote buffers (same capacity as hash table).
+  void InitializeVisibilityPruning();
+
+  // Raycast the hash table from a given camera, then compare with a clean
+  // depth map to tally carve/support votes per voxel.
+  void RaycastAndVote(const Mat3f& K, const Mat3f& R, const Vec3f& t,
+                      const float* clean_depth, int rows, int cols,
+                      float voxel_size, float min_depth, float max_depth,
+                      float min_weight, float carve_margin);
+
+  // Apply pruning based on accumulated votes.
+  void Prune(int carve_threshold, int support_min,
+             float weight_penalty_per_vote);
+
+  // Clear vote counters (call between iterations if doing multiple passes).
+  void ClearVotes();
+
  private:
   void BuildKernels();
   void EnsureFrameBuffers(int rows, int cols, bool has_normal, bool has_color,
@@ -150,13 +176,15 @@ class SVOIntegratorCL {
   cl::Buffer cl_color_;
   cl::Buffer cl_mask_;
   cl::Buffer cl_weight_;
-  cl::Buffer cl_dummy_;  // 1-byte placeholder for null pointers
+  cl::Buffer cl_dummy_;     // 1-byte placeholder for null pointers
+  cl::Buffer cl_overflow_;  // uint32 overflow counter (integration)
 
   // Counting pass buffers.
   cl::Kernel k_count_clear_;
   cl::Kernel k_count_;
   cl::Buffer cl_count_table_;
   cl::Buffer cl_counter_;
+  cl::Buffer cl_count_overflow_;  // uint32 overflow counter (counting)
   uint32_t count_capacity_ = 0;
   uint32_t count_mask_ = 0;
 
@@ -182,6 +210,19 @@ class SVOIntegratorCL {
   size_t color_bytes_ = 0;
   size_t mask_bytes_ = 0;
   size_t weight_bytes_ = 0;
+
+  // Visibility pruning kernels and buffers.
+  cl::Kernel k_raycast_;
+  cl::Kernel k_carve_vote_;
+  cl::Kernel k_prune_;
+  cl::Kernel k_clear_votes_;
+  cl::Buffer cl_rendered_depth_;
+  cl::Buffer cl_hit_slot_;
+  cl::Buffer cl_clean_depth_;
+  cl::Buffer cl_carve_count_;
+  cl::Buffer cl_support_count_;
+  size_t raycast_pixels_ = 0;
+  bool visibility_initialized_ = false;
 };
 
 }  // namespace dense

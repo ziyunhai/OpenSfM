@@ -23,9 +23,8 @@ inline const char* kSVOKernelSource =
 // Constants
 // =====================================================================
 #define EMPTY_KEY 0xFFFFFFFFu
-#define KEY_C_UNINIT ((int)0x80000000)
 #define FP_SCALE  32768
-#define MAX_PROBES 1024
+#define MAX_PROBES 256
 #define WEIGHT_SCALE 128
 
 // =====================================================================
@@ -33,8 +32,9 @@ inline const char* kSVOKernelSource =
 // 12 x int32 = 48 bytes.
 // =====================================================================
 typedef struct {
-    uint key_ab;      // packed (x+32768)<<16 | (y+32768), EMPTY = 0xFFFFFFFF
-    int  key_c;       // z coordinate, KEY_C_UNINIT = 0x80000000 when unwritten
+    uint key_ab;      // packed (x+32768)<<16 | (y+32768)
+    int  key_c;       // z coordinate
+    int  ready;       // 1 after key_c is written
     int  count;       // observation count
     int  sum_tsdf;    // fixed-point TSDF accumulator
     int  sum_nx;      // fixed-point normal.x accumulator
@@ -43,8 +43,7 @@ typedef struct {
     int  sum_r;       // color accumulator (raw uint8 scale)
     int  sum_g;
     int  sum_b;
-    int  sum_weight;  // accumulated confidence weight (scale WEIGHT_SCALE)
-    int  _pad;        // padding to maintain 48-byte slot size
+    int  sum_weight;   // accumulated confidence weight (scale WEIGHT_SCALE)
 } VoxelSlot;
 
 // =====================================================================
@@ -82,19 +81,15 @@ uint voxel_hash(int kx, int ky, int kz) {
 // before accumulation so that Download can compute weighted averages
 // by dividing by sum_weight.
 //
-// Protocol (32-bit CAS, no ready flag):
+// Protocol
 //   1. CAS on key_ab to claim an empty slot.
-//   2. For a freshly claimed slot, write key_c with atomic_xchg +
-//      mem_fence (transitions from KEY_C_UNINIT to valid kz).
-//   3. For a slot that already has our key_ab, spin on key_c until it
-//      leaves KEY_C_UNINIT.  On match, accumulate; otherwise probe.
-//   4. Accumulation uses atomic_add on every field (commutative).
-//
-// Overflow counter is incremented on probe exhaustion or (extremely
-// rare) spin exhaustion, making drops visible to the host.
+//   2. For a freshly claimed slot, write key_c with atomic_xchg, then
+//      set ready=1 with atomic_xchg + mem_fence.
+//   3. For a slot that already has our key_ab, spin briefly on ready,
+//      then verify key_c.  On match, accumulate; otherwise probe.
+//   4. Accumulation uses atomic_add on every field.
 // =====================================================================
 void hash_accumulate(__global VoxelSlot* table, uint mask,
-                     __global uint* overflow_counter,
                      int kx, int ky, int kz,
                      int tsdf_fp,
                      int nx_fp, int ny_fp, int nz_fp,
@@ -120,44 +115,44 @@ void hash_accumulate(__global VoxelSlot* table, uint mask,
         uint old = atomic_cmpxchg(&table[slot].key_ab, EMPTY_KEY, my_ab);
 
         if (old == EMPTY_KEY) {
-            // Freshly claimed — write key_c, then accumulate.
+            // Freshly claimed — write z, signal ready, accumulate.
             atomic_xchg(&table[slot].key_c, kz);
             mem_fence(CLK_GLOBAL_MEM_FENCE);
+            atomic_xchg(&table[slot].ready, 1);
+            mem_fence(CLK_GLOBAL_MEM_FENCE);
 
-            atomic_add(&table[slot].count,      1);
+            atomic_add(&table[slot].count,    1);
             atomic_add(&table[slot].sum_weight, weight);
-            atomic_add(&table[slot].sum_tsdf,   w_tsdf);
-            atomic_add(&table[slot].sum_nx,     w_nx);
-            atomic_add(&table[slot].sum_ny,     w_ny);
-            atomic_add(&table[slot].sum_nz,     w_nz);
-            atomic_add(&table[slot].sum_r,      w_cr);
-            atomic_add(&table[slot].sum_g,      w_cg);
-            atomic_add(&table[slot].sum_b,      w_cb);
+            atomic_add(&table[slot].sum_tsdf, w_tsdf);
+            atomic_add(&table[slot].sum_nx,   w_nx);
+            atomic_add(&table[slot].sum_ny,   w_ny);
+            atomic_add(&table[slot].sum_nz,   w_nz);
+            atomic_add(&table[slot].sum_r,    w_cr);
+            atomic_add(&table[slot].sum_g,    w_cg);
+            atomic_add(&table[slot].sum_b,    w_cb);
             return;
         }
 
         if (old == my_ab) {
-            // Same (x,y) — spin until key_c is written.
-            int stored_z = KEY_C_UNINIT;
-            for (int s = 0; s < 32768; s++) {
-                stored_z = atomic_add(&table[slot].key_c, 0);
-                if (stored_z != KEY_C_UNINIT) break;
+            // Same (x,y) — wait for ready, then verify z.
+            int ready_val = 0;
+            for (int s = 0; s < 512; s++) {
+                ready_val = atomic_add(&table[slot].ready, 0);
+                if (ready_val != 0) break;
             }
-            if (stored_z == KEY_C_UNINIT) {
-                // Spin exhausted (practically impossible on Apple GPU).
-                atomic_add(overflow_counter, 1u);
-                continue;
-            }
+            if (ready_val == 0) continue;  // timed-out — probe next
+
+            int stored_z = atomic_add(&table[slot].key_c, 0);
             if (stored_z == kz) {
-                atomic_add(&table[slot].count,      1);
+                atomic_add(&table[slot].count,    1);
                 atomic_add(&table[slot].sum_weight, weight);
-                atomic_add(&table[slot].sum_tsdf,   w_tsdf);
-                atomic_add(&table[slot].sum_nx,     w_nx);
-                atomic_add(&table[slot].sum_ny,     w_ny);
-                atomic_add(&table[slot].sum_nz,     w_nz);
-                atomic_add(&table[slot].sum_r,      w_cr);
-                atomic_add(&table[slot].sum_g,      w_cg);
-                atomic_add(&table[slot].sum_b,      w_cb);
+                atomic_add(&table[slot].sum_tsdf, w_tsdf);
+                atomic_add(&table[slot].sum_nx,   w_nx);
+                atomic_add(&table[slot].sum_ny,   w_ny);
+                atomic_add(&table[slot].sum_nz,   w_nz);
+                atomic_add(&table[slot].sum_r,    w_cr);
+                atomic_add(&table[slot].sum_g,    w_cg);
+                atomic_add(&table[slot].sum_b,    w_cb);
                 return;
             }
             // Different z — linear probe.
@@ -165,7 +160,6 @@ void hash_accumulate(__global VoxelSlot* table, uint mask,
         // Different key_ab — linear probe.
     }
     // Dropped (max probes exceeded — table too full).
-    atomic_add(overflow_counter, 1u);
 }
 
 // =====================================================================
@@ -174,18 +168,18 @@ void hash_accumulate(__global VoxelSlot* table, uint mask,
 __kernel void svo_clear_table(__global VoxelSlot* table, uint capacity) {
     uint i = get_global_id(0);
     if (i >= capacity) return;
-    table[i].key_ab     = EMPTY_KEY;
-    table[i].key_c      = KEY_C_UNINIT;
-    table[i].count      = 0;
-    table[i].sum_tsdf   = 0;
-    table[i].sum_nx     = 0;
-    table[i].sum_ny     = 0;
-    table[i].sum_nz     = 0;
-    table[i].sum_r      = 0;
-    table[i].sum_g      = 0;
-    table[i].sum_b      = 0;
+    table[i].key_ab   = EMPTY_KEY;
+    table[i].key_c    = 0;
+    table[i].ready    = 0;
+    table[i].count    = 0;
+    table[i].sum_tsdf = 0;
+    table[i].sum_nx   = 0;
+    table[i].sum_ny   = 0;
+    table[i].sum_nz   = 0;
+    table[i].sum_r    = 0;
+    table[i].sum_g    = 0;
+    table[i].sum_b    = 0;
     table[i].sum_weight = 0;
-    table[i]._pad       = 0;
 }
 
 
@@ -198,7 +192,6 @@ __kernel void svo_clear_table(__global VoxelSlot* table, uint capacity) {
 __kernel void svo_integrate(
     __global VoxelSlot*    table,
     uint                   capacity_mask,
-    __global uint*         overflow_counter,
     __global const float*  depth,
     __global const float*  normal_buf,
     __global const uchar*  color_buf,
@@ -342,8 +335,7 @@ __kernel void svo_integrate(
         float tsdf = fmin(sdf / trunc, 1.0f);
         int tsdf_fp = (int)(tsdf * (float)FP_SCALE);
 
-        hash_accumulate(table, capacity_mask, overflow_counter,
-                        kx, ky, kz,
+        hash_accumulate(table, capacity_mask, kx, ky, kz,
                         tsdf_fp, nx_fp, ny_fp, nz_fp, cr, cg, cb, w_int);
     }
 })CL"
@@ -356,14 +348,14 @@ __kernel void svo_integrate(
 // =====================================================================
 typedef struct {
     uint key_ab;   // packed (x+32768)<<16 | (y+32768), EMPTY = 0xFFFFFFFF
-    int  key_c;    // z coordinate, KEY_C_UNINIT when unwritten
+    int  key_c;    // z coordinate
+    int  ready;    // initialisation flag
 } CountSlot;
 
 // Insert a voxel key into the counting table.  Increments *counter
 // exactly once per unique (kx, ky, kz) coordinate.
 void count_hash_insert(__global CountSlot* table, uint mask,
                        __global uint* counter,
-                       __global uint* overflow_counter,
                        int kx, int ky, int kz)
 {
     uint my_ab = pack_xy(kx, ky);
@@ -377,30 +369,29 @@ void count_hash_insert(__global CountSlot* table, uint mask,
         uint old = atomic_cmpxchg(&table[slot].key_ab, EMPTY_KEY, my_ab);
 
         if (old == EMPTY_KEY) {
-            // Freshly claimed slot — write z, count.
+            // Freshly claimed slot — write z, signal ready, count.
             atomic_xchg(&table[slot].key_c, kz);
             mem_fence(CLK_GLOBAL_MEM_FENCE);
+            atomic_xchg(&table[slot].ready, 1);
             atomic_add(counter, 1u);
             return;
         }
 
         if (old == my_ab) {
-            // Same (x,y) — spin until key_c leaves UNINIT.
-            int stored_z = KEY_C_UNINIT;
-            for (int s = 0; s < 32768; s++) {
-                stored_z = atomic_add(&table[slot].key_c, 0);
-                if (stored_z != KEY_C_UNINIT) break;
+            // Same (x,y) — wait for ready, then verify z.
+            int ready_val = 0;
+            for (int s = 0; s < 512; s++) {
+                ready_val = atomic_add(&table[slot].ready, 0);
+                if (ready_val != 0) break;
             }
-            if (stored_z == KEY_C_UNINIT) {
-                atomic_add(overflow_counter, 1u);
-                continue;
-            }
+            if (ready_val == 0) continue;
+
+            int stored_z = atomic_add(&table[slot].key_c, 0);
             if (stored_z == kz) return;  // already counted
         }
         // Different key — linear probe.
     }
     // Dropped (max probes exceeded).
-    atomic_add(overflow_counter, 1u);
 }
 
 // Clear the counting table.
@@ -408,7 +399,8 @@ __kernel void svo_clear_count_table(__global CountSlot* table, uint capacity) {
     uint i = get_global_id(0);
     if (i >= capacity) return;
     table[i].key_ab = EMPTY_KEY;
-    table[i].key_c  = KEY_C_UNINIT;
+    table[i].key_c  = 0;
+    table[i].ready  = 0;
 }
 
 // =====================================================================
@@ -420,7 +412,6 @@ __kernel void svo_count(
     __global CountSlot*    table,
     uint                   capacity_mask,
     __global uint*         counter,
-    __global uint*         overflow_counter,
     __global const float*  depth,
     __global const uchar*  mask_buf,
     int                    has_mask,
@@ -511,7 +502,7 @@ __kernel void svo_count(
         float sdf = d - p_cam_v.z;
         if (sdf < -trunc) continue;
 
-        count_hash_insert(table, capacity_mask, counter, overflow_counter, kx, ky, kz);
+        count_hash_insert(table, capacity_mask, counter, kx, ky, kz);
     }
 }
 
@@ -545,9 +536,8 @@ uint hash_lookup(__global const VoxelSlot* table, uint mask,
         if (stored_ab == EMPTY_KEY) return 0xFFFFFFFF;
 
         if (stored_ab == my_ab) {
-            int stored_z = table[slot_idx].key_c;
-            if (stored_z == KEY_C_UNINIT) continue;
-            if (stored_z == kz) return slot_idx;
+            if (table[slot_idx].ready == 0) continue;
+            if (table[slot_idx].key_c == kz) return slot_idx;
         }
     }
     return 0xFFFFFFFF;
@@ -593,7 +583,7 @@ __kernel void svo_extract_points(
     float ga   = (float)table[i].sum_g  * inv_sw_a;
     float ba   = (float)table[i].sum_b  * inv_sw_a;
 
-    // Check +X, +Y, +Z neighbours for TSDF sign change.
+    // Check +X, +Y, +Z neighbours.
     int off_x[3] = {1, 0, 0};
     int off_y[3] = {0, 1, 0};
     int off_z[3] = {0, 0, 1};
@@ -1567,7 +1557,7 @@ __kernel void svo_prune(
         if (new_weight <= 0) {
             // Kill the voxel.
             table[i].key_ab = EMPTY_KEY;
-            table[i].key_c = KEY_C_UNINIT;
+            table[i].ready = 0;
             table[i].sum_weight = 0;
         } else {
             table[i].sum_weight = new_weight;

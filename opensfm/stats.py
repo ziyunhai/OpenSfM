@@ -1282,9 +1282,9 @@ def save_residual_grids(
         w, h = camera.width, camera.height
         normalizer = max(w, h)
 
-        clamp = 0.1
+        clamp = 0.15
         res_colors = np.linalg.norm(camera_array_res[:, :, :2], axis=2)
-        lowest = np.percentile(res_colors, 0)
+        lowest = np.percentile(res_colors, 100 * clamp)
         highest = np.percentile(res_colors, 100 * (1 - clamp))
         np.clip(res_colors, lowest, highest, res_colors)
         res_colors /= highest - lowest
