@@ -19,6 +19,7 @@ PYBIND11_MODULE(pydense, m) {
       .def("set_trunc_factor", &dense::SVOFuserWrapper::SetTruncFactor)
       .def("set_min_weight", &dense::SVOFuserWrapper::SetMinWeight)
       .def("set_device", &dense::SVOFuserWrapper::SetDevice)
+      .def("set_num_levels", &dense::SVOFuserWrapper::SetNumLevels)
       .def("set_bbox", &dense::SVOFuserWrapper::SetBBox, py::arg("min_world"),
            py::arg("max_world"))
       .def_static("is_gpu_available", &dense::SVOFuserWrapper::IsGPUAvailable)

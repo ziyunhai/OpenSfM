@@ -316,6 +316,7 @@ class SVOFuserWrapper {
   void SetTruncFactor(float factor) { sf_.SetTruncFactor(factor); }
   void SetMinWeight(float w) { sf_.SetMinWeight(w); }
   void SetDevice(int device_idx) { sf_.SetDevice(device_idx); }
+  void SetNumLevels(int n) { sf_.SetNumLevels(n); }
   void SetBBox(const Vec3f& min_world, const Vec3f& max_world) {
     sf_.SetBBox(min_world, max_world);
   }

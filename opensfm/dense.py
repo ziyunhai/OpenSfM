@@ -1576,6 +1576,9 @@ def _fuse_per_cluster(
             fuser.set_min_weight(
                 config["depthmap_fusion_svo_min_weight"]
             )
+            fuser.set_num_levels(
+                config["depthmap_fusion_svo_num_levels"]
+            )
             fuser.set_device(0)
             fuser.set_bbox(sv.ext_min, sv.ext_max)
 

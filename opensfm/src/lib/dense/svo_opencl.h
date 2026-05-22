@@ -86,6 +86,19 @@ class SVOIntegratorCL {
                      std::vector<Vec3f>* points, std::vector<Vec3f>* normals,
                      std::vector<Vec3<uint8_t>>* colors);
 
+  // Multi-level fill extraction: sub-sample coarse TSDF crossings at
+  // fine-level density, emitting only where the fine table has no coverage.
+  // |fine_table| and |fine_mask| come from a finer-level integrator.
+  void ExtractFill(const cl::Buffer& fine_table, uint32_t fine_mask,
+                   float min_weight, float coarse_voxel_size,
+                   float fine_voxel_size, int level_shift,
+                   std::vector<Vec3f>* points, std::vector<Vec3f>* normals,
+                   std::vector<Vec3<uint8_t>>* colors);
+
+  // Public accessors for the hash table buffer (needed for multi-level fill).
+  const cl::Buffer& table_buffer() const { return cl_table_; }
+  uint32_t capacity_mask() const { return capacity_mask_; }
+
   // --- Counting pass (lightweight dry-run) ---
   // Allocate a compact counting table (12 bytes/slot) to count unique
   // voxels across all views without accumulating TSDF / color data.
@@ -190,6 +203,7 @@ class SVOIntegratorCL {
 
   // Extraction kernel.
   cl::Kernel k_extract_;
+  cl::Kernel k_extract_fill_;
 
   // Refinement kernels and buffers.
   cl::Kernel k_refine_clear_;

@@ -662,7 +662,185 @@ __kernel void svo_extract_points(
         out_colors[out_idx * 3 + 1] = (uchar)clamp(ga + t * (gb - ga), 0.0f, 255.0f);
         out_colors[out_idx * 3 + 2] = (uchar)clamp(ba + t * (bb - ba), 0.0f, 255.0f);
     }
-})CL"
+}
+
+// =====================================================================
+// Multi-level fill-in extraction.
+//
+// One work-item per coarse hash table slot.  For each occupied coarse
+// voxel with a TSDF sign change to a positive-axis neighbor, sub-sample
+// the crossing plane at fine-level density and emit points only where
+// the fine table has NO coverage (i.e. fill holes).
+//
+// Arguments:
+//   coarse_table / coarse_mask / coarse_capacity — coarse integration table
+//   fine_table / fine_mask — fine (L=0) integration table (read-only lookup)
+//   min_weight_scaled — minimum sum_weight to consider a voxel valid
+//   coarse_voxel_size — voxel size at coarse level
+//   fine_voxel_size — voxel size at fine level
+//   level_shift — log2(coarse_voxel_size / fine_voxel_size), i.e. 1<<level_shift sub-samples per axis
+//   out_points/out_normals/out_colors/out_counter/max_output — output buffers
+// =====================================================================
+__kernel void svo_extract_fill(
+    __global const VoxelSlot* coarse_table,
+    uint                      coarse_mask,
+    uint                      coarse_capacity,
+    __global const VoxelSlot* fine_table,
+    uint                      fine_mask,
+    float                     min_weight_scaled,
+    float                     coarse_voxel_size,
+    float                     fine_voxel_size,
+    int                       level_shift,
+    __global float*           out_points,
+    __global float*           out_normals,
+    __global uchar*           out_colors,
+    __global uint*            out_counter,
+    uint                      max_output)
+{
+    uint i = get_global_id(0);
+    if (i >= coarse_capacity) return;
+
+    // Read coarse slot A.
+    uint key_ab_a = coarse_table[i].key_ab;
+    if (key_ab_a == EMPTY_KEY) return;
+    int count_a = coarse_table[i].count;
+    if (count_a == 0) return;
+
+    float sw_a = (float)coarse_table[i].sum_weight;
+    if (sw_a < min_weight_scaled) return;
+
+    int kx = (int)((key_ab_a >> 16) & 0xFFFF) - 32768;
+    int ky = (int)(key_ab_a & 0xFFFF) - 32768;
+    int kz = coarse_table[i].key_c;
+
+    float inv_sw_a    = 1.0f / sw_a;
+    float inv_fp_sw_a = inv_sw_a / (float)FP_SCALE;
+    float tsdf_a      = (float)coarse_table[i].sum_tsdf * inv_fp_sw_a;
+
+    // Pre-decode coarse voxel A normal & color.
+    float na_x = (float)coarse_table[i].sum_nx * inv_fp_sw_a;
+    float na_y = (float)coarse_table[i].sum_ny * inv_fp_sw_a;
+    float na_z = (float)coarse_table[i].sum_nz * inv_fp_sw_a;
+    float ra   = (float)coarse_table[i].sum_r  * inv_sw_a;
+    float ga   = (float)coarse_table[i].sum_g  * inv_sw_a;
+    float ba   = (float)coarse_table[i].sum_b  * inv_sw_a;
+
+    // Number of sub-samples per axis along the crossing plane.
+    int subdiv = 1 << level_shift;
+
+    // Check +X, +Y, +Z neighbours for TSDF sign change.
+    int off_x[3] = {1, 0, 0};
+    int off_y[3] = {0, 1, 0};
+    int off_z[3] = {0, 0, 1};
+
+    for (int d = 0; d < 3; d++) {
+        int nx = kx + off_x[d];
+        int ny = ky + off_y[d];
+        int nz = kz + off_z[d];
+
+        // Look up neighbor in coarse table.
+        uint nb_idx = hash_lookup(coarse_table, coarse_mask, nx, ny, nz);
+        if (nb_idx == 0xFFFFFFFF) continue;
+
+        float sw_b = (float)coarse_table[nb_idx].sum_weight;
+        if (sw_b < min_weight_scaled) continue;
+
+        float inv_sw_b    = 1.0f / sw_b;
+        float inv_fp_sw_b = inv_sw_b / (float)FP_SCALE;
+        float tsdf_b      = (float)coarse_table[nb_idx].sum_tsdf * inv_fp_sw_b;
+
+        // Sign change?
+        if ((tsdf_a > 0.0f) == (tsdf_b > 0.0f)) continue;
+        if (tsdf_a == 0.0f || tsdf_b == 0.0f) continue;
+
+        // Interpolation factor along the edge.
+        float t = tsdf_a / (tsdf_a - tsdf_b);
+        t = clamp(t, 0.0f, 1.0f);
+
+        // Coarse voxel centres.
+        float pa_x = ((float)kx + 0.5f) * coarse_voxel_size;
+        float pa_y = ((float)ky + 0.5f) * coarse_voxel_size;
+        float pa_z = ((float)kz + 0.5f) * coarse_voxel_size;
+
+        // Interpolated crossing point (coarse grid).
+        float cx = pa_x + t * (float)off_x[d] * coarse_voxel_size;
+        float cy = pa_y + t * (float)off_y[d] * coarse_voxel_size;
+        float cz = pa_z + t * (float)off_z[d] * coarse_voxel_size;
+
+        // Interpolated normal from coarse.
+        float nb_x = (float)coarse_table[nb_idx].sum_nx * inv_fp_sw_b;
+        float nb_y = (float)coarse_table[nb_idx].sum_ny * inv_fp_sw_b;
+        float nb_z = (float)coarse_table[nb_idx].sum_nz * inv_fp_sw_b;
+        float inx = na_x + t * (nb_x - na_x);
+        float iny = na_y + t * (nb_y - na_y);
+        float inz = na_z + t * (nb_z - na_z);
+        float nlen = sqrt(inx*inx + iny*iny + inz*inz);
+        if (nlen > 1e-6f) { inx /= nlen; iny /= nlen; inz /= nlen; }
+
+        // Interpolated color from coarse.
+        float rb = (float)coarse_table[nb_idx].sum_r * inv_sw_b;
+        float gb = (float)coarse_table[nb_idx].sum_g * inv_sw_b;
+        float bb = (float)coarse_table[nb_idx].sum_b * inv_sw_b;
+        float icr = ra + t * (rb - ra);
+        float icg = ga + t * (gb - ga);
+        float icb = ba + t * (bb - ba);
+
+        // Sub-sample the crossing plane at fine resolution.
+        // The two axes perpendicular to direction d define the plane.
+        // d=0 (edge along X): plane axes are Y, Z
+        // d=1 (edge along Y): plane axes are X, Z
+        // d=2 (edge along Z): plane axes are X, Y
+        for (int s0 = 0; s0 < subdiv; s0++) {
+            for (int s1 = 0; s1 < subdiv; s1++) {
+                // Offset within the coarse voxel face, in world units.
+                float off0 = ((float)s0 + 0.5f) * fine_voxel_size
+                             - 0.5f * coarse_voxel_size;
+                float off1 = ((float)s1 + 0.5f) * fine_voxel_size
+                             - 0.5f * coarse_voxel_size;
+
+                // Compute sub-sample world position.
+                float sx, sy, sz;
+                if (d == 0) {
+                    sx = cx; sy = cy + off0; sz = cz + off1;
+                } else if (d == 1) {
+                    sx = cx + off0; sy = cy; sz = cz + off1;
+                } else {
+                    sx = cx + off0; sy = cy + off1; sz = cz;
+                }
+
+                // Convert to fine voxel coordinate and check fine table.
+                float inv_fine_vs = 1.0f / fine_voxel_size;
+                int fx = (int)floor(sx * inv_fine_vs);
+                int fy = (int)floor(sy * inv_fine_vs);
+                int fz = (int)floor(sz * inv_fine_vs);
+
+                uint fine_slot = hash_lookup(fine_table, fine_mask, fx, fy, fz);
+                if (fine_slot != 0xFFFFFFFF) {
+                    // Fine table has this voxel — check if it has enough weight.
+                    float fine_sw = (float)fine_table[fine_slot].sum_weight;
+                    if (fine_sw >= min_weight_scaled) {
+                        continue;  // Fine already covers this point.
+                    }
+                }
+
+                // No fine coverage — emit this point.
+                uint out_idx = atomic_add(out_counter, 1u);
+                if (out_idx >= max_output) return;
+
+                out_points[out_idx * 3 + 0] = sx;
+                out_points[out_idx * 3 + 1] = sy;
+                out_points[out_idx * 3 + 2] = sz;
+                out_normals[out_idx * 3 + 0] = inx;
+                out_normals[out_idx * 3 + 1] = iny;
+                out_normals[out_idx * 3 + 2] = inz;
+                out_colors[out_idx * 3 + 0] = (uchar)clamp(icr, 0.0f, 255.0f);
+                out_colors[out_idx * 3 + 1] = (uchar)clamp(icg, 0.0f, 255.0f);
+                out_colors[out_idx * 3 + 2] = (uchar)clamp(icb, 0.0f, 255.0f);
+            }
+        }
+    }
+}
+)CL"
     R"CL(
 
 // =====================================================================

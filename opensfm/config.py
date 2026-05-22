@@ -498,6 +498,9 @@ class OpenSfMConfig:
     depthmap_fusion_svo_trunc_factor: float = 8
     # SVO minimum weight for extracting points
     depthmap_fusion_svo_min_weight: float = 3
+    # Number of multi-level fill passes (1=fine only, 3=fine+2 coarser).
+    # Coarser levels fill in holes where the fine grid has no coverage.
+    depthmap_fusion_svo_num_levels: int = 3
     # Maximum unique voxels per SVO sub-volume.
     # Clusters are spatially split so each piece stays within this budget.
     # The GPU hash table is sized to 2x this (50% load factor).
@@ -562,7 +565,7 @@ class OpenSfMConfig:
     # Fill small holes in the DSM via iterative nearest-neighbor dilation.
     dsm_fill_holes: bool = True
     # Maximum dilation radius (in pixels) for small-hole filling.
-    dsm_fill_max_radius: int = 3
+    dsm_fill_max_radius: int = 40
     # Use Delaunay triangulation to fill larger interior holes after dilation.
     dsm_fill_triangulate: bool = True
     # Post-process median filter radius (0 = disabled, 1 = 3x3, 2 = 5x5).

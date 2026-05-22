@@ -29,6 +29,7 @@ class SVOFuser {
   void SetTruncFactor(float factor);
   void SetMinWeight(float w);
   void SetDevice(int device_idx);
+  void SetNumLevels(int n);
   void SetBBox(const Eigen::Vector3f& min_world,
                const Eigen::Vector3f& max_world);
   static bool IsGPUAvailable();
@@ -93,6 +94,7 @@ class SVOFuser {
   float voxel_size_;
   float trunc_factor_;
   float min_weight_;
+  int num_levels_ = 1;             // Multi-level fill: 1 = fine only
   int device_idx_ = 0;             // OpenCL device index
   uint32_t last_voxel_count_ = 0;  // cached from CountVoxels()
   bool has_bbox_ = false;

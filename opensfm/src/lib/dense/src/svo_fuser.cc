@@ -26,6 +26,8 @@ void SVOFuser::SetMinWeight(float w) { min_weight_ = std::max(0.0f, w); }
 
 void SVOFuser::SetDevice(int device_idx) { device_idx_ = device_idx; }
 
+void SVOFuser::SetNumLevels(int n) { num_levels_ = std::max(1, n); }
+
 void SVOFuser::SetBBox(const Eigen::Vector3f& min_world,
                        const Eigen::Vector3f& max_world) {
   has_bbox_ = true;
@@ -343,12 +345,139 @@ void SVOFuser::ExtractPoints(std::vector<Vec3f>* fused_points,
         "SVOFuser::ExtractPoints: Fuse() must be called first");
   }
 
+  // Phase 1: Extract fine level (L=0).
   integrator_->ExtractPoints(min_weight_, voxel_size_, fused_points,
                              fused_normals, fused_colors);
-  std::cerr << "[SVOFuser] GPU ExtractPoints: " << fused_points->size()
+  std::cerr << "[SVOFuser] Fine (L=0): " << fused_points->size()
             << " surface points\n";
 
-  // Release GPU resources.
+  // Phase 2: For each coarse level, integrate lazily and extract fill.
+  if (num_levels_ > 1 && !views_.empty()) {
+    const float fine_voxel_size = voxel_size_;
+    const cl::Buffer& fine_table = integrator_->table_buffer();
+    const uint32_t fine_mask = integrator_->capacity_mask();
+
+    for (int L = 1; L < num_levels_; ++L) {
+      const int level_shift = L;
+      const float coarse_vs = fine_voxel_size * static_cast<float>(1 << L);
+      const float coarse_trunc = trunc_factor_ * coarse_vs;
+
+      std::cerr << "[SVOFuser] Coarse L=" << L << " voxel_size=" << coarse_vs
+                << " trunc=" << coarse_trunc << "\n";
+
+      // Count unique coarse voxels.
+      auto coarse_integrator = std::make_unique<SVOIntegratorCL>(device_idx_);
+
+      const float coarse_inv_vs = 1.0f / coarse_vs;
+      Eigen::Vector3i bbox_min_v, bbox_max_v;
+      if (has_bbox_) {
+        bbox_min_v = (bbox_min_world_ * coarse_inv_vs)
+                         .array()
+                         .floor()
+                         .cast<int>()
+                         .matrix();
+        bbox_max_v = (bbox_max_world_ * coarse_inv_vs)
+                         .array()
+                         .ceil()
+                         .cast<int>()
+                         .matrix();
+      }
+      const Eigen::Vector3i* bbox_min_ptr = has_bbox_ ? &bbox_min_v : nullptr;
+      const Eigen::Vector3i* bbox_max_ptr = has_bbox_ ? &bbox_max_v : nullptr;
+
+      // Count pass for coarse level.
+      // Use a rough estimate: fine count / (1<<L)^3 * 2 for safety.
+      uint32_t coarse_count_cap = static_cast<uint32_t>(
+          std::min<uint64_t>(static_cast<uint64_t>(last_voxel_count_) /
+                                     static_cast<uint64_t>(1 << (3 * L)) * 4 +
+                                 (1u << 20),
+                             std::numeric_limits<uint32_t>::max()));
+      coarse_count_cap = std::max<uint32_t>(coarse_count_cap, 1u << 20);
+      coarse_integrator->InitializeCounting(coarse_count_cap);
+
+      for (size_t vi = 0; vi < views_.size(); ++vi) {
+        const auto& sv = views_[vi];
+        const int rows = static_cast<int>(sv.depth.rows());
+        const int cols = static_cast<int>(sv.depth.cols());
+        const Mat3f Kf = sv.K.cast<float>();
+        const Mat3f Rf = sv.R.cast<float>();
+        const Vec3f tf = sv.t.cast<float>();
+        const uint8_t* mask_ptr =
+            (sv.mask.size() > 0) ? sv.mask.data() : nullptr;
+
+        coarse_integrator->Count(Kf, Rf, tf, sv.depth.data(), rows, cols,
+                                 mask_ptr, coarse_vs, coarse_trunc,
+                                 bbox_min_ptr, bbox_max_ptr);
+      }
+
+      uint32_t coarse_voxels = coarse_integrator->GetUniqueCount();
+      std::cerr << "[SVOFuser] Coarse L=" << L << " counted " << coarse_voxels
+                << " voxels\n";
+
+      if (coarse_voxels == 0) {
+        continue;
+      }
+
+      // Allocate and integrate coarse level.
+      uint32_t coarse_capacity = static_cast<uint32_t>(
+          std::min<uint64_t>(static_cast<uint64_t>(coarse_voxels) * 2,
+                             std::numeric_limits<uint32_t>::max()));
+      coarse_capacity = std::max<uint32_t>(coarse_capacity, 1u << 20);
+
+      coarse_integrator->Initialize(coarse_capacity);
+
+      for (size_t vi = 0; vi < views_.size(); ++vi) {
+        const auto& sv = views_[vi];
+        const int rows = static_cast<int>(sv.depth.rows());
+        const int cols = static_cast<int>(sv.depth.cols());
+        const Mat3f Kf = sv.K.cast<float>();
+        const Mat3f Rf = sv.R.cast<float>();
+        const Vec3f tf = sv.t.cast<float>();
+        const float* normal_ptr =
+            (sv.normal.size() > 0) ? sv.normal.data() : nullptr;
+        const uint8_t* color_ptr =
+            (sv.color.size() > 0) ? sv.color.data() : nullptr;
+        const uint8_t* mask_ptr =
+            (sv.mask.size() > 0) ? sv.mask.data() : nullptr;
+        const float* weight_ptr =
+            (sv.weight.size() > 0) ? sv.weight.data() : nullptr;
+
+        coarse_integrator->Integrate(Kf, Rf, tf, sv.depth.data(), rows, cols,
+                                     normal_ptr, color_ptr, mask_ptr,
+                                     weight_ptr, coarse_vs, coarse_trunc,
+                                     bbox_min_ptr, bbox_max_ptr);
+      }
+
+      // Extract fill: sub-sample coarse crossings, skip where fine covers.
+      std::vector<Vec3f> fill_pts, fill_nrm;
+      std::vector<Vec3<uint8_t>> fill_clr;
+
+      coarse_integrator->ExtractFill(fine_table, fine_mask, min_weight_,
+                                     coarse_vs, fine_voxel_size, level_shift,
+                                     &fill_pts, &fill_nrm, &fill_clr);
+
+      std::cerr << "[SVOFuser] Coarse L=" << L << " fill: " << fill_pts.size()
+                << " points\n";
+
+      // Append fill points to output.
+      if (!fill_pts.empty()) {
+        fused_points->insert(fused_points->end(), fill_pts.begin(),
+                             fill_pts.end());
+        fused_normals->insert(fused_normals->end(), fill_nrm.begin(),
+                              fill_nrm.end());
+        fused_colors->insert(fused_colors->end(), fill_clr.begin(),
+                             fill_clr.end());
+      }
+
+      // Release coarse GPU memory before next level.
+      coarse_integrator.reset();
+    }
+  }
+
+  std::cerr << "[SVOFuser] Total ExtractPoints: " << fused_points->size()
+            << " surface points (fine + fill)\n";
+
+  // Release fine GPU resources.
   integrator_.reset();
 }
 

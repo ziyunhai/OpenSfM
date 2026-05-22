@@ -38,6 +38,9 @@ void SVOIntegratorCL::BuildKernels() {
   k_extract_ = cl::Kernel(program_, "svo_extract_points", &err);
   opencl::CheckCL(err, "kernel svo_extract_points");
 
+  k_extract_fill_ = cl::Kernel(program_, "svo_extract_fill", &err);
+  opencl::CheckCL(err, "kernel svo_extract_fill");
+
   k_refine_clear_ = cl::Kernel(program_, "svo_refine_clear", &err);
   opencl::CheckCL(err, "kernel svo_refine_clear");
 
@@ -695,6 +698,121 @@ void SVOIntegratorCL::ExtractPoints(float min_weight, float voxel_size,
   queue.finish();
 
   // Convert to output vectors.
+  points->resize(n_points);
+  normals->resize(n_points);
+  colors->resize(n_points);
+
+  for (uint32_t i = 0; i < n_points; ++i) {
+    (*points)[i] =
+        Vec3f(host_pts[i * 3], host_pts[i * 3 + 1], host_pts[i * 3 + 2]);
+    (*normals)[i] =
+        Vec3f(host_nrm[i * 3], host_nrm[i * 3 + 1], host_nrm[i * 3 + 2]);
+    (*colors)[i] = Vec3<uint8_t>(host_clr[i * 3], host_clr[i * 3 + 1],
+                                 host_clr[i * 3 + 2]);
+  }
+}
+
+// ── Multi-level fill extraction ───────────────────────────────────────
+
+void SVOIntegratorCL::ExtractFill(const cl::Buffer& fine_table,
+                                  uint32_t fine_mask, float min_weight,
+                                  float coarse_voxel_size,
+                                  float fine_voxel_size, int level_shift,
+                                  std::vector<Vec3f>* points,
+                                  std::vector<Vec3f>* normals,
+                                  std::vector<Vec3<uint8_t>>* colors) {
+  points->clear();
+  normals->clear();
+  colors->clear();
+
+  if (capacity_ == 0) {
+    return;
+  }
+
+  auto& dev = opencl::CLContext::Instance().Device(device_idx_);
+  auto& ctx = dev.context();
+  auto& queue = dev.queue();
+
+  // Budget: each coarse crossing can emit up to (1<<level_shift)^2 * 3 points.
+  // Use capacity/4 as a safe upper bound (same heuristic as ExtractPoints).
+  const size_t max_alloc = dev.device().getInfo<CL_DEVICE_MAX_MEM_ALLOC_SIZE>();
+  const uint32_t mem_limit_pts = static_cast<uint32_t>(std::min<size_t>(
+      max_alloc / (3 * sizeof(float)), std::numeric_limits<uint32_t>::max()));
+  const uint32_t max_output = std::min(capacity_ / 4, mem_limit_pts);
+
+  const size_t pts_bytes = static_cast<size_t>(max_output) * 3 * sizeof(float);
+  const size_t clr_bytes =
+      static_cast<size_t>(max_output) * 3 * sizeof(uint8_t);
+
+  std::cerr << "[SVOIntegratorCL] ExtractFill L" << level_shift
+            << ": max_output=" << max_output << " ("
+            << ((pts_bytes * 2 + clr_bytes) >> 20) << " MB buffers)\n";
+
+  cl_int err;
+  cl::Buffer cl_out_pts(ctx, CL_MEM_WRITE_ONLY, pts_bytes, nullptr, &err);
+  opencl::CheckCL(err, "extract_fill points buffer");
+  cl::Buffer cl_out_nrm(ctx, CL_MEM_WRITE_ONLY, pts_bytes, nullptr, &err);
+  opencl::CheckCL(err, "extract_fill normals buffer");
+  cl::Buffer cl_out_clr(ctx, CL_MEM_WRITE_ONLY, clr_bytes, nullptr, &err);
+  opencl::CheckCL(err, "extract_fill colors buffer");
+  cl::Buffer cl_out_counter(ctx, CL_MEM_READ_WRITE, sizeof(uint32_t), nullptr,
+                            &err);
+  opencl::CheckCL(err, "extract_fill counter buffer");
+
+  uint32_t zero = 0;
+  queue.enqueueWriteBuffer(cl_out_counter, CL_TRUE, 0, sizeof(uint32_t), &zero);
+
+  const float min_weight_scaled = min_weight * kWeightScale;
+
+  int arg = 0;
+  k_extract_fill_.setArg(arg++, cl_table_);
+  k_extract_fill_.setArg(arg++, capacity_mask_);
+  k_extract_fill_.setArg(arg++, capacity_);
+  k_extract_fill_.setArg(arg++, fine_table);
+  k_extract_fill_.setArg(arg++, fine_mask);
+  k_extract_fill_.setArg(arg++, min_weight_scaled);
+  k_extract_fill_.setArg(arg++, coarse_voxel_size);
+  k_extract_fill_.setArg(arg++, fine_voxel_size);
+  k_extract_fill_.setArg(arg++, level_shift);
+  k_extract_fill_.setArg(arg++, cl_out_pts);
+  k_extract_fill_.setArg(arg++, cl_out_nrm);
+  k_extract_fill_.setArg(arg++, cl_out_clr);
+  k_extract_fill_.setArg(arg++, cl_out_counter);
+  k_extract_fill_.setArg(arg++, max_output);
+
+  const size_t global = ((static_cast<size_t>(capacity_) + 255u) / 256u) * 256u;
+  queue.enqueueNDRangeKernel(k_extract_fill_, cl::NullRange,
+                             cl::NDRange(global), cl::NDRange(256));
+  queue.finish();
+
+  uint32_t n_points = 0;
+  queue.enqueueReadBuffer(cl_out_counter, CL_TRUE, 0, sizeof(uint32_t),
+                          &n_points);
+  if (n_points > max_output) {
+    std::cerr << "[SVOIntegratorCL] Warning: extract_fill buffer overflow, "
+              << n_points << " > " << max_output << ". Clamping.\n";
+    n_points = max_output;
+  }
+
+  std::cerr << "[SVOIntegratorCL] GPU extract_fill L" << level_shift << ": "
+            << n_points << " fill points\n";
+
+  if (n_points == 0) {
+    return;
+  }
+
+  const size_t read_pts = static_cast<size_t>(n_points) * 3 * sizeof(float);
+  const size_t read_clr = static_cast<size_t>(n_points) * 3 * sizeof(uint8_t);
+
+  std::vector<float> host_pts(n_points * 3);
+  std::vector<float> host_nrm(n_points * 3);
+  std::vector<uint8_t> host_clr(n_points * 3);
+
+  queue.enqueueReadBuffer(cl_out_pts, CL_FALSE, 0, read_pts, host_pts.data());
+  queue.enqueueReadBuffer(cl_out_nrm, CL_FALSE, 0, read_pts, host_nrm.data());
+  queue.enqueueReadBuffer(cl_out_clr, CL_FALSE, 0, read_clr, host_clr.data());
+  queue.finish();
+
   points->resize(n_points);
   normals->resize(n_points);
   colors->resize(n_points);
