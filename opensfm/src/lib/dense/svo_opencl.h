@@ -65,15 +65,26 @@ class SVOIntegratorCL {
   // Allocate the GPU hash table.  |capacity| is rounded up to next power of 2.
   void Initialize(uint32_t capacity);
 
+  // Reference table info for multi-level coverage check during integration.
+  struct RefTableInfo {
+    cl::Buffer buffer;
+    uint32_t mask;
+    float inv_voxel_size;
+  };
+
   // Integrate a single depthmap into the hash table on device.
   // Optional bbox_min/bbox_max clip integration to a sub-volume
   // (voxel integer coordinates).
+  // Optional ref_tables: if provided, pixels covered by finer levels are
+  // skipped.
   void Integrate(const Mat3f& K, const Mat3f& R, const Vec3f& t,
                  const float* depth, int rows, int cols, const float* normal,
                  const uint8_t* color, const uint8_t* mask, const float* weight,
                  float voxel_size, float trunc_dist,
                  const Eigen::Vector3i* bbox_min = nullptr,
-                 const Eigen::Vector3i* bbox_max = nullptr);
+                 const Eigen::Vector3i* bbox_max = nullptr,
+                 const std::vector<RefTableInfo>* ref_tables = nullptr,
+                 float ref_min_weight = 0.0f);
 
   // Download the GPU hash table and convert to a CPU-side VoxelMap.
   VoxelMap Download() const;

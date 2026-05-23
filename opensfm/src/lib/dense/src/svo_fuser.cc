@@ -168,7 +168,8 @@ void SVOFuser::Fuse() {
 
     integrator_->Integrate(Kf, Rf, tf, sv.depth.data(), rows, cols, normal_ptr,
                            color_ptr, mask_ptr, weight_ptr, voxel_size_,
-                           trunc_dist, bbox_min_ptr, bbox_max_ptr);
+                           trunc_dist, bbox_min_ptr, bbox_max_ptr, nullptr,
+                           0.0f);
   }
 
   // Check for overflow (dropped contributions due to hash table exhaustion).
@@ -351,11 +352,14 @@ void SVOFuser::ExtractPoints(std::vector<Vec3f>* fused_points,
   std::cerr << "[SVOFuser] Fine (L=0): " << fused_points->size()
             << " surface points\n";
 
-  // Phase 2: For each coarse level, integrate lazily and extract fill.
+  // Phase 2: Integrate all coarse levels with coverage check, then extract.
   if (num_levels_ > 1 && !views_.empty()) {
     const float fine_voxel_size = voxel_size_;
     const cl::Buffer& fine_table = integrator_->table_buffer();
     const uint32_t fine_mask = integrator_->capacity_mask();
+
+    // Keep all coarse integrators alive for cross-level reference checks.
+    std::vector<std::unique_ptr<SVOIntegratorCL>> coarse_integrators;
 
     for (int L = 1; L < num_levels_; ++L) {
       const int level_shift = L;
@@ -365,7 +369,6 @@ void SVOFuser::ExtractPoints(std::vector<Vec3f>* fused_points,
       std::cerr << "[SVOFuser] Coarse L=" << L << " voxel_size=" << coarse_vs
                 << " trunc=" << coarse_trunc << "\n";
 
-      // Count unique coarse voxels.
       auto coarse_integrator = std::make_unique<SVOIntegratorCL>(device_idx_);
 
       const float coarse_inv_vs = 1.0f / coarse_vs;
@@ -386,7 +389,6 @@ void SVOFuser::ExtractPoints(std::vector<Vec3f>* fused_points,
       const Eigen::Vector3i* bbox_max_ptr = has_bbox_ ? &bbox_max_v : nullptr;
 
       // Count pass for coarse level.
-      // Use a rough estimate: fine count / (1<<L)^3 * 2 for safety.
       uint32_t coarse_count_cap = static_cast<uint32_t>(
           std::min<uint64_t>(static_cast<uint64_t>(last_voxel_count_) /
                                      static_cast<uint64_t>(1 << (3 * L)) * 4 +
@@ -418,13 +420,23 @@ void SVOFuser::ExtractPoints(std::vector<Vec3f>* fused_points,
         continue;
       }
 
-      // Allocate and integrate coarse level.
+      // Allocate and integrate coarse level with reference check.
       uint32_t coarse_capacity = static_cast<uint32_t>(
           std::min<uint64_t>(static_cast<uint64_t>(coarse_voxels) * 2,
                              std::numeric_limits<uint32_t>::max()));
       coarse_capacity = std::max<uint32_t>(coarse_capacity, 1u << 20);
 
       coarse_integrator->Initialize(coarse_capacity);
+
+      // Build reference table list: fine (L=0) + all previous coarse levels.
+      std::vector<SVOIntegratorCL::RefTableInfo> ref_tables;
+      ref_tables.push_back({fine_table, fine_mask, 1.0f / fine_voxel_size});
+      for (size_t prev = 0; prev < coarse_integrators.size(); ++prev) {
+        auto& prev_int = coarse_integrators[prev];
+        float prev_vs = fine_voxel_size * static_cast<float>(1 << (prev + 1));
+        ref_tables.push_back({prev_int->table_buffer(),
+                              prev_int->capacity_mask(), 1.0f / prev_vs});
+      }
 
       for (size_t vi = 0; vi < views_.size(); ++vi) {
         const auto& sv = views_[vi];
@@ -442,24 +454,32 @@ void SVOFuser::ExtractPoints(std::vector<Vec3f>* fused_points,
         const float* weight_ptr =
             (sv.weight.size() > 0) ? sv.weight.data() : nullptr;
 
-        coarse_integrator->Integrate(Kf, Rf, tf, sv.depth.data(), rows, cols,
-                                     normal_ptr, color_ptr, mask_ptr,
-                                     weight_ptr, coarse_vs, coarse_trunc,
-                                     bbox_min_ptr, bbox_max_ptr);
+        coarse_integrator->Integrate(
+            Kf, Rf, tf, sv.depth.data(), rows, cols, normal_ptr, color_ptr,
+            mask_ptr, weight_ptr, coarse_vs, coarse_trunc, bbox_min_ptr,
+            bbox_max_ptr, &ref_tables, min_weight_);
       }
 
-      // Extract fill: sub-sample coarse crossings, skip where fine covers.
+      // Keep this integrator alive for future levels to reference.
+      coarse_integrators.push_back(std::move(coarse_integrator));
+    }
+
+    // Extract fill from each coarse level against fine table.
+    for (int L = 1; L <= static_cast<int>(coarse_integrators.size()); ++L) {
+      auto& coarse_int = coarse_integrators[L - 1];
+      const float coarse_vs = fine_voxel_size * static_cast<float>(1 << L);
+      const float coarse_min_weight = min_weight_ * static_cast<float>(1 << L);
+
       std::vector<Vec3f> fill_pts, fill_nrm;
       std::vector<Vec3<uint8_t>> fill_clr;
 
-      coarse_integrator->ExtractFill(fine_table, fine_mask, min_weight_,
-                                     coarse_vs, fine_voxel_size, level_shift,
-                                     &fill_pts, &fill_nrm, &fill_clr);
+      coarse_int->ExtractFill(fine_table, fine_mask, coarse_min_weight,
+                              coarse_vs, fine_voxel_size, L, &fill_pts,
+                              &fill_nrm, &fill_clr);
 
       std::cerr << "[SVOFuser] Coarse L=" << L << " fill: " << fill_pts.size()
                 << " points\n";
 
-      // Append fill points to output.
       if (!fill_pts.empty()) {
         fused_points->insert(fused_points->end(), fill_pts.begin(),
                              fill_pts.end());
@@ -468,10 +488,10 @@ void SVOFuser::ExtractPoints(std::vector<Vec3f>* fused_points,
         fused_colors->insert(fused_colors->end(), fill_clr.begin(),
                              fill_clr.end());
       }
-
-      // Release coarse GPU memory before next level.
-      coarse_integrator.reset();
     }
+
+    // Release all coarse integrators.
+    coarse_integrators.clear();
   }
 
   std::cerr << "[SVOFuser] Total ExtractPoints: " << fused_points->size()

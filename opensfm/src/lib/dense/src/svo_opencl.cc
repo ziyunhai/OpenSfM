@@ -205,7 +205,9 @@ void SVOIntegratorCL::Integrate(const Mat3f& K, const Mat3f& R, const Vec3f& t,
                                 const uint8_t* mask, const float* weight,
                                 float voxel_size, float trunc_dist,
                                 const Eigen::Vector3i* bbox_min,
-                                const Eigen::Vector3i* bbox_max) {
+                                const Eigen::Vector3i* bbox_max,
+                                const std::vector<RefTableInfo>* ref_tables,
+                                float ref_min_weight) {
   if (capacity_ == 0) {
     throw std::runtime_error("SVOIntegratorCL: Initialize() not called");
   }
@@ -299,6 +301,34 @@ void SVOIntegratorCL::Integrate(const Mat3f& K, const Mat3f& R, const Vec3f& t,
   k_integrate_.setArg(arg++,
                       static_cast<cl_int>(has_bbox ? (*bbox_max).z() : 0));
   k_integrate_.setArg(arg++, static_cast<cl_int>(has_bbox ? 1 : 0));
+
+  // Multi-level reference table check arguments.
+  const int n_ref =
+      ref_tables ? static_cast<int>(std::min(ref_tables->size(), size_t(2)))
+                 : 0;
+  k_integrate_.setArg(arg++, static_cast<cl_int>(n_ref));
+
+  if (n_ref >= 1) {
+    k_integrate_.setArg(arg++, (*ref_tables)[0].buffer);
+    k_integrate_.setArg(arg++, (*ref_tables)[0].mask);
+    k_integrate_.setArg(arg++, (*ref_tables)[0].inv_voxel_size);
+  } else {
+    k_integrate_.setArg(arg++, cl_dummy_);
+    k_integrate_.setArg(arg++, static_cast<cl_uint>(0));
+    k_integrate_.setArg(arg++, 1.0f);
+  }
+
+  if (n_ref >= 2) {
+    k_integrate_.setArg(arg++, (*ref_tables)[1].buffer);
+    k_integrate_.setArg(arg++, (*ref_tables)[1].mask);
+    k_integrate_.setArg(arg++, (*ref_tables)[1].inv_voxel_size);
+  } else {
+    k_integrate_.setArg(arg++, cl_dummy_);
+    k_integrate_.setArg(arg++, static_cast<cl_uint>(0));
+    k_integrate_.setArg(arg++, 1.0f);
+  }
+
+  k_integrate_.setArg(arg++, static_cast<float>(ref_min_weight * kWeightScale));
 
   // Launch: one work-item per pixel.
   cl::NDRange global(static_cast<size_t>((cols + 15) / 16 * 16),

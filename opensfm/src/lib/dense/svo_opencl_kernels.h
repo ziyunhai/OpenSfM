@@ -191,9 +191,15 @@ __kernel void svo_clear_table(__global VoxelSlot* table, uint capacity) {
 
 #define COS_THETA_MIN 0.15f   // ~81° — skip pixels at more grazing angles
 
+// Forward declaration (defined after svo_extract_points).
+uint hash_lookup(__global const VoxelSlot* table, uint mask,
+                 int kx, int ky, int kz);
+
 // =====================================================================
 // Integrate one depthmap into the hash table.
 // Global work size: (cols_padded, rows_padded).
+// Supports optional multi-level reference check: if a finer level already
+// has a well-weighted voxel at the pixel's depth position, skip integration.
 // =====================================================================
 __kernel void svo_integrate(
     __global VoxelSlot*    table,
@@ -220,7 +226,16 @@ __kernel void svo_integrate(
     int                    bbox_max_x,
     int                    bbox_max_y,
     int                    bbox_max_z,
-    int                    has_bbox)
+    int                    has_bbox,
+    // --- Multi-level reference check (up to 2 finer tables) ---
+    int                    n_ref_tables,
+    __global const VoxelSlot* ref_table_0,
+    uint                   ref_mask_0,
+    float                  ref_inv_vs_0,
+    __global const VoxelSlot* ref_table_1,
+    uint                   ref_mask_1,
+    float                  ref_inv_vs_1,
+    float                  ref_min_weight)
 {
     int c = get_global_id(0);
     int r = get_global_id(1);
@@ -249,6 +264,28 @@ __kernel void svo_integrate(
     p_world.x = cam->Rinv[0]*diff.x + cam->Rinv[1]*diff.y + cam->Rinv[2]*diff.z;
     p_world.y = cam->Rinv[3]*diff.x + cam->Rinv[4]*diff.y + cam->Rinv[5]*diff.z;
     p_world.z = cam->Rinv[6]*diff.x + cam->Rinv[7]*diff.y + cam->Rinv[8]*diff.z;
+
+    // ---- Multi-level coverage check: skip if finer levels already cover ----
+    if (n_ref_tables > 0) {
+        int ref_kx_0 = (int)floor(p_world.x * ref_inv_vs_0);
+        int ref_ky_0 = (int)floor(p_world.y * ref_inv_vs_0);
+        int ref_kz_0 = (int)floor(p_world.z * ref_inv_vs_0);
+        uint ref_slot_0 = hash_lookup(ref_table_0, ref_mask_0, ref_kx_0, ref_ky_0, ref_kz_0);
+        if (ref_slot_0 != 0xFFFFFFFF) {
+            float ref_sw_0 = (float)ref_table_0[ref_slot_0].sum_weight;
+            if (ref_sw_0 >= ref_min_weight) return;
+        }
+        if (n_ref_tables > 1) {
+            int ref_kx_1 = (int)floor(p_world.x * ref_inv_vs_1);
+            int ref_ky_1 = (int)floor(p_world.y * ref_inv_vs_1);
+            int ref_kz_1 = (int)floor(p_world.z * ref_inv_vs_1);
+            uint ref_slot_1 = hash_lookup(ref_table_1, ref_mask_1, ref_kx_1, ref_ky_1, ref_kz_1);
+            if (ref_slot_1 != 0xFFFFFFFF) {
+                float ref_sw_1 = (float)ref_table_1[ref_slot_1].sum_weight;
+                if (ref_sw_1 >= ref_min_weight) return;
+            }
+        }
+    }
 
     // ---- Ray from camera centre to surface point ----
     float3 cp = (float3)(cam->cam_pos[0], cam->cam_pos[1], cam->cam_pos[2]);
