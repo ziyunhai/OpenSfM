@@ -513,7 +513,7 @@ class OpenSfMConfig:
     # Local adaptive weight threshold (0=disabled). A crossing is only
     # extracted if both voxels have weight >= this fraction of the local
     # 6-neighborhood maximum weight. Allows weak areas to self-calibrate.
-    depthmap_fusion_svo_relative_min_weight: float = 0.5
+    depthmap_fusion_svo_relative_min_weight: float = 0.25
     # Maximum unique voxels per SVO sub-volume.
     # Clusters are spatially split so each piece stays within this budget.
     # The GPU hash table is sized to 2x this (50% load factor).
@@ -526,15 +526,13 @@ class OpenSfMConfig:
     depthmap_fusion_svo_coarse_factor: int = 8
     # Relative margin added to each side of the per-cluster bounding box
     depthmap_cluster_bbox_margin: float = 0.01
-    # Photometric TSDF refinement (Zollhöfer 2015 / Pons-Keriven 2007).
-    # Enable in-place SDF+color refinement after SVO fusion.
-    depthmap_fusion_svo_refine_enabled: bool = False
-    # Number of color-only refinement iterations (phase 1).
-    depthmap_fusion_svo_refine_color_iters: int = 20
-    # Number of joint SDF+color iterations (phase 2).
-    depthmap_fusion_svo_refine_joint_iters: int = 30
-    # Initial Laplacian regularization weight (decayed ×0.95/iter).
-    depthmap_fusion_svo_refine_lambda_reg: float = 0.01
+    # Photometric TSDF refinement (Pons-Keriven 2007 level-set).
+    # Enable in-place SDF refinement after SVO fusion.
+    depthmap_fusion_svo_refine_enabled: bool = True
+    # Number of SDF refinement iterations.
+    depthmap_fusion_svo_refine_iters: int = 20
+    # Laplacian regularization weight (0 = disabled).
+    depthmap_fusion_svo_refine_lambda_reg: float = 0.0
     # Visibility-based pruning of TSDF voxels (removes foreground smear).
     # Enable raycast-vote-prune passes after SVO fusion.
     depthmap_fusion_svo_prune_enabled: bool = False

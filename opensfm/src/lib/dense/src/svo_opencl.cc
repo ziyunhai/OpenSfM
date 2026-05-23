@@ -50,6 +50,12 @@ void SVOIntegratorCL::BuildKernels() {
   k_refine_update_ = cl::Kernel(program_, "svo_refine_update", &err);
   opencl::CheckCL(err, "kernel svo_refine_update");
 
+  k_bake_colors_ = cl::Kernel(program_, "svo_bake_colors", &err);
+  opencl::CheckCL(err, "kernel svo_bake_colors");
+
+  k_raycast_guided_ = cl::Kernel(program_, "svo_raycast_guided", &err);
+  opencl::CheckCL(err, "kernel svo_raycast_guided");
+
   k_raycast_ = cl::Kernel(program_, "svo_raycast", &err);
   opencl::CheckCL(err, "kernel svo_raycast");
 
@@ -146,8 +152,7 @@ void SVOIntegratorCL::Initialize(uint32_t capacity) {
 }
 
 void SVOIntegratorCL::EnsureFrameBuffers(int rows, int cols, bool has_normal,
-                                         bool has_color, bool has_mask,
-                                         bool has_weight) {
+                                         bool has_mask, bool has_weight) {
   auto& ctx = opencl::CLContext::Instance().Device(device_idx_).context();
   cl_int err;
   const size_t npix = static_cast<size_t>(rows) * cols;
@@ -164,14 +169,6 @@ void SVOIntegratorCL::EnsureFrameBuffers(int rows, int cols, bool has_normal,
       cl_normal_ = cl::Buffer(ctx, CL_MEM_READ_ONLY, n_bytes, nullptr, &err);
       opencl::CheckCL(err, "normal buffer");
       normal_bytes_ = n_bytes;
-    }
-  }
-  if (has_color) {
-    const size_t c_bytes = npix * 3 * sizeof(uint8_t);
-    if (c_bytes > color_bytes_) {
-      cl_color_ = cl::Buffer(ctx, CL_MEM_READ_ONLY, c_bytes, nullptr, &err);
-      opencl::CheckCL(err, "color buffer");
-      color_bytes_ = c_bytes;
     }
   }
   if (has_mask) {
@@ -211,16 +208,16 @@ void SVOIntegratorCL::Integrate(const Mat3f& K, const Mat3f& R, const Vec3f& t,
   if (capacity_ == 0) {
     throw std::runtime_error("SVOIntegratorCL: Initialize() not called");
   }
+  (void)color;  // Color no longer integrated; baked separately.
 
   auto& dev = opencl::CLContext::Instance().Device(device_idx_);
   auto& queue = dev.queue();
 
   const bool has_normal = (normal != nullptr);
-  const bool has_color = (color != nullptr);
   const bool has_mask = (mask != nullptr);
   const bool has_weight = (weight != nullptr);
 
-  EnsureFrameBuffers(rows, cols, has_normal, has_color, has_mask, has_weight);
+  EnsureFrameBuffers(rows, cols, has_normal, has_mask, has_weight);
 
   const size_t npix = static_cast<size_t>(rows) * cols;
 
@@ -230,10 +227,6 @@ void SVOIntegratorCL::Integrate(const Mat3f& K, const Mat3f& R, const Vec3f& t,
   if (has_normal) {
     queue.enqueueWriteBuffer(cl_normal_, CL_FALSE, 0, npix * 3 * sizeof(float),
                              normal);
-  }
-  if (has_color) {
-    queue.enqueueWriteBuffer(cl_color_, CL_FALSE, 0, npix * 3 * sizeof(uint8_t),
-                             color);
   }
   if (has_mask) {
     queue.enqueueWriteBuffer(cl_mask_, CL_FALSE, 0, npix * sizeof(uint8_t),
@@ -272,11 +265,9 @@ void SVOIntegratorCL::Integrate(const Mat3f& K, const Mat3f& R, const Vec3f& t,
   k_integrate_.setArg(arg++, cl_overflow_);
   k_integrate_.setArg(arg++, cl_depth_);
   k_integrate_.setArg(arg++, has_normal ? cl_normal_ : cl_dummy_);
-  k_integrate_.setArg(arg++, has_color ? cl_color_ : cl_dummy_);
   k_integrate_.setArg(arg++, has_mask ? cl_mask_ : cl_dummy_);
   k_integrate_.setArg(arg++, has_weight ? cl_weight_ : cl_dummy_);
   k_integrate_.setArg(arg++, static_cast<cl_int>(has_normal));
-  k_integrate_.setArg(arg++, static_cast<cl_int>(has_color));
   k_integrate_.setArg(arg++, static_cast<cl_int>(has_mask));
   k_integrate_.setArg(arg++, static_cast<cl_int>(has_weight));
   k_integrate_.setArg(arg++, cl_camera_);
@@ -427,8 +418,8 @@ void SVOIntegratorCL::Count(const Mat3f& K, const Mat3f& R, const Vec3f& t,
 
   const bool has_mask = (mask != nullptr);
   // Reuse the depth/mask frame buffers from the integration path.
-  EnsureFrameBuffers(rows, cols, /*has_normal=*/false, /*has_color=*/false,
-                     has_mask, /*has_weight=*/false);
+  EnsureFrameBuffers(rows, cols, /*has_normal=*/false, has_mask,
+                     /*has_weight=*/false);
 
   const size_t npix = static_cast<size_t>(rows) * cols;
 
@@ -574,9 +565,6 @@ VoxelMap SVOIntegratorCL::Download() const {
     const float avg_nx = static_cast<float>(slot.sum_nx) * inv_fp_sw;
     const float avg_ny = static_cast<float>(slot.sum_ny) * inv_fp_sw;
     const float avg_nz = static_cast<float>(slot.sum_nz) * inv_fp_sw;
-    const float avg_r = static_cast<float>(slot.sum_r) * inv_sw;
-    const float avg_g = static_cast<float>(slot.sum_g) * inv_sw;
-    const float avg_b = static_cast<float>(slot.sum_b) * inv_sw;
 
     SVOVoxel v;
     v.tsdf = PackSnorm16(std::clamp(avg_tsdf, -1.0f, 1.0f));
@@ -587,9 +575,10 @@ VoxelMap SVOIntegratorCL::Download() const {
     v.nx = PackSnorm16(std::clamp(avg_nx, -1.0f, 1.0f));
     v.ny = PackSnorm16(std::clamp(avg_ny, -1.0f, 1.0f));
     v.nz = PackSnorm16(std::clamp(avg_nz, -1.0f, 1.0f));
-    v.r = static_cast<uint8_t>(std::clamp(avg_r, 0.0f, 255.0f));
-    v.g = static_cast<uint8_t>(std::clamp(avg_g, 0.0f, 255.0f));
-    v.b = static_cast<uint8_t>(std::clamp(avg_b, 0.0f, 255.0f));
+    // Color is baked separately via svo_bake_colors; store gray placeholder.
+    v.r = 128;
+    v.g = 128;
+    v.b = 128;
 
     VoxelCoord coord{kx, ky, kz};
     auto [it, inserted] = voxels.try_emplace(coord, v);
@@ -869,8 +858,8 @@ void SVOIntegratorCL::ExtractFill(const cl::Buffer& fine_table,
 void SVOIntegratorCL::PrepareRefinement(
     const std::vector<SVOCameraGPU>& cameras,
     const std::vector<uint8_t>& packed_colors,
-    const std::vector<float>& packed_depths,
-    const std::vector<ImageDesc>& image_descs, int n_views) {
+    const std::vector<float>& packed_depths, int img_width, int img_height,
+    int n_views) {
   if (capacity_ == 0) {
     throw std::runtime_error(
         "SVOIntegratorCL::PrepareRefinement: Initialize() + Integrate() "
@@ -883,32 +872,53 @@ void SVOIntegratorCL::PrepareRefinement(
   cl_int err;
 
   n_refine_views_ = n_views;
+  refine_img_width_ = img_width;
+  refine_img_height_ = img_height;
 
-  // Allocate gradient and Adam buffers.
-  const size_t grad_bytes = static_cast<size_t>(capacity_) * 4 * sizeof(float);
-  const size_t adam_bytes = static_cast<size_t>(capacity_) * 8 * sizeof(float);
+  // Allocate gradient buffer: 1 float per slot.
+  const size_t grad_bytes = static_cast<size_t>(capacity_) * sizeof(float);
   cl_refine_grad_ =
       cl::Buffer(ctx, CL_MEM_READ_WRITE, grad_bytes, nullptr, &err);
   opencl::CheckCL(err, "refine grad buffer");
+
+  // Allocate Adam buffer: 2 floats per slot (m_d, v_d).
+  const size_t adam_bytes = static_cast<size_t>(capacity_) * 2 * sizeof(float);
   cl_refine_adam_ =
       cl::Buffer(ctx, CL_MEM_READ_WRITE, adam_bytes, nullptr, &err);
   opencl::CheckCL(err, "refine adam buffer");
 
-  // Upload packed color images.
-  const size_t color_bytes = packed_colors.size() * sizeof(uint8_t);
-  cl_color_images_ =
-      cl::Buffer(ctx, CL_MEM_READ_ONLY, color_bytes, nullptr, &err);
-  opencl::CheckCL(err, "refine color images buffer");
-  queue.enqueueWriteBuffer(cl_color_images_, CL_FALSE, 0, color_bytes,
-                           packed_colors.data());
+  // Upload color images as image2d_array_t (CL_RGBA CL_UNORM_INT8).
+  // Input packed_colors is RGB (3 bytes/pixel); we need to expand to RGBA (4).
+  const size_t npix = static_cast<size_t>(img_width) * img_height;
+  std::vector<uint8_t> rgba_data(npix * 4 * n_views);
+  for (int v = 0; v < n_views; ++v) {
+    const uint8_t* src = packed_colors.data() + v * npix * 3;
+    uint8_t* dst = rgba_data.data() + v * npix * 4;
+    for (size_t p = 0; p < npix; ++p) {
+      dst[p * 4 + 0] = src[p * 3 + 0];
+      dst[p * 4 + 1] = src[p * 3 + 1];
+      dst[p * 4 + 2] = src[p * 3 + 2];
+      dst[p * 4 + 3] = 255;
+    }
+  }
 
-  // Upload packed depth maps.
-  const size_t depth_bytes = packed_depths.size() * sizeof(float);
-  cl_depth_images_ =
-      cl::Buffer(ctx, CL_MEM_READ_ONLY, depth_bytes, nullptr, &err);
-  opencl::CheckCL(err, "refine depth images buffer");
-  queue.enqueueWriteBuffer(cl_depth_images_, CL_FALSE, 0, depth_bytes,
-                           packed_depths.data());
+  cl::ImageFormat color_fmt(CL_RGBA, CL_UNORM_INT8);
+  cl_color_images_ = cl::Image2DArray(
+      ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, color_fmt,
+      static_cast<size_t>(n_views), static_cast<size_t>(img_width),
+      static_cast<size_t>(img_height), 0, 0, rgba_data.data(), &err);
+  opencl::CheckCL(err, "refine color image2d_array");
+
+  // Allocate TSDF-rendered depth image array, pre-filled with clean depths.
+  // The clean depths serve as initial hints for guided narrow-band raycast,
+  // avoiding blind marching from 0.1→100m (~2000 steps vs ~12 steps).
+  cl::ImageFormat depth_fmt(CL_R, CL_FLOAT);
+  cl_tsdf_depths_ = cl::Image2DArray(
+      ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, depth_fmt,
+      static_cast<size_t>(n_views), static_cast<size_t>(img_width),
+      static_cast<size_t>(img_height), 0, 0,
+      const_cast<float*>(packed_depths.data()), &err);
+  opencl::CheckCL(err, "refine tsdf depth image2d_array");
 
   // Upload camera array.
   const size_t cam_bytes = static_cast<size_t>(n_views) * sizeof(SVOCameraGPU);
@@ -917,14 +927,6 @@ void SVOIntegratorCL::PrepareRefinement(
   opencl::CheckCL(err, "refine cameras buffer");
   queue.enqueueWriteBuffer(cl_cameras_array_, CL_FALSE, 0, cam_bytes,
                            cameras.data());
-
-  // Upload image descriptors.
-  const size_t desc_bytes = static_cast<size_t>(n_views) * sizeof(ImageDesc);
-  cl_image_descs_ =
-      cl::Buffer(ctx, CL_MEM_READ_ONLY, desc_bytes, nullptr, &err);
-  opencl::CheckCL(err, "refine image descs buffer");
-  queue.enqueueWriteBuffer(cl_image_descs_, CL_FALSE, 0, desc_bytes,
-                           image_descs.data());
 
   // Clear gradient and Adam buffers.
   queue.finish();
@@ -940,85 +942,210 @@ void SVOIntegratorCL::PrepareRefinement(
     queue.finish();
   }
 
-  std::cerr << "[SVOIntegratorCL] PrepareRefinement: " << n_views << " views, "
-            << (color_bytes >> 20) << " MB colors, " << (depth_bytes >> 20)
-            << " MB depths, " << ((grad_bytes + adam_bytes) >> 20)
-            << " MB grad+adam\n";
+  std::cerr << "[SVOIntegratorCL] PrepareRefinement: " << n_views << " views ("
+            << img_width << "x" << img_height << "), "
+            << ((grad_bytes + adam_bytes) >> 20) << " MB grad+adam\n";
 
   refine_prepared_ = true;
 }
 
-void SVOIntegratorCL::Refine(int color_iters, int joint_iters, float lambda_reg,
-                             float lambda_decay, float voxel_size,
-                             float trunc_dist, float min_weight) {
+void SVOIntegratorCL::RefineGeometry(int iters, float lambda_reg,
+                                     float voxel_size, float trunc_dist,
+                                     float min_weight) {
   if (!refine_prepared_) {
     throw std::runtime_error(
-        "SVOIntegratorCL::Refine: PrepareRefinement() not called");
+        "SVOIntegratorCL::RefineGeometry: PrepareRefinement() not called");
   }
 
   auto& dev = opencl::CLContext::Instance().Device(device_idx_);
+  auto& ctx = dev.context();
   auto& queue = dev.queue();
+  cl_int err;
+
+  refine_voxel_size_ = voxel_size;
+  refine_min_weight_ = min_weight;
 
   const float inv_voxel_size = 1.0f / voxel_size;
   const float min_weight_scaled = min_weight * kWeightScale;
-  const float lr_sdf = 10.f * voxel_size;
-  const float lr_color = 0.3f;
+  const float lr_sdf = 10.0f * voxel_size;
   const float beta1 = 0.9f;
   const float beta2 = 0.999f;
   const float epsilon = 1e-8f;
+  const int half_patch = 3;
+  const float inv_sigma_s2 = -0.5f;    // sigma_spatial = 1 px
+  const float inv_sigma_c2 = -325.0f;  // sigma_color = 10/255 ≈ 0.039
 
-  const int total_iters = color_iters + joint_iters;
-  float cur_lambda = lambda_reg;
-
-  // Find max image dimensions for dispatch sizing.
-  // Read back image descs to find max width/height.
-  std::vector<ImageDesc> descs(n_refine_views_);
-  queue.enqueueReadBuffer(cl_image_descs_, CL_TRUE, 0,
-                          n_refine_views_ * sizeof(ImageDesc), descs.data());
-  int max_w = 0, max_h = 0;
-  for (int v = 0; v < n_refine_views_; ++v) {
-    if (descs[v].width > max_w) {
-      max_w = descs[v].width;
-    }
-    if (descs[v].height > max_h) {
-      max_h = descs[v].height;
-    }
-  }
-
+  const int W = refine_img_width_;
+  const int H = refine_img_height_;
   const size_t update_global =
       ((static_cast<size_t>(capacity_) + 255u) / 256u) * 256u;
 
-  for (int iter = 0; iter < total_iters; ++iter) {
-    const bool color_only = (iter < color_iters);
+  // Temp buffer for raycast depth (1 view at a time, then copied into the
+  // image array slice).
+  const size_t depth_buf_bytes = static_cast<size_t>(W) * H * sizeof(float);
+  cl::Buffer cl_raycast_depth(ctx, CL_MEM_READ_WRITE, depth_buf_bytes, nullptr,
+                              &err);
+  opencl::CheckCL(err, "refine raycast depth buffer");
 
-    // Phase 1: Accumulate gradients from each source view.
+  // Temp buffer for hit_slot (needed by svo_raycast, unused here).
+  cl::Buffer cl_raycast_hit(ctx, CL_MEM_READ_WRITE,
+                            static_cast<size_t>(W) * H * sizeof(uint32_t),
+                            nullptr, &err);
+  opencl::CheckCL(err, "refine raycast hit buffer");
+
+  // ---- Build per-view neighbor list (K=4 best by triangulation angle) ----
+  static constexpr int kMaxRefineNeighbors = 4;
+  std::vector<int32_t> neighbor_data(
+      static_cast<size_t>(n_refine_views_) * kMaxRefineNeighbors, -1);
+
+  // Read back cameras to compute pairwise scores on CPU.
+  std::vector<SVOCameraGPU> cameras_cpu(n_refine_views_);
+  queue.enqueueReadBuffer(cl_cameras_array_, CL_TRUE, 0,
+                          n_refine_views_ * sizeof(SVOCameraGPU),
+                          cameras_cpu.data());
+
+  for (int i = 0; i < n_refine_views_; ++i) {
+    // Optical axis of view i: 3rd row of R (= z_cam in world = Rinv * [0,0,1]).
+    const auto& ci = cameras_cpu[i];
+    float dir_i[3] = {ci.Rinv[6], ci.Rinv[7], ci.Rinv[8]};
+
+    // Score each other view by triangulation angle quality:
+    // Prefer views with baseline angle ~20-40° (cos in [0.77, 0.94]).
+    // Score = 1 - |cos_angle - 0.85| to peak around 30°.
+    struct ViewScore {
+      int idx;
+      float score;
+    };
+    std::vector<ViewScore> scores;
+    scores.reserve(n_refine_views_ - 1);
+
+    for (int j = 0; j < n_refine_views_; ++j) {
+      if (j == i) {
+        continue;
+      }
+      const auto& cj = cameras_cpu[j];
+      // Baseline direction.
+      float bx = cj.cam_pos[0] - ci.cam_pos[0];
+      float by = cj.cam_pos[1] - ci.cam_pos[1];
+      float bz = cj.cam_pos[2] - ci.cam_pos[2];
+      float bl = std::sqrt(bx * bx + by * by + bz * bz);
+      if (bl < 1e-8f) {
+        continue;
+      }
+
+      // Optical axis of view j.
+      float dir_j[3] = {cj.Rinv[6], cj.Rinv[7], cj.Rinv[8]};
+
+      // Cos angle between optical axes (small = wide baseline).
+      float cos_axes =
+          dir_i[0] * dir_j[0] + dir_i[1] * dir_j[1] + dir_i[2] * dir_j[2];
+      // Prefer moderate baseline (peak around cos=0.85 ≈ 30°).
+      float s = 1.0f - std::abs(cos_axes - 0.85f);
+      scores.push_back({j, s});
+    }
+
+    // Sort by score descending, pick top K.
+    std::sort(scores.begin(), scores.end(),
+              [](const ViewScore& a, const ViewScore& b) {
+                return a.score > b.score;
+              });
+    int count = std::min(static_cast<int>(scores.size()), kMaxRefineNeighbors);
+    for (int k = 0; k < count; ++k) {
+      neighbor_data[i * kMaxRefineNeighbors + k] = scores[k].idx;
+    }
+  }
+
+  // Upload neighbor buffer.
+  const size_t nb_bytes = static_cast<size_t>(n_refine_views_) *
+                          kMaxRefineNeighbors * sizeof(int32_t);
+  cl::Buffer cl_neighbors(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                          nb_bytes, neighbor_data.data(), &err);
+  opencl::CheckCL(err, "refine neighbor buffer");
+
+  for (int iter = 0; iter < iters; ++iter) {
+    // ---- Step 1: Guided narrow-band raycast for all views ----
+    // Uses cl_tsdf_depths_ as depth hints (clean depths on iter 0, then
+    // previous iteration's rendered depths). Search margin = trunc_dist +
+    // 2*voxel_size.
+    const float search_margin = trunc_dist + 2.0f * voxel_size;
+
+    for (int vi = 0; vi < n_refine_views_; ++vi) {
+      // Create sub-buffer for this camera (svo_raycast_guided takes
+      // __constant).
+      const size_t cam_offset = vi * sizeof(SVOCameraGPU);
+      cl_buffer_region region{cam_offset, sizeof(SVOCameraGPU)};
+      cl::Buffer cam_sub = cl_cameras_array_.createSubBuffer(
+          CL_MEM_READ_ONLY, CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
+      if (err != CL_SUCCESS) {
+        SVOCameraGPU single_cam;
+        queue.enqueueReadBuffer(cl_cameras_array_, CL_TRUE, cam_offset,
+                                sizeof(SVOCameraGPU), &single_cam);
+        queue.enqueueWriteBuffer(cl_camera_, CL_TRUE, 0, sizeof(SVOCameraGPU),
+                                 &single_cam);
+        cam_sub = cl_camera_;
+      }
+
+      int rarg = 0;
+      k_raycast_guided_.setArg(rarg++, cl_table_);
+      k_raycast_guided_.setArg(rarg++, capacity_mask_);
+      k_raycast_guided_.setArg(rarg++, cl_raycast_depth);
+      k_raycast_guided_.setArg(rarg++, cl_raycast_hit);
+      k_raycast_guided_.setArg(rarg++, cam_sub);
+      k_raycast_guided_.setArg(rarg++, cl_tsdf_depths_);
+      k_raycast_guided_.setArg(rarg++, static_cast<cl_int>(vi));
+      k_raycast_guided_.setArg(rarg++, static_cast<cl_int>(H));
+      k_raycast_guided_.setArg(rarg++, static_cast<cl_int>(W));
+      k_raycast_guided_.setArg(rarg++, voxel_size);
+      k_raycast_guided_.setArg(rarg++, inv_voxel_size);
+      k_raycast_guided_.setArg(rarg++, search_margin);
+      k_raycast_guided_.setArg(rarg++, min_weight_scaled);
+
+      cl::NDRange global_rc(static_cast<size_t>((W + 15) / 16 * 16),
+                            static_cast<size_t>((H + 15) / 16 * 16));
+      queue.enqueueNDRangeKernel(k_raycast_guided_, cl::NullRange, global_rc,
+                                 cl::NDRange(16, 16));
+
+      // Copy raycast depth buffer → tsdf_depths image array slice vi.
+      std::array<size_t, 3> origin = {0, 0, static_cast<size_t>(vi)};
+      std::array<size_t, 3> region_sz = {static_cast<size_t>(W),
+                                         static_cast<size_t>(H), 1};
+      queue.enqueueCopyBufferToImage(cl_raycast_depth, cl_tsdf_depths_, 0,
+                                     origin, region_sz);
+    }
+    queue.finish();
+
+    // ---- Step 2: Accumulate gradient from each source view ----
     for (int vi = 0; vi < n_refine_views_; ++vi) {
       int arg = 0;
       k_refine_accumulate_.setArg(arg++, cl_table_);
       k_refine_accumulate_.setArg(arg++, capacity_mask_);
       k_refine_accumulate_.setArg(arg++, cl_refine_grad_);
       k_refine_accumulate_.setArg(arg++, cl_color_images_);
-      k_refine_accumulate_.setArg(arg++, cl_depth_images_);
+      k_refine_accumulate_.setArg(arg++, cl_tsdf_depths_);
       k_refine_accumulate_.setArg(arg++, cl_cameras_array_);
-      k_refine_accumulate_.setArg(arg++, cl_image_descs_);
+      k_refine_accumulate_.setArg(arg++, cl_neighbors);
+      k_refine_accumulate_.setArg(arg++,
+                                  static_cast<cl_int>(kMaxRefineNeighbors));
       k_refine_accumulate_.setArg(arg++, static_cast<cl_int>(n_refine_views_));
       k_refine_accumulate_.setArg(arg++, static_cast<cl_int>(vi));
+      k_refine_accumulate_.setArg(arg++, static_cast<cl_int>(W));
+      k_refine_accumulate_.setArg(arg++, static_cast<cl_int>(H));
       k_refine_accumulate_.setArg(arg++, voxel_size);
       k_refine_accumulate_.setArg(arg++, inv_voxel_size);
       k_refine_accumulate_.setArg(arg++, trunc_dist);
       k_refine_accumulate_.setArg(arg++, min_weight_scaled);
-      k_refine_accumulate_.setArg(arg++,
-                                  static_cast<cl_int>(color_only ? 1 : 0));
+      k_refine_accumulate_.setArg(arg++, static_cast<cl_int>(half_patch));
+      k_refine_accumulate_.setArg(arg++, inv_sigma_s2);
+      k_refine_accumulate_.setArg(arg++, inv_sigma_c2);
 
-      // Dispatch for this view's image dimensions.
-      const size_t gw = static_cast<size_t>((descs[vi].width + 15) / 16 * 16);
-      const size_t gh = static_cast<size_t>((descs[vi].height + 15) / 16 * 16);
+      const size_t gw = static_cast<size_t>((W + 15) / 16 * 16);
+      const size_t gh = static_cast<size_t>((H + 15) / 16 * 16);
       queue.enqueueNDRangeKernel(k_refine_accumulate_, cl::NullRange,
                                  cl::NDRange(gw, gh), cl::NDRange(16, 16));
     }
     queue.finish();
 
-    // Phase 2: Adam update + Laplacian regularization.
+    // ---- Step 3: Adam update on SDF ----
     {
       int arg = 0;
       k_refine_update_.setArg(arg++, cl_table_);
@@ -1028,36 +1155,155 @@ void SVOIntegratorCL::Refine(int color_iters, int joint_iters, float lambda_reg,
       k_refine_update_.setArg(arg++, cl_refine_adam_);
       k_refine_update_.setArg(arg++, min_weight_scaled);
       k_refine_update_.setArg(arg++, voxel_size);
-      k_refine_update_.setArg(arg++, cur_lambda);
+      k_refine_update_.setArg(arg++, lambda_reg);
       k_refine_update_.setArg(arg++, lr_sdf);
-      k_refine_update_.setArg(arg++, lr_color);
       k_refine_update_.setArg(arg++, beta1);
       k_refine_update_.setArg(arg++, beta2);
       k_refine_update_.setArg(arg++, epsilon);
       k_refine_update_.setArg(arg++, static_cast<cl_int>(iter));
-      k_refine_update_.setArg(arg++, static_cast<cl_int>(color_only ? 0 : 1));
       queue.enqueueNDRangeKernel(k_refine_update_, cl::NullRange,
                                  cl::NDRange(update_global), cl::NDRange(256));
       queue.finish();
     }
 
-    cur_lambda *= lambda_decay;
-
-    if ((iter + 1) % 10 == 0 || iter == total_iters - 1) {
-      std::cerr << "[SVOIntegratorCL] Refine iter " << (iter + 1) << "/"
-                << total_iters << " (" << (color_only ? "color-only" : "joint")
-                << ")\n";
+    if ((iter + 1) % 5 == 0 || iter == iters - 1) {
+      std::cerr << "[SVOIntegratorCL] RefineGeometry iter " << (iter + 1) << "/"
+                << iters << "\n";
     }
   }
 
-  // Release refinement image buffers (no longer needed).
-  cl_color_images_ = cl::Buffer();
-  cl_depth_images_ = cl::Buffer();
-  cl_cameras_array_ = cl::Buffer();
-  cl_image_descs_ = cl::Buffer();
+  // Keep color images and cameras alive for BakeColors.
+  // Release grad/adam.
   cl_refine_grad_ = cl::Buffer();
   cl_refine_adam_ = cl::Buffer();
+}
+
+void SVOIntegratorCL::BakeColors(const std::vector<Vec3f>& points,
+                                 const std::vector<Vec3f>& normals,
+                                 std::vector<Vec3<uint8_t>>* out_colors) {
+  if (!refine_prepared_) {
+    throw std::runtime_error(
+        "SVOIntegratorCL::BakeColors: PrepareRefinement() not called");
+  }
+
+  auto& dev = opencl::CLContext::Instance().Device(device_idx_);
+  auto& ctx = dev.context();
+  auto& queue = dev.queue();
+  cl_int err;
+
+  const size_t M = points.size();
+  if (M == 0) {
+    out_colors->clear();
+    return;
+  }
+
+  // Upload points and normals (as flat float arrays).
+  const size_t pts_bytes = M * 3 * sizeof(float);
+  cl::Buffer cl_pts(
+      ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, pts_bytes,
+      const_cast<float*>(reinterpret_cast<const float*>(points.data())), &err);
+  opencl::CheckCL(err, "bake points buffer");
+
+  cl::Buffer cl_nrm(
+      ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, pts_bytes,
+      const_cast<float*>(reinterpret_cast<const float*>(normals.data())), &err);
+  opencl::CheckCL(err, "bake normals buffer");
+
+  // Output color buffer.
+  const size_t color_bytes = M * 3;
+  cl::Buffer cl_out(ctx, CL_MEM_WRITE_ONLY, color_bytes, nullptr, &err);
+  opencl::CheckCL(err, "bake output buffer");
+
+  // We need TSDF depths for occlusion.  Render them one more time.
+  const int W = refine_img_width_;
+  const int H = refine_img_height_;
+  const float inv_voxel_size = 1.0f / refine_voxel_size_;
+  // cl_tsdf_depths_ has clean depths (from PrepareRefinement) or last
+  // RefineGeometry iteration. Use guided raycast with narrow band.
+  {
+    const float search_margin = 5.0f * refine_voxel_size_;
+    const size_t depth_buf_bytes = static_cast<size_t>(W) * H * sizeof(float);
+    cl::Buffer cl_rc_depth(ctx, CL_MEM_READ_WRITE, depth_buf_bytes, nullptr,
+                           &err);
+    opencl::CheckCL(err, "bake raycast depth");
+    cl::Buffer cl_rc_hit(ctx, CL_MEM_READ_WRITE,
+                         static_cast<size_t>(W) * H * sizeof(uint32_t), nullptr,
+                         &err);
+    opencl::CheckCL(err, "bake raycast hit");
+
+    for (int vi = 0; vi < n_refine_views_; ++vi) {
+      const size_t cam_offset = vi * sizeof(SVOCameraGPU);
+      cl_buffer_region region{cam_offset, sizeof(SVOCameraGPU)};
+      cl::Buffer cam_sub = cl_cameras_array_.createSubBuffer(
+          CL_MEM_READ_ONLY, CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
+      if (err != CL_SUCCESS) {
+        SVOCameraGPU single_cam;
+        queue.enqueueReadBuffer(cl_cameras_array_, CL_TRUE, cam_offset,
+                                sizeof(SVOCameraGPU), &single_cam);
+        queue.enqueueWriteBuffer(cl_camera_, CL_TRUE, 0, sizeof(SVOCameraGPU),
+                                 &single_cam);
+        cam_sub = cl_camera_;
+      }
+
+      int rarg = 0;
+      k_raycast_guided_.setArg(rarg++, cl_table_);
+      k_raycast_guided_.setArg(rarg++, capacity_mask_);
+      k_raycast_guided_.setArg(rarg++, cl_rc_depth);
+      k_raycast_guided_.setArg(rarg++, cl_rc_hit);
+      k_raycast_guided_.setArg(rarg++, cam_sub);
+      k_raycast_guided_.setArg(rarg++, cl_tsdf_depths_);
+      k_raycast_guided_.setArg(rarg++, static_cast<cl_int>(vi));
+      k_raycast_guided_.setArg(rarg++, static_cast<cl_int>(H));
+      k_raycast_guided_.setArg(rarg++, static_cast<cl_int>(W));
+      k_raycast_guided_.setArg(rarg++, refine_voxel_size_);
+      k_raycast_guided_.setArg(rarg++, inv_voxel_size);
+      k_raycast_guided_.setArg(rarg++, search_margin);
+      k_raycast_guided_.setArg(rarg++, 0.0f);  // min weight for bake = 0
+
+      cl::NDRange grc(static_cast<size_t>((W + 15) / 16 * 16),
+                      static_cast<size_t>((H + 15) / 16 * 16));
+      queue.enqueueNDRangeKernel(k_raycast_guided_, cl::NullRange, grc,
+                                 cl::NDRange(16, 16));
+
+      std::array<size_t, 3> origin = {0, 0, static_cast<size_t>(vi)};
+      std::array<size_t, 3> region_sz = {static_cast<size_t>(W),
+                                         static_cast<size_t>(H), 1};
+      queue.enqueueCopyBufferToImage(cl_rc_depth, cl_tsdf_depths_, 0, origin,
+                                     region_sz);
+    }
+    queue.finish();
+  }
+
+  // Dispatch svo_bake_colors kernel.
+  {
+    int arg = 0;
+    k_bake_colors_.setArg(arg++, cl_pts);
+    k_bake_colors_.setArg(arg++, cl_nrm);
+    k_bake_colors_.setArg(arg++, cl_out);
+    k_bake_colors_.setArg(arg++, cl_color_images_);
+    k_bake_colors_.setArg(arg++, cl_tsdf_depths_);
+    k_bake_colors_.setArg(arg++, cl_cameras_array_);
+    k_bake_colors_.setArg(arg++, static_cast<cl_int>(n_refine_views_));
+    k_bake_colors_.setArg(arg++, static_cast<cl_int>(W));
+    k_bake_colors_.setArg(arg++, static_cast<cl_int>(H));
+
+    const size_t global = ((M + 255) / 256) * 256;
+    queue.enqueueNDRangeKernel(k_bake_colors_, cl::NullRange,
+                               cl::NDRange(global), cl::NDRange(256));
+    queue.finish();
+  }
+
+  // Read back colors.
+  out_colors->resize(M);
+  queue.enqueueReadBuffer(cl_out, CL_TRUE, 0, color_bytes, out_colors->data());
+
+  // Release all refinement resources.
+  cl_color_images_ = cl::Image2DArray();
+  cl_tsdf_depths_ = cl::Image2DArray();
+  cl_cameras_array_ = cl::Buffer();
   refine_prepared_ = false;
+
+  std::cerr << "[SVOIntegratorCL] BakeColors: " << M << " points colored\n";
 }
 
 // =====================================================================

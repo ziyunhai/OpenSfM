@@ -30,7 +30,7 @@ inline const char* kSVOKernelSource =
 
 // =====================================================================
 // GPU hash table slot — must match host-side GPUVoxelSlot exactly.
-// 12 x int32 = 48 bytes.
+// 9 x int32 = 36 bytes.  Color is baked separately post-extraction.
 // =====================================================================
 typedef struct {
     uint key_ab;      // packed (x+32768)<<16 | (y+32768), EMPTY = 0xFFFFFFFF
@@ -40,11 +40,8 @@ typedef struct {
     int  sum_nx;      // fixed-point normal.x accumulator
     int  sum_ny;
     int  sum_nz;
-    int  sum_r;       // color accumulator (raw uint8 scale)
-    int  sum_g;
-    int  sum_b;
     int  sum_weight;  // accumulated confidence weight (scale WEIGHT_SCALE)
-    int  _pad;        // padding to maintain 48-byte slot size
+    int  _pad;        // reserved
 } VoxelSlot;
 
 // =====================================================================
@@ -98,7 +95,7 @@ void hash_accumulate(__global VoxelSlot* table, uint mask,
                      int kx, int ky, int kz,
                      int tsdf_fp,
                      int nx_fp, int ny_fp, int nz_fp,
-                     int cr, int cg, int cb, int weight)
+                     int weight)
 {
     uint my_ab = pack_xy(kx, ky);
     if (my_ab == EMPTY_KEY) return;  // (32767,32767) cannot be stored
@@ -108,9 +105,6 @@ void hash_accumulate(__global VoxelSlot* table, uint mask,
     int w_nx   = nx_fp   * weight;
     int w_ny   = ny_fp   * weight;
     int w_nz   = nz_fp   * weight;
-    int w_cr   = cr      * weight;
-    int w_cg   = cg      * weight;
-    int w_cb   = cb      * weight;
 
     uint h = voxel_hash(kx, ky, kz) & mask;
 
@@ -130,9 +124,6 @@ void hash_accumulate(__global VoxelSlot* table, uint mask,
             atomic_add(&table[slot].sum_nx,     w_nx);
             atomic_add(&table[slot].sum_ny,     w_ny);
             atomic_add(&table[slot].sum_nz,     w_nz);
-            atomic_add(&table[slot].sum_r,      w_cr);
-            atomic_add(&table[slot].sum_g,      w_cg);
-            atomic_add(&table[slot].sum_b,      w_cb);
             return;
         }
 
@@ -155,9 +146,6 @@ void hash_accumulate(__global VoxelSlot* table, uint mask,
                 atomic_add(&table[slot].sum_nx,     w_nx);
                 atomic_add(&table[slot].sum_ny,     w_ny);
                 atomic_add(&table[slot].sum_nz,     w_nz);
-                atomic_add(&table[slot].sum_r,      w_cr);
-                atomic_add(&table[slot].sum_g,      w_cg);
-                atomic_add(&table[slot].sum_b,      w_cb);
                 return;
             }
             // Different z — linear probe.
@@ -181,9 +169,6 @@ __kernel void svo_clear_table(__global VoxelSlot* table, uint capacity) {
     table[i].sum_nx     = 0;
     table[i].sum_ny     = 0;
     table[i].sum_nz     = 0;
-    table[i].sum_r      = 0;
-    table[i].sum_g      = 0;
-    table[i].sum_b      = 0;
     table[i].sum_weight = 0;
     table[i]._pad       = 0;
 }
@@ -207,11 +192,9 @@ __kernel void svo_integrate(
     __global uint*         overflow_counter,
     __global const float*  depth,
     __global const float*  normal_buf,
-    __global const uchar*  color_buf,
     __global const uchar*  mask_buf,
     __global const float*  weight_buf,
     int                    has_normal,
-    int                    has_color,
     int                    has_mask,
     int                    has_weight,
     __constant SVOCamera*  cam,
@@ -324,15 +307,7 @@ __kernel void svo_integrate(
         }
     }
 
-    // ---- Per-pixel color ----
-    int cr = 0, cg = 0, cb = 0;
-    if (has_color) {
-        cr = (int)color_buf[idx*3];
-        cg = (int)color_buf[idx*3+1];
-        cb = (int)color_buf[idx*3+2];
-    }
-
-    // ---- Per-pixel weight: confidence (cos theta is too noisy)----
+    // ---- Per-pixel weight: confidence ----
     float w_float = 1.0f;
     if (has_weight) {
         w_float *= weight_buf[idx];
@@ -381,7 +356,7 @@ __kernel void svo_integrate(
 
         hash_accumulate(table, capacity_mask, overflow_counter,
                         kx, ky, kz,
-                        tsdf_fp, nx_fp, ny_fp, nz_fp, cr, cg, cb, w_int);
+                        tsdf_fp, nx_fp, ny_fp, nz_fp, w_int);
     }
 })CL"
     R"CL(
@@ -626,13 +601,10 @@ __kernel void svo_extract_points(
     float inv_fp_sw_a  = inv_sw_a / (float)FP_SCALE;
     float tsdf_a       = (float)table[i].sum_tsdf * inv_fp_sw_a;
 
-    // Pre-decode voxel A normal & color (reused for all 3 axes).
+    // Pre-decode voxel A normal (reused for all 3 axes).
     float na_x = (float)table[i].sum_nx * inv_fp_sw_a;
     float na_y = (float)table[i].sum_ny * inv_fp_sw_a;
     float na_z = (float)table[i].sum_nz * inv_fp_sw_a;
-    float ra   = (float)table[i].sum_r  * inv_sw_a;
-    float ga   = (float)table[i].sum_g  * inv_sw_a;
-    float ba   = (float)table[i].sum_b  * inv_sw_a;
 
     // Check +X, +Y, +Z neighbours for TSDF sign change.
     int off_x[3] = {1, 0, 0};
@@ -687,11 +659,6 @@ __kernel void svo_extract_points(
         float nlen = sqrt(inx*inx + iny*iny + inz*inz);
         if (nlen > 1e-6f) { inx /= nlen; iny /= nlen; inz /= nlen; }
 
-        // Interpolated color.
-        float rb = (float)table[nb_idx].sum_r * inv_sw_b;
-        float gb = (float)table[nb_idx].sum_g * inv_sw_b;
-        float bb = (float)table[nb_idx].sum_b * inv_sw_b;
-
         // Local adaptive weight threshold: require weight to be a fraction
         // of the local neighborhood maximum.  Skipped when relative_min_weight <= 0.
         if (relative_min_weight > 0.0f) {
@@ -730,9 +697,10 @@ __kernel void svo_extract_points(
         out_normals[out_idx * 3 + 0] = inx;
         out_normals[out_idx * 3 + 1] = iny;
         out_normals[out_idx * 3 + 2] = inz;
-        out_colors[out_idx * 3 + 0] = (uchar)clamp(ra + t * (rb - ra), 0.0f, 255.0f);
-        out_colors[out_idx * 3 + 1] = (uchar)clamp(ga + t * (gb - ga), 0.0f, 255.0f);
-        out_colors[out_idx * 3 + 2] = (uchar)clamp(ba + t * (bb - ba), 0.0f, 255.0f);
+        // Colors will be baked by svo_bake_colors after extraction.
+        out_colors[out_idx * 3 + 0] = 128;
+        out_colors[out_idx * 3 + 1] = 128;
+        out_colors[out_idx * 3 + 2] = 128;
     }
 }
 
@@ -789,13 +757,10 @@ __kernel void svo_extract_fill(
     float inv_fp_sw_a = inv_sw_a / (float)FP_SCALE;
     float tsdf_a      = (float)coarse_table[i].sum_tsdf * inv_fp_sw_a;
 
-    // Pre-decode coarse voxel A normal & color.
+    // Pre-decode coarse voxel A normal.
     float na_x = (float)coarse_table[i].sum_nx * inv_fp_sw_a;
     float na_y = (float)coarse_table[i].sum_ny * inv_fp_sw_a;
     float na_z = (float)coarse_table[i].sum_nz * inv_fp_sw_a;
-    float ra   = (float)coarse_table[i].sum_r  * inv_sw_a;
-    float ga   = (float)coarse_table[i].sum_g  * inv_sw_a;
-    float ba   = (float)coarse_table[i].sum_b  * inv_sw_a;
 
     // Number of sub-samples per axis along the crossing plane.
     int subdiv = 1 << level_shift;
@@ -849,14 +814,6 @@ __kernel void svo_extract_fill(
         float nlen = sqrt(inx*inx + iny*iny + inz*inz);
         if (nlen > 1e-6f) { inx /= nlen; iny /= nlen; inz /= nlen; }
 
-        // Interpolated color from coarse.
-        float rb = (float)coarse_table[nb_idx].sum_r * inv_sw_b;
-        float gb = (float)coarse_table[nb_idx].sum_g * inv_sw_b;
-        float bb = (float)coarse_table[nb_idx].sum_b * inv_sw_b;
-        float icr = ra + t * (rb - ra);
-        float icg = ga + t * (gb - ga);
-        float icb = ba + t * (bb - ba);
-
         // Sub-sample the crossing plane at fine resolution.
         // The two axes perpendicular to direction d define the plane.
         // d=0 (edge along X): plane axes are Y, Z
@@ -905,9 +862,10 @@ __kernel void svo_extract_fill(
                 out_normals[out_idx * 3 + 0] = inx;
                 out_normals[out_idx * 3 + 1] = iny;
                 out_normals[out_idx * 3 + 2] = inz;
-                out_colors[out_idx * 3 + 0] = (uchar)clamp(icr, 0.0f, 255.0f);
-                out_colors[out_idx * 3 + 1] = (uchar)clamp(icg, 0.0f, 255.0f);
-                out_colors[out_idx * 3 + 2] = (uchar)clamp(icb, 0.0f, 255.0f);
+                // Colors baked post-extraction.
+                out_colors[out_idx * 3 + 0] = 128;
+                out_colors[out_idx * 3 + 1] = 128;
+                out_colors[out_idx * 3 + 2] = 128;
             }
         }
     }
@@ -916,7 +874,11 @@ __kernel void svo_extract_fill(
     R"CL(
 
 // =====================================================================
-// Photometric refinement kernels
+// Photometric refinement kernels (image2d_array_t path)
+//
+// All views share the same (W, H) resolution (same-resolution assumption).
+// color_images: CL_RGBA CL_UNORM_INT8, one layer per view, [0,1] float4.
+// tsdf_depths:  CL_R   CL_FLOAT, one layer per view, TSDF-rendered depth.
 // =====================================================================
 
 // ---- Atomic float add via CAS loop ----
@@ -932,15 +894,7 @@ void atomic_add_f(__global float* addr, float val) {
     } while (true);
 }
 
-// Per-view image descriptor (must match host-side ImageDesc).
-typedef struct {
-    int width;
-    int height;
-    int color_offset;  // byte offset into packed color buffer (÷3 = pixel offset)
-    int depth_offset;  // pixel offset into packed depth buffer
-} RefineImageDesc;
-
-// ---- Trilinear SDF sampling ----
+// ---- Trilinear SDF sampling helpers (unchanged) ----
 // Decode the weighted-average TSDF from a hash table slot.
 float decode_tsdf(__global const VoxelSlot* table, uint slot_idx) {
     float sw = (float)table[slot_idx].sum_weight;
@@ -1012,217 +966,192 @@ float3 compute_sdf_gradient(
     return grad / (2.0f * eps);
 }
 
-// ---- Bilinear image sampling ----
-float3 sample_image_bilinear(
-    __global const uchar* images,
-    __global const RefineImageDesc* descs,
-    int view_idx, float u, float v)
+// ---- image2d_array helpers ----
+
+// Grayscale from RGBA UNORM_INT8 image array layer.
+// color_images: CL_RGBA CL_UNORM_INT8, values in [0,1].
+float gray_from_array(read_only image2d_array_t images,
+                      const sampler_t samp,
+                      float u, float v, int layer)
 {
-    int w = descs[view_idx].width;
-    int h = descs[view_idx].height;
-    int base = descs[view_idx].color_offset;
-
-    // Clamp to image bounds.
-    float uf = clamp(u, 0.0f, (float)(w - 1));
-    float vf = clamp(v, 0.0f, (float)(h - 1));
-    int u0 = (int)floor(uf);
-    int v0 = (int)floor(vf);
-    int u1 = min(u0 + 1, w - 1);
-    int v1 = min(v0 + 1, h - 1);
-    float fu = uf - (float)u0;
-    float fv = vf - (float)v0;
-
-    #define PIX(uu, vv) (base + ((vv) * w + (uu)) * 3)
-    float r = (float)images[PIX(u0,v0)+0] * (1-fu)*(1-fv)
-            + (float)images[PIX(u1,v0)+0] * fu*(1-fv)
-            + (float)images[PIX(u0,v1)+0] * (1-fu)*fv
-            + (float)images[PIX(u1,v1)+0] * fu*fv;
-    float g = (float)images[PIX(u0,v0)+1] * (1-fu)*(1-fv)
-            + (float)images[PIX(u1,v0)+1] * fu*(1-fv)
-            + (float)images[PIX(u0,v1)+1] * (1-fu)*fv
-            + (float)images[PIX(u1,v1)+1] * fu*fv;
-    float b = (float)images[PIX(u0,v0)+2] * (1-fu)*(1-fv)
-            + (float)images[PIX(u1,v0)+2] * fu*(1-fv)
-            + (float)images[PIX(u0,v1)+2] * (1-fu)*fv
-            + (float)images[PIX(u1,v1)+2] * fu*fv;
-    #undef PIX
-    return (float3)(r, g, b);
+    float4 c = read_imagef(images, samp, (float4)(u + 0.5f, v + 0.5f, (float)layer, 0.0f));
+    return (c.x + c.y + c.z) * 0.333333f;
 }
 
-// Sample depth from packed depth buffer (nearest neighbor).
-float sample_depth_nn(
-    __global const float* depths,
-    __global const RefineImageDesc* descs,
-    int view_idx, int u, int v)
+// Color (rgb) from image array layer.
+float3 color_from_array(read_only image2d_array_t images,
+                        const sampler_t samp,
+                        float u, float v, int layer)
 {
-    int w = descs[view_idx].width;
-    int base = descs[view_idx].depth_offset;
-    return depths[base + v * w + u];
+    float4 c = read_imagef(images, samp, (float4)(u + 0.5f, v + 0.5f, (float)layer, 0.0f));
+    return c.xyz;
 }
 
-// ---- Project a 3D point into a camera ----
-// Returns (u, v, z_cam). z_cam <= 0 means behind camera.
-float3 project_point(
-    __constant SVOCamera* cams, int view_idx,
-    float3 world_pt)
+// Grayscale image gradient via ±1 central diff, hardware bilinear.
+float2 image_grad_array(read_only image2d_array_t images,
+                        const sampler_t samp,
+                        float u, float v, int layer)
 {
-    __constant SVOCamera* cam = &cams[view_idx];
-    // World → camera: p_cam = R * world_pt + t
-    float3 p_cam;
-    p_cam.x = cam->R[0]*world_pt.x + cam->R[1]*world_pt.y + cam->R[2]*world_pt.z + cam->t[0];
-    p_cam.y = cam->R[3]*world_pt.x + cam->R[4]*world_pt.y + cam->R[5]*world_pt.z + cam->t[1];
-    p_cam.z = cam->R[6]*world_pt.x + cam->R[7]*world_pt.y + cam->R[8]*world_pt.z + cam->t[2];
-    if (p_cam.z <= 0.0f) return (float3)(0.0f, 0.0f, -1.0f);
-
-    // Camera → pixel: p_px = K * p_cam / z (but we have Kinv, not K).
-    // Recover K from Kinv: K = Kinv^{-1}. For a 3×3 upper-triangular intrinsics,
-    // we can use the projection directly: u = fx*X/Z + cx, v = fy*Y/Z + cy.
-    // But we only have Kinv stored. Use: (u,v,1)^T = (1/z) * K * p_cam_norm.
-    // Since Kinv * (u,v,1) = (X/Z, Y/Z, 1), we need K explicitly.
-    // Alternative: Kinv is the inverse of K. K = inv(Kinv).
-    // For a 3x3 matrix, compute inline:
-    __constant float* ki = cam->Kinv;  // row-major Kinv
-    // K = inv(Kinv). For upper triangular K, Kinv is also upper triangular.
-    // det(Kinv) = ki[0]*ki[4]*ki[8] (for upper triangular).
-    float det = ki[0]*(ki[4]*ki[8] - ki[5]*ki[7])
-              - ki[1]*(ki[3]*ki[8] - ki[5]*ki[6])
-              + ki[2]*(ki[3]*ki[7] - ki[4]*ki[6]);
-    if (fabs(det) < 1e-12f) return (float3)(0.0f, 0.0f, -1.0f);
-    float inv_det = 1.0f / det;
-
-    // Adjugate, transposed (cofactor matrix transpose) for row-major.
-    float K00 = (ki[4]*ki[8] - ki[5]*ki[7]) * inv_det;
-    float K01 = (ki[2]*ki[7] - ki[1]*ki[8]) * inv_det;
-    float K02 = (ki[1]*ki[5] - ki[2]*ki[4]) * inv_det;
-    float K10 = (ki[5]*ki[6] - ki[3]*ki[8]) * inv_det;
-    float K11 = (ki[0]*ki[8] - ki[2]*ki[6]) * inv_det;
-    float K12 = (ki[2]*ki[3] - ki[0]*ki[5]) * inv_det;
-
-    float inv_z = 1.0f / p_cam.z;
-    float u = (K00 * p_cam.x + K01 * p_cam.y + K02 * p_cam.z) * inv_z;
-    float v = (K10 * p_cam.x + K11 * p_cam.y + K12 * p_cam.z) * inv_z;
-    return (float3)(u, v, p_cam.z);
+    float gxp = gray_from_array(images, samp, u + 1.0f, v,        layer);
+    float gxm = gray_from_array(images, samp, u - 1.0f, v,        layer);
+    float gyp = gray_from_array(images, samp, u,         v + 1.0f, layer);
+    float gym = gray_from_array(images, samp, u,         v - 1.0f, layer);
+    return (float2)((gxp - gxm) * 0.5f, (gyp - gym) * 0.5f);
 }
 
-// ---- Image gradient (central differences) ----
-float2 image_gradient(
-    __global const uchar* images,
-    __global const RefineImageDesc* descs,
-    int view_idx, float u, float v)
+// Bilateral Gaussian-windowed ZNCC between two layers of the same image array.
+//
+// Replicates compute_ncc_at_stride from opencl_kernels.h but reads both
+// ref and src from the same image2d_array_t via their respective layer indices.
+//
+// inv_sigma_s2: spatial weight exponent, e.g. -0.5 for sigma_s=1 pixel
+// inv_sigma_c2: bilateral weight exponent, e.g. -325.0 for sigma_c=10/255 in [0,1]
+//
+// Returns (ncc_score, d2ncc):
+//   ncc_score  ∈ [-1,1]
+//   d2ncc      = ∂NCC/∂I_j at center pixel (src layer center), per Pons-Keriven eq.(13)
+//              = w_center × (ref_norm_center - NCC×src_norm_center) / (σ_src × Σw)
+// Returns (-1, 0) when either patch variance < 1.5e-6 (flat/uniform region).
+float2 compute_zncc_array(
+    read_only image2d_array_t images,
+    int ref_layer, float ref_cx, float ref_cy,
+    int src_layer, float src_cx, float src_cy,
+    int half_patch,
+    float inv_sigma_s2,
+    float inv_sigma_c2)
 {
-    // Gradient of grayscale intensity (average of RGB channels).
-    float3 cp = sample_image_bilinear(images, descs, view_idx, u + 1.0f, v);
-    float3 cm = sample_image_bilinear(images, descs, view_idx, u - 1.0f, v);
-    float3 rp = sample_image_bilinear(images, descs, view_idx, u, v + 1.0f);
-    float3 rm = sample_image_bilinear(images, descs, view_idx, u, v - 1.0f);
-    float dx = ((cp.x + cp.y + cp.z) - (cm.x + cm.y + cm.z)) / 6.0f;
-    float dy = ((rp.x + rp.y + rp.z) - (rm.x + rm.y + rm.z)) / 6.0f;
-    return (float2)(dx, dy);
-}
+    const sampler_t samp = CLK_NORMALIZED_COORDS_FALSE |
+                           CLK_ADDRESS_CLAMP_TO_EDGE |
+                           CLK_FILTER_LINEAR;
 
-// ---- Per-channel image gradient (central differences) ----
-// Returns (dI_ch/du, dI_ch/dv) for a single channel (0=R, 1=G, 2=B).
-float2 image_gradient_channel(
-    __global const uchar* images,
-    __global const RefineImageDesc* descs,
-    int view_idx, float u, float v, int ch)
-{
-    float3 cp = sample_image_bilinear(images, descs, view_idx, u + 1.0f, v);
-    float3 cm = sample_image_bilinear(images, descs, view_idx, u - 1.0f, v);
-    float3 rp = sample_image_bilinear(images, descs, view_idx, u, v + 1.0f);
-    float3 rm = sample_image_bilinear(images, descs, view_idx, u, v - 1.0f);
-    float dx, dy;
-    if (ch == 0)      { dx = (cp.x - cm.x) * 0.5f; dy = (rp.x - rm.x) * 0.5f; }
-    else if (ch == 1) { dx = (cp.y - cm.y) * 0.5f; dy = (rp.y - rm.y) * 0.5f; }
-    else              { dx = (cp.z - cm.z) * 0.5f; dy = (rp.z - rm.z) * 0.5f; }
-    return (float2)(dx, dy);
-}
+    float ref_center = gray_from_array(images, samp, ref_cx, ref_cy, ref_layer);
+    float src_center = gray_from_array(images, samp, src_cx, src_cy, src_layer);
 
-// ---- Local patch statistics for affine normalization ----
-// Computes mean and inverse stddev of grayscale intensity over a 5×5 patch.
-// Returns (mean, inv_sigma). If sigma < threshold, returns inv_sigma = 0 (flat patch).
-float2 patch_stats(
-    __global const uchar* images,
-    __global const RefineImageDesc* descs,
-    int view_idx, float u, float v)
-{
-    float sum = 0.0f;
-    float sum_sq = 0.0f;
-    int count = 0;
-    for (int dy = -2; dy <= 2; dy++) {
-        for (int dx = -2; dx <= 2; dx++) {
-            float3 c = sample_image_bilinear(images, descs, view_idx,
-                                             u + (float)dx, v + (float)dy);
-            float gray = (c.x + c.y + c.z) * 0.333333f;
-            sum += gray;
-            sum_sq += gray * gray;
-            count++;
+    float sum_w  = 0.0f;
+    float sum_r  = 0.0f, sum_s  = 0.0f;
+    float sum_rr = 0.0f, sum_ss = 0.0f, sum_rs = 0.0f;
+    float w_center = 0.0f;
+
+    for (int iy = -half_patch; iy <= half_patch; iy++) {
+        for (int ix = -half_patch; ix <= half_patch; ix++) {
+            float fdx = (float)ix, fdy = (float)iy;
+            float ref_g = gray_from_array(images, samp, ref_cx + fdx, ref_cy + fdy, ref_layer);
+            float src_g = gray_from_array(images, samp, src_cx + fdx, src_cy + fdy, src_layer);
+
+            float dr = ref_g - ref_center;
+            float w = exp(inv_sigma_s2 * (fdx*fdx + fdy*fdy) + inv_sigma_c2 * dr * dr);
+
+            float r = dr;                  // centered at ref_center
+            float s = src_g - src_center;  // centered at src_center
+
+            sum_r  += w * r;
+            sum_s  += w * s;
+            sum_rr += w * r * r;
+            sum_ss += w * s * s;
+            sum_rs += w * r * s;
+            sum_w  += w;
+            if (ix == 0 && iy == 0) w_center = w;
         }
     }
-    float mean = sum / (float)count;
-    float var = sum_sq / (float)count - mean * mean;
-    float sigma = sqrt(fmax(var, 0.0f));
-    float inv_sigma = (sigma > 3.0f) ? (1.0f / sigma) : 0.0f;  // flat patch guard
-    return (float2)(mean, inv_sigma);
+
+    if (sum_w < 1e-6f) return (float2)(-1.0f, 0.0f);
+
+    float inv_w  = 1.0f / sum_w;
+    float mean_r = sum_r * inv_w;
+    float mean_s = sum_s * inv_w;
+    float var_r  = sum_rr * inv_w - mean_r * mean_r;
+    float var_s  = sum_ss * inv_w - mean_s * mean_s;
+
+    if (var_r < 1.5e-6f || var_s < 1.5e-6f) return (float2)(-1.0f, 0.0f);
+
+    float sigma_r = sqrt(var_r);
+    float sigma_s = sqrt(var_s);
+    float covar   = sum_rs * inv_w - mean_r * mean_s;
+    float ncc     = covar / (sigma_r * sigma_s);
+
+    // Pons-Keriven ∂₂M_CC at center pixel (eq.13):
+    //   ∂₂M = w_center × (I_ref_norm_center − NCC × I_src_norm_center) / (σ_s × Σw)
+    // where I_ref_norm_center = (ref_center − true_mean_ref) / σ_r = −mean_r / σ_r
+    //       I_src_norm_center = (src_center − true_mean_src) / σ_s = −mean_s / σ_s
+    float ref_norm_c = -mean_r / sigma_r;
+    float src_norm_c = -mean_s / sigma_s;
+    float d2ncc = w_center * (ref_norm_c - ncc * src_norm_c) / (sigma_s * sum_w);
+
+    return (float2)(ncc, d2ncc);
 }
 
 )CL"
     R"CL(
 
 // =====================================================================
-// svo_refine_clear — zero gradient + Adam buffers
+// svo_refine_clear — zero gradient (1 float/slot) + Adam (2 floats/slot)
 // =====================================================================
 __kernel void svo_refine_clear(
-    __global float* grad_buf,    // 4 floats per slot
-    __global float* adam_buf,    // 8 floats per slot
+    __global float* grad_buf,   // 1 float per slot
+    __global float* adam_buf,   // 2 floats per slot
     uint capacity,
-    int clear_adam)              // 1 = also clear Adam state
+    int  clear_adam)            // 1 = also clear Adam state
 {
     uint i = get_global_id(0);
     if (i >= capacity) return;
-    grad_buf[i * 4 + 0] = 0.0f;
-    grad_buf[i * 4 + 1] = 0.0f;
-    grad_buf[i * 4 + 2] = 0.0f;
-    grad_buf[i * 4 + 3] = 0.0f;
+    grad_buf[i] = 0.0f;
     if (clear_adam) {
-        for (int j = 0; j < 8; j++) adam_buf[i * 8 + j] = 0.0f;
+        adam_buf[i * 2 + 0] = 0.0f;  // m_d
+        adam_buf[i * 2 + 1] = 0.0f;  // v_d
     }
 }
 
 // =====================================================================
-// svo_refine_accumulate — per-pixel gradient accumulation
+// svo_refine_accumulate — per-pixel bilateral ZNCC gradient accumulation
 //
-// Dispatched once per camera view: global_size = (cols_pad, rows_pad).
-// For each pixel, ray-march to find the zero crossing, then project the
-// surface point into all OTHER views and compute photometric gradient.
+// Dispatched once per source view: global_size = (img_width, img_height).
+// For each pixel, ray-march the TSDF to find the surface point, then
+// project into all other views and accumulate the photometric SDF gradient
+// using bilateral Gaussian-windowed ZNCC (Pons-Keriven 2005/PAMI 2007).
+//
+// color_images: CL_RGBA CL_UNORM_INT8, one slice per view.
+// tsdf_depths:  CL_R   CL_FLOAT, one slice per view (TSDF-rendered; used
+//               for occlusion — updated each iteration before this kernel).
 // =====================================================================
 __kernel void svo_refine_accumulate(
     __global const VoxelSlot* table,
     uint                      capacity_mask,
-    __global float*           grad_buf,       // 4 floats per slot
-    __global const uchar*     color_images,   // packed RGB
-    __global const float*     depth_images,   // packed depths
-    __constant SVOCamera*     cameras,        // N cameras (constant memory)
-    __global const RefineImageDesc* img_descs,
+    __global float*           grad_buf,          // 1 float per slot
+    read_only image2d_array_t color_images,      // CL_RGBA UNORM_INT8
+    read_only image2d_array_t tsdf_depths,       // CL_R FLOAT
+    __constant SVOCamera*     cameras,
+    __global const int*       neighbor_buf,      // n_views × max_neighbors
+    int                       max_neighbors,     // K (e.g. 4)
     int                       n_views,
-    int                       src_view,       // which camera we're ray-casting from
+    int                       src_view,
+    int                       img_width,
+    int                       img_height,
     float                     voxel_size,
     float                     inv_voxel_size,
     float                     trunc_dist,
     float                     min_weight_scaled,
-    int                       color_only)     // 1 = skip SDF gradient
+    int                       half_patch,
+    float                     inv_sigma_s2,
+    float                     inv_sigma_c2)
 {
     int col = get_global_id(0);
     int row = get_global_id(1);
-    int src_w = img_descs[src_view].width;
-    int src_h = img_descs[src_view].height;
-    if (col >= src_w || row >= src_h) return;
+    if (col >= img_width || row >= img_height) return;
 
-    // Border margin: 5×5 patch needs ±2, plus ±1 for gradient = ±3 total.
-    if (col < 3 || col >= src_w - 3 || row < 3 || row >= src_h - 3) return;
+    // Border margin: half_patch + 1 gradient sample.
+    int margin = half_patch + 2;
+    if (col < margin || col >= img_width  - margin ||
+        row < margin || row >= img_height - margin) return;
 
-    // Check depth — skip if no valid depth at this pixel.
-    float d = sample_depth_nn(depth_images, img_descs, src_view, col, row);
+    // Nearest-neighbor sampler for depth lookup.
+    const sampler_t nn_samp = CLK_NORMALIZED_COORDS_FALSE |
+                              CLK_ADDRESS_CLAMP_TO_EDGE |
+                              CLK_FILTER_NEAREST;
+
+    // Depth of this pixel in the TSDF-rendered surface.
+    float d = read_imagef(tsdf_depths, nn_samp,
+                          (float4)((float)col + 0.5f, (float)row + 0.5f,
+                                   (float)src_view, 0.0f)).x;
     if (d <= 0.0f) return;
 
     // ---- Back-project pixel to world ----
@@ -1236,92 +1165,10 @@ __kernel void svo_refine_accumulate(
     float3 diff = (float3)(p_cam.x - cam->t[0],
                            p_cam.y - cam->t[1],
                            p_cam.z - cam->t[2]);
-    float3 p_world;
-    p_world.x = cam->Rinv[0]*diff.x + cam->Rinv[1]*diff.y + cam->Rinv[2]*diff.z;
-    p_world.y = cam->Rinv[3]*diff.x + cam->Rinv[4]*diff.y + cam->Rinv[5]*diff.z;
-    p_world.z = cam->Rinv[6]*diff.x + cam->Rinv[7]*diff.y + cam->Rinv[8]*diff.z;
-
-    float3 cp = (float3)(cam->cam_pos[0], cam->cam_pos[1], cam->cam_pos[2]);
-    float3 ray = p_world - cp;
-    float ray_len = length(ray);
-    if (ray_len < 1e-8f) return;
-    ray /= ray_len;
-
-    // ---- Ray-march: sphere stepping to find sign change ----
-    float min_step = 0.5f * voxel_size;
-    float max_step = 2.0f * voxel_size;
-    float t_start = fmax(0.0f, ray_len - trunc_dist);
-    float t_end   = ray_len + trunc_dist;
-
-    float tt = t_start;
-    float sdf_prev = sample_sdf_trilinear(table, capacity_mask,
-                         cp + tt * ray, inv_voxel_size, min_weight_scaled);
-    float t_prev = tt;
-    bool found = false;
-
-    #define REFINE_MAX_STEPS 64
-    for (int step = 0; step < REFINE_MAX_STEPS; step++) {
-        float sdf_cur = sample_sdf_trilinear(table, capacity_mask,
-                            cp + tt * ray, inv_voxel_size, min_weight_scaled);
-        if (sdf_cur < 0.0f && sdf_prev > 0.0f) {
-            found = true;
-            break;
-        }
-        t_prev = tt;
-        sdf_prev = sdf_cur;
-        float step_sz = clamp(fabs(sdf_cur) * voxel_size, min_step, max_step);
-        tt += step_sz;
-        if (tt > t_end) break;
-    }
-    if (!found) return;
-
-    // ---- Regula falsi sub-voxel refinement ----
-    float t_a = t_prev, f_a = sdf_prev;
-    float t_b = tt, f_b = sample_sdf_trilinear(table, capacity_mask,
-                               cp + tt * ray, inv_voxel_size, min_weight_scaled);
-    for (int i = 0; i < 4; i++) {
-        float denom = f_b - f_a;
-        if (fabs(denom) < 1e-10f) break;
-        float t_m = t_a - f_a * (t_b - t_a) / denom;
-        float f_m = sample_sdf_trilinear(table, capacity_mask,
-                        cp + t_m * ray, inv_voxel_size, min_weight_scaled);
-        if (f_m * f_a < 0.0f) { t_b = t_m; f_b = f_m; }
-        else                   { t_a = t_m; f_a = f_m; }
-    }
-    float t_surface = t_a - f_a * (t_b - t_a) / (f_b - f_a + 1e-10f);
-    float3 x_surface = cp + t_surface * ray;
-
-    // ---- Compute trilinear weights and slot indices for 8 corners ----
-    float fx = x_surface.x * inv_voxel_size - 0.5f;
-    float fy = x_surface.y * inv_voxel_size - 0.5f;
-    float fz = x_surface.z * inv_voxel_size - 0.5f;
-    int ix = (int)floor(fx);
-    int iy = (int)floor(fy);
-    int iz = (int)floor(fz);
-    float tx = fx - (float)ix;
-    float ty = fy - (float)iy;
-    float tz = fz - (float)iz;
-
-    float weights[8];
-    uint slots[8];
-    int corner_dx[8] = {0,1,0,1,0,1,0,1};
-    int corner_dy[8] = {0,0,1,1,0,0,1,1};
-    int corner_dz[8] = {0,0,0,0,1,1,1,1};
-
-    bool all_valid = true;
-    for (int c = 0; c < 8; c++) {
-        slots[c] = hash_lookup(table, capacity_mask,
-                               ix + corner_dx[c],
-                               iy + corner_dy[c],
-                               iz + corner_dz[c]);
-        if (slots[c] == 0xFFFFFFFF) { all_valid = false; break; }
-
-        float wx = corner_dx[c] ? tx : (1.0f - tx);
-        float wy = corner_dy[c] ? ty : (1.0f - ty);
-        float wz = corner_dz[c] ? tz : (1.0f - tz);
-        weights[c] = wx * wy * wz;
-    }
-    if (!all_valid) return;
+    float3 x_surface;
+    x_surface.x = cam->Rinv[0]*diff.x + cam->Rinv[1]*diff.y + cam->Rinv[2]*diff.z;
+    x_surface.y = cam->Rinv[3]*diff.x + cam->Rinv[4]*diff.y + cam->Rinv[5]*diff.z;
+    x_surface.z = cam->Rinv[6]*diff.x + cam->Rinv[7]*diff.y + cam->Rinv[8]*diff.z;
 
     // ---- Surface normal via central-difference SDF gradient ----
     float eps = 0.5f * voxel_size;
@@ -1331,135 +1178,116 @@ __kernel void svo_refine_accumulate(
     if (grad_len < 1e-6f) return;
     float3 normal = grad_sdf / grad_len;
 
-    // ---- Source camera patch statistics for affine normalization ----
-    float2 src_stats = patch_stats(color_images, img_descs,
-                                   src_view, (float)col, (float)row);
-    float src_mean = src_stats.x;
-    float src_inv_sigma = src_stats.y;
-    if (src_inv_sigma == 0.0f) return;  // flat patch — no photometric information
+    // ---- Trilinear corner slots (for gradient distribution) ----
+    float fx = x_surface.x * inv_voxel_size - 0.5f;
+    float fy = x_surface.y * inv_voxel_size - 0.5f;
+    float fz = x_surface.z * inv_voxel_size - 0.5f;
+    int ix = (int)floor(fx), iy = (int)floor(fy), iz = (int)floor(fz);
+    float tx = fx - (float)ix, ty = fy - (float)iy, tz = fz - (float)iz;
 
-    float3 src_color = sample_image_bilinear(color_images, img_descs,
-                                             src_view, (float)col, (float)row);
+    float weights[8];
+    uint  slots[8];
+    int cdx[8] = {0,1,0,1,0,1,0,1};
+    int cdy[8] = {0,0,1,1,0,0,1,1};
+    int cdz[8] = {0,0,0,0,1,1,1,1};
+    bool all_valid = true;
+    for (int c = 0; c < 8; c++) {
+        slots[c] = hash_lookup(table, capacity_mask,
+                               ix + cdx[c], iy + cdy[c], iz + cdz[c]);
+        if (slots[c] == 0xFFFFFFFF) { all_valid = false; break; }
+        float wx = cdx[c] ? tx : (1.0f - tx);
+        float wy = cdy[c] ? ty : (1.0f - ty);
+        float wz = cdz[c] ? tz : (1.0f - tz);
+        weights[c] = wx * wy * wz;
+    }
+    if (!all_valid) return;
 
-    // ---- Accumulate photometric gradient from other views ----
+    // ---- Accumulate photometric gradient from neighbor views ----
     float total_grad_d = 0.0f;
-    float total_grad_r = 0.0f;
-    float total_grad_g = 0.0f;
-    float total_grad_b = 0.0f;
-    int n_valid_views = 0;
+    int n_valid_views  = 0;
 
-    for (int j = 0; j < n_views; j++) {
-        if (j == src_view) continue;
+    const int nb_offset = src_view * max_neighbors;
+    for (int k = 0; k < max_neighbors; k++) {
+        int j = neighbor_buf[nb_offset + k];
+        if (j < 0) break;  // sentinel: end of neighbor list
 
         // Project surface point into view j.
-        float3 proj = project_point(cameras, j, x_surface);
-        if (proj.z <= 0.0f) continue;
+        __constant SVOCamera* cam_j = &cameras[j];
+        float3 p_j;
+        p_j.x = cam_j->R[0]*x_surface.x + cam_j->R[1]*x_surface.y + cam_j->R[2]*x_surface.z + cam_j->t[0];
+        p_j.y = cam_j->R[3]*x_surface.x + cam_j->R[4]*x_surface.y + cam_j->R[5]*x_surface.z + cam_j->t[1];
+        p_j.z = cam_j->R[6]*x_surface.x + cam_j->R[7]*x_surface.y + cam_j->R[8]*x_surface.z + cam_j->t[2];
+        if (p_j.z <= 0.0f) continue;
 
-        int jw = img_descs[j].width;
-        int jh = img_descs[j].height;
-        if (proj.x < 4.0f || proj.x >= (float)(jw - 4) ||
-            proj.y < 4.0f || proj.y >= (float)(jh - 4)) continue;
+        float inv_zj = 1.0f / p_j.z;
+        // Recover fx, fy from Kinv: Kinv row-0 = (1/fx, 0, -cx/fx), so fx = 1/Kinv[0].
+        float fx_j = 1.0f / (cam_j->Kinv[0] + 1e-12f);
+        float fy_j = 1.0f / (cam_j->Kinv[4] + 1e-12f);
+        float cx_j = -cam_j->Kinv[2] * fx_j;
+        float cy_j = -cam_j->Kinv[5] * fy_j;
+        float px = fx_j * p_j.x * inv_zj + cx_j;
+        float py = fy_j * p_j.y * inv_zj + cy_j;
 
-        // Depth-buffer visibility check.
-        float stored_depth = sample_depth_nn(depth_images, img_descs, j,
-                                            (int)(proj.x + 0.5f),
-                                            (int)(proj.y + 0.5f));
-        if (stored_depth > 0.0f && proj.z > stored_depth * 1.05f) continue;
+        // Bounds check (same resolution for all views).
+        if (px < (float)margin || px >= (float)(img_width  - margin) ||
+            py < (float)margin || py >= (float)(img_height - margin)) continue;
 
-        // Viewing angle check.
-        float3 cam_j_pos = (float3)(cameras[j].cam_pos[0],
-                                    cameras[j].cam_pos[1],
-                                    cameras[j].cam_pos[2]);
+        // TSDF-rendered occlusion check: x_surface occluded from j if it lies
+        // behind the TSDF front surface (5% margin for grazing tolerance).
+        float tsdf_d = read_imagef(tsdf_depths, nn_samp,
+                           (float4)(px + 0.5f, py + 0.5f, (float)j, 0.0f)).x;
+        if (tsdf_d > 0.0f && p_j.z > tsdf_d * 1.05f) continue;
+
+        // Viewing angle (cos between surface normal and view direction).
+        float3 cam_j_pos = (float3)(cam_j->cam_pos[0], cam_j->cam_pos[1], cam_j->cam_pos[2]);
         float3 ray_j = normalize(x_surface - cam_j_pos);
         float cos_angle = fabs(dot(normal, ray_j));
-        if (cos_angle < 0.15f) continue;  // grazing angle
+        if (cos_angle < 0.15f) continue;
 
-        // ---- Affine-normalized patch comparison ----
-        float2 dst_stats = patch_stats(color_images, img_descs,
-                                       j, proj.x, proj.y);
-        float dst_inv_sigma = dst_stats.y;
-        if (dst_inv_sigma == 0.0f) continue;  // flat patch in target view
+        // ---- Bilateral ZNCC between source and target views ----
+        float2 zncc_result = compute_zncc_array(
+            color_images,
+            src_view, (float)col, (float)row,
+            j, px, py,
+            half_patch, inv_sigma_s2, inv_sigma_c2);
 
-        float3 dst_color = sample_image_bilinear(color_images, img_descs,
-                                                 j, proj.x, proj.y);
+        float ncc   = zncc_result.x;
+        float d2ncc = zncc_result.y;
+        if (ncc < -0.5f) continue;  // failed or flat patch
 
-        // Normalized colors: (I - μ) / σ → affine-invariant comparison.
-        float src_gray = (src_color.x + src_color.y + src_color.z) * 0.333333f;
-        float dst_gray = (dst_color.x + dst_color.y + dst_color.z) * 0.333333f;
-        float src_norm = (src_gray - src_mean) * src_inv_sigma;
-        float dst_norm = (dst_gray - dst_stats.x) * dst_inv_sigma;
+        // ---- SDF gradient: Pons-Keriven eq.(14) ----
+        // Normal in camera j frame.
+        float n_cam_x = cam_j->R[0]*normal.x + cam_j->R[1]*normal.y + cam_j->R[2]*normal.z;
+        float n_cam_y = cam_j->R[3]*normal.x + cam_j->R[4]*normal.y + cam_j->R[5]*normal.z;
 
-        // Affine-normalized residual (scalar, for SDF gradient).
-        float norm_residual = dst_norm - src_norm;
+        // Projected normal derivative: ∂(u,v)/∂d = (fx/z × n_cam_x, fy/z × n_cam_y)
+        float du_dn = fx_j * inv_zj * n_cam_x;
+        float dv_dn = fy_j * inv_zj * n_cam_y;
 
-        // Raw color residual (for color gradient — keeps color info).
-        float3 residual = dst_color - src_color;
-        float r2 = residual.x * residual.x + residual.y * residual.y
-                 + residual.z * residual.z;
-        float sigma2 = 400.0f;
-        float cauchy_w = 2.0f / (sigma2 + r2);
+        // Image gradient ∇I_j at projected point.
+        const sampler_t lin_samp = CLK_NORMALIZED_COORDS_FALSE |
+                                   CLK_ADDRESS_CLAMP_TO_EDGE |
+                                   CLK_FILTER_LINEAR;
+        float2 ig = image_grad_array(color_images, lin_samp, px, py, j);
 
-        // Color gradient: push voxel color toward consensus.
-        total_grad_r += cauchy_w * residual.x * cos_angle;
-        total_grad_g += cauchy_w * residual.y * cos_angle;
-        total_grad_b += cauchy_w * residual.z * cos_angle;
-
-        if (!color_only) {
-            // ---- Per-channel SDF gradient with affine-normalized loss ----
-            float inv_z = 1.0f / proj.z;
-            float fx_j = 1.0f / (cameras[j].Kinv[0] + 1e-10f);
-            float fy_j = 1.0f / (cameras[j].Kinv[4] + 1e-10f);
-
-            // Normal in camera j coordinates.
-            float3 n_cam;
-            n_cam.x = cameras[j].R[0]*normal.x + cameras[j].R[1]*normal.y + cameras[j].R[2]*normal.z;
-            n_cam.y = cameras[j].R[3]*normal.x + cameras[j].R[4]*normal.y + cameras[j].R[5]*normal.z;
-
-            float du_dn = fx_j * inv_z * n_cam.x;
-            float dv_dn = fy_j * inv_z * n_cam.y;
-
-            // Per-channel image gradient → per-channel projected normal derivative.
-            // ∂E/∂d = Σ_ch [ ∂ρ/∂r_ch × ∇I_j_ch · (du_dn, dv_dn) ] / |∇D|
-            float s = 0.0f;
-            for (int ch = 0; ch < 3; ch++) {
-                float2 ig = image_gradient_channel(color_images, img_descs,
-                                                   j, proj.x, proj.y, ch);
-                float grad_proj = ig.x * du_dn + ig.y * dv_dn;
-                // Affine-normalized: scale image gradient by dst_inv_sigma.
-                grad_proj *= dst_inv_sigma;
-                // Cauchy on normalized residual (per-channel approximation).
-                float nr2 = norm_residual * norm_residual;
-                float cauchy_nr = 2.0f * norm_residual / (1.0f + nr2);
-                s += cauchy_nr * grad_proj;
-            }
-            s /= (3.0f * (grad_len + 1e-6f));
-
-            total_grad_d += s * cos_angle;
-        }
+        // Chain rule: ∂E/∂TSDF = −d2ncc × ∇I_j·(du_dn,dv_dn) × cos_angle / |∇SDF|
+        float proj_grad = ig.x * du_dn + ig.y * dv_dn;
+        float g = d2ncc * proj_grad * cos_angle / (grad_len + 1e-6f);
+        total_grad_d -= g;  // sign: minimize E = 1 − NCC
 
         n_valid_views++;
     }
 
     if (n_valid_views == 0) return;
 
-    // Normalize by number of valid view pairs.
     float inv_n = 1.0f / (float)n_valid_views;
     total_grad_d *= inv_n;
-    total_grad_r *= inv_n;
-    total_grad_g *= inv_n;
-    total_grad_b *= inv_n;
 
-    // ---- Distribute gradients to 8 corner voxels ----
+    // Distribute gradient to 8 trilinear corner voxels.
     for (int c = 0; c < 8; c++) {
         float w = weights[c];
         if (w < 1e-8f) continue;
-        uint si = slots[c];
-
-        // Atomic float add via CAS loop — prevents race-condition gradient loss.
-        atomic_add_f(&grad_buf[si * 4 + 0], w * total_grad_d);
-        atomic_add_f(&grad_buf[si * 4 + 1], w * total_grad_r);
-        atomic_add_f(&grad_buf[si * 4 + 2], w * total_grad_g);
-        atomic_add_f(&grad_buf[si * 4 + 3], w * total_grad_b);
+        atomic_add_f(&grad_buf[slots[c]], w * total_grad_d);
     }
 }
 
@@ -1467,26 +1295,26 @@ __kernel void svo_refine_accumulate(
     R"CL(
 
 // =====================================================================
-// svo_refine_update — Adam update + Laplacian regularization
+// svo_refine_update — Adam update + optional Laplacian regularization
 //
 // One work-item per hash table slot.
+// grad_buf: 1 float/slot.  adam_buf: 2 floats/slot (m_d, v_d).
+// Regularization is skipped entirely when lambda_reg == 0.
 // =====================================================================
 __kernel void svo_refine_update(
-    __global VoxelSlot*   table,
-    uint                  capacity_mask,
-    uint                  capacity,
-    __global float*       grad_buf,       // 4 floats per slot
-    __global float*       adam_buf,       // 8 floats per slot
-    float                 min_weight_scaled,
-    float                 voxel_size,
-    float                 lambda_reg,
-    float                 lr_sdf,
-    float                 lr_color,
-    float                 beta1,
-    float                 beta2,
-    float                 epsilon,
-    int                   iteration,       // for Adam bias correction
-    int                   update_sdf)      // 0 = color only, 1 = joint
+    __global VoxelSlot* table,
+    uint                capacity_mask,
+    uint                capacity,
+    __global float*     grad_buf,         // 1 float per slot
+    __global float*     adam_buf,         // 2 floats per slot
+    float               min_weight_scaled,
+    float               voxel_size,
+    float               lambda_reg,       // 0 = no regularization
+    float               lr_sdf,
+    float               beta1,
+    float               beta2,
+    float               epsilon,
+    int                 iteration)
 {
     uint i = get_global_id(0);
     if (i >= capacity) return;
@@ -1498,40 +1326,28 @@ __kernel void svo_refine_update(
     float sw = (float)table[i].sum_weight;
     if (sw < min_weight_scaled) return;
 
-    // Only update near-surface voxels (|TSDF| < 1.5 voxel band).
     float inv_fp_sw = 1.0f / (sw * (float)FP_SCALE);
     float tsdf = (float)table[i].sum_tsdf * inv_fp_sw;
-    if (fabs(tsdf) > 0.5f) return;  // far from surface
+    // Only update near-surface voxels.
+    if (fabs(tsdf) > 0.5f) return;
 
-    // Read accumulated gradients.
-    float grad_d = grad_buf[i * 4 + 0];
-    float grad_r = grad_buf[i * 4 + 1];
-    float grad_g = grad_buf[i * 4 + 2];
-    float grad_b = grad_buf[i * 4 + 3];
+    float grad_d = grad_buf[i];
+    // Clear for next iteration.
+    grad_buf[i] = 0.0f;
 
-    // Clear gradient buffer for next iteration.
-    grad_buf[i * 4 + 0] = 0.0f;
-    grad_buf[i * 4 + 1] = 0.0f;
-    grad_buf[i * 4 + 2] = 0.0f;
-    grad_buf[i * 4 + 3] = 0.0f;
-
-    // Skip if no gradient was accumulated.
-    float photo_d_mag = fabs(grad_d);
-    if (photo_d_mag + fabs(grad_r) + fabs(grad_g) + fabs(grad_b) < 1e-10f) return;
+    if (fabs(grad_d) < 1e-10f) return;
 
     int kx = (int)((key_ab >> 16) & 0xFFFF) - 32768;
     int ky = (int)(key_ab & 0xFFFF) - 32768;
     int kz = table[i].key_c;
 
-    // ---- Laplacian regularization on SDF ----
-    // Only apply if this voxel received photometric SDF gradient (avoids
-    // unconditional smoothing of voxels not hit by any ray this iteration).
-    if (update_sdf && lambda_reg > 0.0f && photo_d_mag > 1e-10f) {
+    // ---- Optional Laplacian regularization on SDF ----
+    if (lambda_reg > 0.0f) {
         float neighbor_sum = 0.0f;
         int n_nbrs = 0;
-        int dx[6] = {1,-1,0,0,0,0};
-        int dy[6] = {0,0,1,-1,0,0};
-        int dz[6] = {0,0,0,0,1,-1};
+        int dx[6] = {1,-1,0, 0,0, 0};
+        int dy[6] = {0, 0,1,-1,0, 0};
+        int dz[6] = {0, 0,0, 0,1,-1};
         for (int nb = 0; nb < 6; nb++) {
             uint ni = hash_lookup(table, capacity_mask,
                                   kx + dx[nb], ky + dy[nb], kz + dz[nb]);
@@ -1550,84 +1366,134 @@ __kernel void svo_refine_update(
 
     // ---- Weight-scaled learning rate ----
     float weight_factor = 1.0f / (1.0f + 0.002f * sw / (float)WEIGHT_SCALE);
-    float lr_d_eff = lr_sdf * weight_factor;
-    float lr_c_eff = lr_color * weight_factor;
+    float lr_eff = lr_sdf * weight_factor;
 
     // ---- Adam update ----
     int t_adam = iteration + 1;
     float bc1 = 1.0f - pown(beta1, t_adam);
     float bc2 = 1.0f - pown(beta2, t_adam);
 
-    __global float* adam = &adam_buf[i * 8];
+    float m_d = adam_buf[i * 2 + 0];
+    float v_d = adam_buf[i * 2 + 1];
 
-    if (update_sdf) {
-        // Adam on SDF: indices 0 (m_d) and 1 (v_d).
-        adam[0] = beta1 * adam[0] + (1.0f - beta1) * grad_d;
-        adam[1] = beta2 * adam[1] + (1.0f - beta2) * grad_d * grad_d;
-        float m_hat = adam[0] / bc1;
-        float v_hat = adam[1] / bc2;
-        float delta_d = lr_d_eff * m_hat / (sqrt(v_hat) + epsilon);
+    m_d = beta1 * m_d + (1.0f - beta1) * grad_d;
+    v_d = beta2 * v_d + (1.0f - beta2) * grad_d * grad_d;
 
-        // Update TSDF value.
-        float new_tsdf = clamp(tsdf - delta_d, -1.0f, 1.0f);
-        int new_sum_tsdf = (int)(new_tsdf * sw * (float)FP_SCALE);
-        table[i].sum_tsdf = new_sum_tsdf;
+    adam_buf[i * 2 + 0] = m_d;
+    adam_buf[i * 2 + 1] = v_d;
+
+    float m_hat = m_d / bc1;
+    float v_hat = v_d / bc2;
+    float delta_d = lr_eff * m_hat / (sqrt(v_hat) + epsilon);
+
+    float new_tsdf = clamp(tsdf - delta_d, -1.0f, 1.0f);
+    table[i].sum_tsdf = (int)(new_tsdf * sw * (float)FP_SCALE);
+}
+
+// =====================================================================
+// svo_bake_colors — GPU color baking from image2d_array_t
+//
+// Dispatched 1D over M extracted surface points.
+// For each point, select the best 1 or 2 front-facing visible views
+// (scored by cos_theta), blend their colors, and write to out_colors.
+//
+// color_images: CL_RGBA CL_UNORM_INT8, slice per view.
+// tsdf_depths:  CL_R   CL_FLOAT, slice per view (final TSDF render).
+// points:  M×3 float (world xyz).
+// normals: M×3 float (unit normals).
+// =====================================================================
+__kernel void svo_bake_colors(
+    __global const float*    points,
+    __global const float*    normals,
+    __global uchar*          out_colors,       // M × 3 RGB bytes
+    read_only image2d_array_t color_images,
+    read_only image2d_array_t tsdf_depths,
+    __constant SVOCamera*    cameras,
+    int                      n_views,
+    int                      img_width,
+    int                      img_height)
+{
+    uint gid = get_global_id(0);
+    // M is encoded as capacity of this kernel; boundary handled by Python dispatch.
+
+    float3 x = (float3)(points[gid*3], points[gid*3+1], points[gid*3+2]);
+    float3 n = (float3)(normals[gid*3], normals[gid*3+1], normals[gid*3+2]);
+
+    const sampler_t nn_samp  = CLK_NORMALIZED_COORDS_FALSE |
+                               CLK_ADDRESS_CLAMP_TO_EDGE |
+                               CLK_FILTER_NEAREST;
+    const sampler_t lin_samp = CLK_NORMALIZED_COORDS_FALSE |
+                               CLK_ADDRESS_CLAMP_TO_EDGE |
+                               CLK_FILTER_LINEAR;
+
+    // Track top-2 views by cos_theta score.
+    float best_score[2]  = {-1.0f, -1.0f};
+    int   best_view[2]   = {-1,    -1};
+    float best_px[2]     = { 0.0f,  0.0f};
+    float best_py[2]     = { 0.0f,  0.0f};
+
+    for (int j = 0; j < n_views; j++) {
+        __constant SVOCamera* cam_j = &cameras[j];
+
+        // Project point into view j.
+        float3 p_j;
+        p_j.x = cam_j->R[0]*x.x + cam_j->R[1]*x.y + cam_j->R[2]*x.z + cam_j->t[0];
+        p_j.y = cam_j->R[3]*x.x + cam_j->R[4]*x.y + cam_j->R[5]*x.z + cam_j->t[1];
+        p_j.z = cam_j->R[6]*x.x + cam_j->R[7]*x.y + cam_j->R[8]*x.z + cam_j->t[2];
+        if (p_j.z <= 0.0f) continue;
+
+        float inv_zj = 1.0f / p_j.z;
+        float fx_j = 1.0f / (cam_j->Kinv[0] + 1e-12f);
+        float fy_j = 1.0f / (cam_j->Kinv[4] + 1e-12f);
+        float cx_j = -cam_j->Kinv[2] * fx_j;
+        float cy_j = -cam_j->Kinv[5] * fy_j;
+        float px = fx_j * p_j.x * inv_zj + cx_j;
+        float py = fy_j * p_j.y * inv_zj + cy_j;
+
+        if (px < 1.0f || px >= (float)(img_width  - 1) ||
+            py < 1.0f || py >= (float)(img_height - 1)) continue;
+
+        // TSDF occlusion check.
+        float tsdf_d = read_imagef(tsdf_depths, nn_samp,
+                           (float4)(px + 0.5f, py + 0.5f, (float)j, 0.0f)).x;
+        if (tsdf_d > 0.0f && p_j.z > tsdf_d * 1.05f) continue;
+
+        // Score = viewing angle cosine.
+        float3 cam_pos_j = (float3)(cam_j->cam_pos[0], cam_j->cam_pos[1], cam_j->cam_pos[2]);
+        float3 view_dir  = normalize(cam_pos_j - x);
+        float cos_theta  = dot(n, view_dir);
+        if (cos_theta < 0.15f) continue;  // grazing
+
+        // Insert into top-2.
+        if (cos_theta > best_score[0]) {
+            best_score[1] = best_score[0]; best_view[1] = best_view[0];
+            best_px[1]    = best_px[0];    best_py[1]   = best_py[0];
+            best_score[0] = cos_theta; best_view[0] = j;
+            best_px[0] = px; best_py[0] = py;
+        } else if (cos_theta > best_score[1]) {
+            best_score[1] = cos_theta; best_view[1] = j;
+            best_px[1] = px; best_py[1] = py;
+        }
     }
 
-    // Adam on color: indices 2-7 (m_r, v_r, m_g, v_g, m_b, v_b).
-    float inv_sw = 1.0f / sw;
-    float cur_r = (float)table[i].sum_r * inv_sw;
-    float cur_g = (float)table[i].sum_g * inv_sw;
-    float cur_b = (float)table[i].sum_b * inv_sw;
+    float3 color = (float3)(0.5f, 0.5f, 0.5f);  // grey fallback
 
-    // ---- Laplacian regularization on color ----
-    // if (lambda_reg > 0.0f) {
-    //     float nbr_r = 0.0f, nbr_g = 0.0f, nbr_b = 0.0f;
-    //     int n_nbrs_c = 0;
-    //     int dx[6] = {1,-1,0,0,0,0};
-    //     int dy[6] = {0,0,1,-1,0,0};
-    //     int dz[6] = {0,0,0,0,1,-1};
-    //     for (int nb = 0; nb < 6; nb++) {
-    //         uint ni = hash_lookup(table, capacity_mask,
-    //                               kx + dx[nb], ky + dy[nb], kz + dz[nb]);
-    //         if (ni == 0xFFFFFFFF) continue;
-    //         float nsw = (float)table[ni].sum_weight;
-    //         if (nsw < min_weight_scaled) continue;
-    //         float inv_nsw = 1.0f / nsw;
-    //         nbr_r += (float)table[ni].sum_r * inv_nsw;
-    //         nbr_g += (float)table[ni].sum_g * inv_nsw;
-    //         nbr_b += (float)table[ni].sum_b * inv_nsw;
-    //         n_nbrs_c++;
-    //     }
-    //     if (n_nbrs_c > 0) {
-    //         float inv_n = 1.0f / (float)n_nbrs_c;
-    //         // Color regularization: 0.1× the SDF lambda (lighter touch).
-    //         float lambda_c = lambda_reg * 0.1f;
-    //         grad_r += lambda_c * 2.0f * (cur_r - nbr_r * inv_n);
-    //         grad_g += lambda_c * 2.0f * (cur_g - nbr_g * inv_n);
-    //         grad_b += lambda_c * 2.0f * (cur_b - nbr_b * inv_n);
-    //     }
-    // }
-
-    float grads_c[3] = {grad_r, grad_g, grad_b};
-    float curs_c[3] = {cur_r, cur_g, cur_b};
-    int sums_c[3];
-
-    for (int ch = 0; ch < 3; ch++) {
-        int mi = 2 + ch * 2;
-        int vi = 3 + ch * 2;
-        adam[mi] = beta1 * adam[mi] + (1.0f - beta1) * grads_c[ch];
-        adam[vi] = beta2 * adam[vi] + (1.0f - beta2) * grads_c[ch] * grads_c[ch];
-        float mh = adam[mi] / bc1;
-        float vh = adam[vi] / bc2;
-        float delta_c = lr_c_eff * mh / (sqrt(vh) + epsilon);
-        float new_c = clamp(curs_c[ch] - delta_c, 0.0f, 255.0f);
-        sums_c[ch] = (int)(new_c * sw);
+    if (best_view[0] >= 0) {
+        float3 c0 = color_from_array(color_images, lin_samp,
+                                     best_px[0], best_py[0], best_view[0]);
+        if (best_view[1] >= 0) {
+            float3 c1 = color_from_array(color_images, lin_samp,
+                                         best_px[1], best_py[1], best_view[1]);
+            float s0 = best_score[0], s1 = best_score[1];
+            color = (s0 * c0 + s1 * c1) / (s0 + s1);
+        } else {
+            color = c0;
+        }
     }
 
-    table[i].sum_r = sums_c[0];
-    table[i].sum_g = sums_c[1];
-    table[i].sum_b = sums_c[2];
+    out_colors[gid * 3 + 0] = (uchar)clamp(color.x * 255.0f, 0.0f, 255.0f);
+    out_colors[gid * 3 + 1] = (uchar)clamp(color.y * 255.0f, 0.0f, 255.0f);
+    out_colors[gid * 3 + 2] = (uchar)clamp(color.z * 255.0f, 0.0f, 255.0f);
 }
 
 // =====================================================================
@@ -1723,6 +1589,130 @@ __kernel void svo_raycast(
             // Linear interpolation to find exact crossing.
             float t_cross = prev_t + (tt - prev_t) * prev_tsdf / (prev_tsdf - tsdf + 1e-8f);
             // Convert parametric distance to camera-frame depth.
+            float3 hit_pos = cp + t_cross * dir_w;
+            float3 hit_cam;
+            hit_cam.x = cam->R[0]*hit_pos.x + cam->R[1]*hit_pos.y + cam->R[2]*hit_pos.z + cam->t[0];
+            hit_cam.y = cam->R[3]*hit_pos.x + cam->R[4]*hit_pos.y + cam->R[5]*hit_pos.z + cam->t[1];
+            hit_cam.z = cam->R[6]*hit_pos.x + cam->R[7]*hit_pos.y + cam->R[8]*hit_pos.z + cam->t[2];
+            rendered_depth[idx] = hit_cam.z;
+            hit_slot[idx] = prev_slot_idx;
+            return;
+        }
+
+        prev_tsdf = tsdf;
+        prev_slot_idx = slot_idx;
+        prev_t = tt;
+    }
+}
+
+// =====================================================================
+// svo_raycast_guided: Narrow-band raycast using a per-pixel depth hint.
+//
+// Instead of marching from min_depth to max_depth (potentially thousands of
+// steps), we use a depth hint (from clean depth or previous iteration) and
+// only search within [hint - margin, hint + margin] along the ray.
+// This reduces ~2000 steps/pixel to ~12 steps for typical trunc_dist.
+//
+// The depth_hints image provides per-pixel camera-frame depth from either
+// the original clean depth maps or the previous iteration's rendered output.
+//
+// Global work size: (cols_padded, rows_padded)
+// =====================================================================
+__kernel void svo_raycast_guided(
+    __global const VoxelSlot* table,
+    uint                      capacity_mask,
+    __global float*           rendered_depth,
+    __global uint*            hit_slot,
+    __constant SVOCamera*     cam,
+    __read_only image2d_array_t depth_hints,  // [n_views × H × W], CL_R FLOAT
+    int                       view_idx,
+    int                       rows,
+    int                       cols,
+    float                     voxel_size,
+    float                     inv_voxel_size,
+    float                     search_margin,  // world-space half-range
+    float                     min_weight
+) {
+    int c = get_global_id(0);
+    int r = get_global_id(1);
+    if (c >= cols || r >= rows) return;
+
+    int idx = r * cols + c;
+    rendered_depth[idx] = 0.0f;
+    hit_slot[idx] = 0xFFFFFFFFu;
+
+    // Read depth hint for this pixel.
+    const sampler_t samp = CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_CLAMP_TO_EDGE | CLK_FILTER_NEAREST;
+    float4 hint_val = read_imagef(depth_hints, samp, (int4)(c, r, view_idx, 0));
+    float z_hint = hint_val.x;
+    if (z_hint <= 0.0f) return;  // No hint → skip (no known surface here).
+
+    // Camera centre and ray direction.
+    float uc = (float)c, vr = (float)r;
+    float3 dir_cam;
+    dir_cam.x = cam->Kinv[0]*uc + cam->Kinv[1]*vr + cam->Kinv[2];
+    dir_cam.y = cam->Kinv[3]*uc + cam->Kinv[4]*vr + cam->Kinv[5];
+    dir_cam.z = cam->Kinv[6]*uc + cam->Kinv[7]*vr + cam->Kinv[8];
+
+    // Rotate to world frame.
+    float3 dir_w;
+    dir_w.x = cam->Rinv[0]*dir_cam.x + cam->Rinv[1]*dir_cam.y + cam->Rinv[2]*dir_cam.z;
+    dir_w.y = cam->Rinv[3]*dir_cam.x + cam->Rinv[4]*dir_cam.y + cam->Rinv[5]*dir_cam.z;
+    dir_w.z = cam->Rinv[6]*dir_cam.x + cam->Rinv[7]*dir_cam.y + cam->Rinv[8]*dir_cam.z;
+    float dir_len = length(dir_w);
+    if (dir_len < 1e-8f) return;
+    dir_w /= dir_len;
+
+    float3 cp = (float3)(cam->cam_pos[0], cam->cam_pos[1], cam->cam_pos[2]);
+
+    // Convert camera-frame depth hint to ray parameter.
+    // dz = dot(optical_axis_world, dir_w) = cos(angle to optical axis).
+    // Since dir_cam.z ~ focal_length for normalized coords, and dir_w is
+    // the normalized world ray: t = z / dz where dz = R[2,:] · dir_w.
+    float dz = cam->R[6]*dir_w.x + cam->R[7]*dir_w.y + cam->R[8]*dir_w.z;
+    if (fabs(dz) < 1e-8f) return;
+    float t_center = z_hint / dz;
+
+    // Convert world-space margin to ray-parameter margin.
+    float t_margin = search_margin / fabs(dz);
+    float t_min = fmax(t_center - t_margin, 0.1f);
+    float t_max = t_center + t_margin;
+
+    // Step through the narrow band.
+    float prev_tsdf = 2.0f;
+    uint  prev_slot_idx = 0xFFFFFFFFu;
+    float prev_t = t_min;
+
+    int min_weight_fp = (int)(min_weight * (float)WEIGHT_SCALE);
+
+    for (float tt = t_min; tt <= t_max; tt += voxel_size) {
+        float3 pos = cp + tt * dir_w;
+        int kx = (int)floor(pos.x * inv_voxel_size);
+        int ky = (int)floor(pos.y * inv_voxel_size);
+        int kz = (int)floor(pos.z * inv_voxel_size);
+
+        if (kx < -32768 || kx > 32766 || ky < -32768 || ky > 32766)
+            continue;
+
+        uint slot_idx = hash_lookup(table, capacity_mask, kx, ky, kz);
+        if (slot_idx > capacity_mask) {
+            prev_tsdf = 2.0f;
+            prev_t = tt;
+            continue;
+        }
+
+        int sw = table[slot_idx].sum_weight;
+        if (sw < min_weight_fp) {
+            prev_tsdf = 2.0f;
+            prev_t = tt;
+            continue;
+        }
+
+        float tsdf = (float)table[slot_idx].sum_tsdf / ((float)sw * (float)FP_SCALE / (float)WEIGHT_SCALE);
+
+        // Detect zero-crossing: prev > 0, current <= 0.
+        if (prev_tsdf > 0.0f && prev_tsdf <= 1.0f && tsdf <= 0.0f) {
+            float t_cross = prev_t + (tt - prev_t) * prev_tsdf / (prev_tsdf - tsdf + 1e-8f);
             float3 hit_pos = cp + t_cross * dir_w;
             float3 hit_cam;
             hit_cam.x = cam->R[0]*hit_pos.x + cam->R[1]*hit_pos.y + cam->R[2]*hit_pos.z + cam->t[0];

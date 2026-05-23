@@ -35,8 +35,9 @@ PYBIND11_MODULE(pydense, m) {
            py::arg("confidence") = py::none(), py::arg("name") = "")
       .def("fuse", &dense::SVOFuserWrapper::Fuse)
       .def("fuse_only", &dense::SVOFuserWrapper::FuseOnly)
-      .def("refine", &dense::SVOFuserWrapper::Refine, py::arg("color_iters"),
-           py::arg("joint_iters"), py::arg("lambda_reg"))
+      .def("refine_geometry", &dense::SVOFuserWrapper::RefineGeometry,
+           py::arg("iters"), py::arg("lambda_reg"))
+      .def("extract_and_bake", &dense::SVOFuserWrapper::ExtractAndBake)
       .def("prune_by_visibility", &dense::SVOFuserWrapper::PruneByVisibility,
            py::arg("iterations"), py::arg("carve_margin"),
            py::arg("carve_threshold"), py::arg("support_min"))

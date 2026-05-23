@@ -1699,20 +1699,19 @@ def _fuse_per_cluster(
                         ],
                     )
                 if refine_enabled:
-                    fuser.refine(
-                        color_iters=config[
-                            "depthmap_fusion_svo_refine_color_iters"
-                        ],
-                        joint_iters=config[
-                            "depthmap_fusion_svo_refine_joint_iters"
+                    fuser.refine_geometry(
+                        iters=config[
+                            "depthmap_fusion_svo_refine_iters"
                         ],
                         lambda_reg=config[
                             "depthmap_fusion_svo_refine_lambda_reg"
                         ],
                     )
-                pts_arr, nrm_arr, clr_arr = fuser.extract_points()
+                # Always bake colors (voxels no longer store color).
+                pts_arr, nrm_arr, clr_arr = fuser.extract_and_bake()
             else:
-                pts_arr, nrm_arr, clr_arr = fuser.fuse()
+                fuser.fuse_only()
+                pts_arr, nrm_arr, clr_arr = fuser.extract_and_bake()
             pts = np.asarray(pts_arr, dtype=np.float32)
             nrm = np.asarray(nrm_arr, dtype=np.float32)
             clr = np.asarray(clr_arr, dtype=np.uint8)

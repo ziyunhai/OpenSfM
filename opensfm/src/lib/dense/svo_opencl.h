@@ -10,7 +10,8 @@
 
 namespace dense {
 
-// Must match kernel-side VoxelSlot exactly (48 bytes).
+// Must match kernel-side VoxelSlot exactly (9 × int32 = 36 bytes).
+// Color is baked separately after extraction (svo_bake_colors kernel).
 struct GPUVoxelSlot {
   uint32_t key_ab;   // packed (x+32768)<<16 | (y+32768), EMPTY = 0xFFFFFFFF
   int32_t key_c;     // z coordinate, UNINIT = 0x80000000
@@ -19,13 +20,10 @@ struct GPUVoxelSlot {
   int32_t sum_nx;    // fixed-point normal.x accumulator
   int32_t sum_ny;
   int32_t sum_nz;
-  int32_t sum_r;  // color accumulator
-  int32_t sum_g;
-  int32_t sum_b;
   int32_t sum_weight;  // accumulated confidence weight (WEIGHT_SCALE units)
-  int32_t _pad;
+  int32_t _pad;        // reserved (alignment)
 };
-static_assert(sizeof(GPUVoxelSlot) == 48, "GPUVoxelSlot must be 48 bytes");
+static_assert(sizeof(GPUVoxelSlot) == 36, "GPUVoxelSlot must be 36 bytes");
 
 static constexpr int32_t kKeyCUninit = static_cast<int32_t>(0x80000000);
 
@@ -141,31 +139,27 @@ class SVOIntegratorCL {
 
   uint32_t capacity() const { return capacity_; }
 
-  // --- Photometric refinement ---
-  // Per-view image descriptor for the packed color image buffer.
-  struct ImageDesc {
-    int32_t width;
-    int32_t height;
-    int32_t offset;  // byte offset into packed color buffer
-    int32_t _pad;
-  };
-  static_assert(sizeof(ImageDesc) == 16, "ImageDesc must be 16 bytes");
+  // --- Photometric refinement (Pons-Keriven 2007 level-set) ---
 
   // Upload all view color images and cameras to GPU for refinement.
+  // All images must have the same resolution (img_width × img_height).
   // Must be called after Initialize() + Integrate() (hash table populated).
   void PrepareRefinement(const std::vector<SVOCameraGPU>& cameras,
                          const std::vector<uint8_t>& packed_colors,
-                         const std::vector<float>& packed_depths,
-                         const std::vector<ImageDesc>& image_descs,
-                         int n_views);
+                         const std::vector<float>& packed_depths, int img_width,
+                         int img_height, int n_views);
 
-  // Run photometric refinement on the GPU hash table in-place.
-  // Phase 1: color-only (color_iters), Phase 2: joint SDF+color (joint_iters).
-  // lambda_reg: initial regularization weight, decayed by lambda_decay per
-  // iter.
-  void Refine(int color_iters, int joint_iters, float lambda_reg,
-              float lambda_decay, float voxel_size, float trunc_dist,
-              float min_weight);
+  // Run SDF-only photometric refinement (bilateral ZNCC gradient + Adam).
+  // lambda_reg: Laplacian regularization (0 = disabled, default).
+  void RefineGeometry(int iters, float lambda_reg, float voxel_size,
+                      float trunc_dist, float min_weight);
+
+  // Bake colors onto extracted surface points via top-2 view selection.
+  // |points| and |normals|: M×3 float arrays (on CPU).
+  // |out_colors|: M×3 uint8_t RGB output.
+  void BakeColors(const std::vector<Vec3f>& points,
+                  const std::vector<Vec3f>& normals,
+                  std::vector<Vec3<uint8_t>>* out_colors);
 
   // --- Visibility pruning ---
   // Initialize carve/support vote buffers (same capacity as hash table).
@@ -187,8 +181,8 @@ class SVOIntegratorCL {
 
  private:
   void BuildKernels();
-  void EnsureFrameBuffers(int rows, int cols, bool has_normal, bool has_color,
-                          bool has_mask, bool has_weight);
+  void EnsureFrameBuffers(int rows, int cols, bool has_normal, bool has_mask,
+                          bool has_weight);
 
   int device_idx_;
   uint32_t capacity_ = 0;
@@ -203,7 +197,6 @@ class SVOIntegratorCL {
   cl::Buffer cl_camera_;
   cl::Buffer cl_depth_;
   cl::Buffer cl_normal_;
-  cl::Buffer cl_color_;
   cl::Buffer cl_mask_;
   cl::Buffer cl_weight_;
   cl::Buffer cl_dummy_;     // 1-byte placeholder for null pointers
@@ -226,19 +219,22 @@ class SVOIntegratorCL {
   cl::Kernel k_refine_clear_;
   cl::Kernel k_refine_accumulate_;
   cl::Kernel k_refine_update_;
-  cl::Buffer cl_refine_grad_;  // 4 floats/slot: grad_d, grad_r, grad_g, grad_b
-  cl::Buffer
-      cl_refine_adam_;  // 8 floats/slot: m_d, v_d, m_r, v_r, m_g, v_g, m_b, v_b
-  cl::Buffer cl_color_images_;   // packed RGB for all views
-  cl::Buffer cl_depth_images_;   // packed depth maps for all views (visibility)
-  cl::Buffer cl_cameras_array_;  // N × SVOCameraGPU
-  cl::Buffer cl_image_descs_;    // N × ImageDesc
+  cl::Kernel k_bake_colors_;
+  cl::Kernel k_raycast_guided_;
+  cl::Buffer cl_refine_grad_;         // 1 float/slot
+  cl::Buffer cl_refine_adam_;         // 2 floats/slot: m_d, v_d
+  cl::Image2DArray cl_color_images_;  // CL_RGBA CL_UNORM_INT8 [n_views × H × W]
+  cl::Image2DArray cl_tsdf_depths_;   // CL_R CL_FLOAT [n_views × H × W]
+  cl::Buffer cl_cameras_array_;       // N × SVOCameraGPU
   int n_refine_views_ = 0;
+  int refine_img_width_ = 0;
+  int refine_img_height_ = 0;
+  float refine_voxel_size_ = 0.05f;
+  float refine_min_weight_ = 0.0f;
   bool refine_prepared_ = false;
 
   size_t depth_bytes_ = 0;
   size_t normal_bytes_ = 0;
-  size_t color_bytes_ = 0;
   size_t mask_bytes_ = 0;
   size_t weight_bytes_ = 0;
 

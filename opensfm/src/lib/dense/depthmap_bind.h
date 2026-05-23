@@ -385,9 +385,30 @@ class SVOFuserWrapper {
     sf_.Fuse();
   }
 
-  void Refine(int color_iters, int joint_iters, float lambda_reg) {
+  void RefineGeometry(int iters, float lambda_reg) {
     py::gil_scoped_release release;
-    sf_.Refine(color_iters, joint_iters, lambda_reg);
+    sf_.RefineGeometry(iters, lambda_reg);
+  }
+
+  // Extract surface points and bake colors from images in one call.
+  // Requires PrepareRefinement still active (images on GPU).
+  py::list ExtractAndBake() {
+    std::vector<Vec3f> points;
+    std::vector<Vec3f> normals;
+    std::vector<Vec3<uint8_t>> colors;
+
+    {
+      py::gil_scoped_release release;
+      sf_.ExtractPoints(&points, &normals, &colors);
+      sf_.BakeColors(points, normals, &colors);
+    }
+
+    const int n = static_cast<int>(points.size());
+    py::list retn;
+    retn.append(foundation::py_array_from_data(points.data()->data(), n, 3));
+    retn.append(foundation::py_array_from_data(normals.data()->data(), n, 3));
+    retn.append(foundation::py_array_from_data(colors.data()->data(), n, 3));
+    return retn;
   }
 
   void PruneByVisibility(int iterations, float carve_margin,

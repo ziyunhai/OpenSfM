@@ -195,10 +195,11 @@ void SVOFuser::Fuse() {
   std::cerr << "[SVOFuser] Fuse complete, hash table alive on GPU\n";
 }
 
-void SVOFuser::Refine(int color_iters, int joint_iters, float lambda_reg) {
+void SVOFuser::RefineGeometry(int iters, float lambda_reg) {
   if (!integrator_) {
     throw std::runtime_error(
-        "SVOFuser::Refine: Fuse() must be called before Refine()");
+        "SVOFuser::RefineGeometry: Fuse() must be called before "
+        "RefineGeometry()");
   }
   if (views_.empty()) {
     return;
@@ -206,6 +207,10 @@ void SVOFuser::Refine(int color_iters, int joint_iters, float lambda_reg) {
 
   const float trunc_dist = trunc_factor_ * voxel_size_;
   const int n_views = static_cast<int>(views_.size());
+
+  // All views must have the same resolution.
+  const int h0 = static_cast<int>(views_[0].depth.rows());
+  const int w0 = static_cast<int>(views_[0].depth.cols());
 
   // Build packed camera array.
   std::vector<SVOCameraGPU> cameras(n_views);
@@ -218,7 +223,6 @@ void SVOFuser::Refine(int color_iters, int joint_iters, float lambda_reg) {
     const Mat3f Rinv = Rf.transpose();
     const Vec3f cam_pos = -Rinv * tf;
 
-    // ColMajor M^T data == RowMajor M data.
     auto to_row_major = [](const Mat3f& M, float* out) {
       const Mat3f Mt = M.transpose();
       std::memcpy(out, Mt.data(), 9 * sizeof(float));
@@ -237,55 +241,115 @@ void SVOFuser::Refine(int color_iters, int joint_iters, float lambda_reg) {
     cam._pad[0] = cam._pad[1] = cam._pad[2] = 0.0f;
   }
 
-  // Build packed color images and depth maps, plus descriptors.
-  std::vector<SVOIntegratorCL::ImageDesc> descs(n_views);
-  std::vector<uint8_t> packed_colors;
-  std::vector<float> packed_depths;
-  size_t color_offset = 0;
-  size_t depth_offset = 0;
+  // Build packed color images (RGB interleaved, same resolution).
+  const size_t npix = static_cast<size_t>(h0) * w0;
+  std::vector<uint8_t> packed_colors(npix * 3 * n_views, 0);
   for (int i = 0; i < n_views; ++i) {
     const auto& sv = views_[i];
-    const int h = static_cast<int>(sv.depth.rows());
-    const int w = static_cast<int>(sv.depth.cols());
-    const size_t npix = static_cast<size_t>(h) * w;
-
-    descs[i].width = w;
-    descs[i].height = h;
-    descs[i].offset = static_cast<int32_t>(color_offset);
-    descs[i]._pad = static_cast<int32_t>(depth_offset);
-
-    // Color: 3 bytes per pixel (interleaved RGB).
     if (sv.color.size() > 0) {
-      // PixelData3u8 is (3, h*w) ColMajor → need to interleave to (h*w, 3).
-      const size_t old_size = packed_colors.size();
-      packed_colors.resize(old_size + npix * 3);
+      uint8_t* dst = packed_colors.data() + i * npix * 3;
       for (size_t p = 0; p < npix; ++p) {
-        packed_colors[old_size + p * 3 + 0] = sv.color(0, p);
-        packed_colors[old_size + p * 3 + 1] = sv.color(1, p);
-        packed_colors[old_size + p * 3 + 2] = sv.color(2, p);
+        dst[p * 3 + 0] = sv.color(0, p);
+        dst[p * 3 + 1] = sv.color(1, p);
+        dst[p * 3 + 2] = sv.color(2, p);
       }
-    } else {
-      packed_colors.resize(packed_colors.size() + npix * 3, 0);
     }
-    color_offset += npix * 3;
-
-    // Depth: 4 bytes per pixel.
-    const size_t old_dsize = packed_depths.size();
-    packed_depths.resize(old_dsize + npix);
-    std::memcpy(packed_depths.data() + old_dsize, sv.depth.data(),
-                npix * sizeof(float));
-    depth_offset += npix;
   }
 
-  integrator_->PrepareRefinement(cameras, packed_colors, packed_depths, descs,
+  // Pack clean depth maps (float, row-major, per-view contiguous).
+  std::vector<float> packed_depths(npix * n_views, 0.0f);
+  for (int i = 0; i < n_views; ++i) {
+    const auto& sv = views_[i];
+    float* dst = packed_depths.data() + i * npix;
+    for (size_t p = 0; p < npix; ++p) {
+      dst[p] = sv.depth.data()[p];
+    }
+  }
+
+  integrator_->PrepareRefinement(cameras, packed_colors, packed_depths, w0, h0,
                                  n_views);
+  integrator_->RefineGeometry(iters, lambda_reg, voxel_size_, trunc_dist,
+                              min_weight_);
 
-  const float lambda_decay = 0.95f;
-  integrator_->Refine(color_iters, joint_iters, lambda_reg, lambda_decay,
-                      voxel_size_, trunc_dist, min_weight_);
+  std::cerr << "[SVOFuser] RefineGeometry complete (" << iters
+            << " iterations)\n";
+}
 
-  std::cerr << "[SVOFuser] Refine complete (" << color_iters << " color + "
-            << joint_iters << " joint iterations)\n";
+void SVOFuser::BakeColors(std::vector<Vec3f>& points,
+                          std::vector<Vec3f>& normals,
+                          std::vector<Vec3<uint8_t>>* colors) {
+  if (!integrator_) {
+    throw std::runtime_error(
+        "SVOFuser::BakeColors: Fuse() must be called first");
+  }
+  if (views_.empty() || points.empty()) {
+    return;
+  }
+
+  // If PrepareRefinement wasn't called (refine was skipped), upload images now.
+  // We check by trying to call BakeColors — it will throw if not prepared.
+  // Instead, we always ensure preparation here.
+  const int n_views = static_cast<int>(views_.size());
+  const int h0 = static_cast<int>(views_[0].depth.rows());
+  const int w0 = static_cast<int>(views_[0].depth.cols());
+  const size_t npix = static_cast<size_t>(h0) * w0;
+
+  // Build camera array.
+  std::vector<SVOCameraGPU> cameras(n_views);
+  for (int i = 0; i < n_views; ++i) {
+    const auto& sv = views_[i];
+    const Mat3f Kf = sv.K.cast<float>();
+    const Mat3f Rf = sv.R.cast<float>();
+    const Vec3f tf = sv.t.cast<float>();
+    const Mat3f Kinv = Kf.inverse();
+    const Mat3f Rinv = Rf.transpose();
+    const Vec3f cam_pos = -Rinv * tf;
+
+    auto to_row_major = [](const Mat3f& M, float* out) {
+      const Mat3f Mt = M.transpose();
+      std::memcpy(out, Mt.data(), 9 * sizeof(float));
+    };
+
+    SVOCameraGPU& cam = cameras[i];
+    to_row_major(Kinv, cam.Kinv);
+    to_row_major(Rinv, cam.Rinv);
+    to_row_major(Rf, cam.R);
+    cam.t[0] = tf.x();
+    cam.t[1] = tf.y();
+    cam.t[2] = tf.z();
+    cam.cam_pos[0] = cam_pos.x();
+    cam.cam_pos[1] = cam_pos.y();
+    cam.cam_pos[2] = cam_pos.z();
+    cam._pad[0] = cam._pad[1] = cam._pad[2] = 0.0f;
+  }
+
+  // Build packed color images.
+  std::vector<uint8_t> packed_colors(npix * 3 * n_views, 0);
+  for (int i = 0; i < n_views; ++i) {
+    const auto& sv = views_[i];
+    if (sv.color.size() > 0) {
+      uint8_t* dst = packed_colors.data() + i * npix * 3;
+      for (size_t p = 0; p < npix; ++p) {
+        dst[p * 3 + 0] = sv.color(0, p);
+        dst[p * 3 + 1] = sv.color(1, p);
+        dst[p * 3 + 2] = sv.color(2, p);
+      }
+    }
+  }
+
+  // Pack clean depth maps for PrepareRefinement.
+  std::vector<float> packed_depths(npix * n_views, 0.0f);
+  for (int i = 0; i < n_views; ++i) {
+    const auto& sv = views_[i];
+    float* dst = packed_depths.data() + i * npix;
+    for (size_t p = 0; p < npix; ++p) {
+      dst[p] = sv.depth.data()[p];
+    }
+  }
+
+  integrator_->PrepareRefinement(cameras, packed_colors, packed_depths, w0, h0,
+                                 n_views);
+  integrator_->BakeColors(points, normals, colors);
 }
 
 void SVOFuser::PruneByVisibility(int iterations, float carve_margin,
@@ -509,9 +573,6 @@ void SVOFuser::ExtractPoints(std::vector<Vec3f>* fused_points,
 
   std::cerr << "[SVOFuser] Total ExtractPoints: " << fused_points->size()
             << " surface points (fine + fill)\n";
-
-  // Release fine GPU resources.
-  integrator_.reset();
 }
 
 // Legacy API: Fuse + ExtractPoints in one call.

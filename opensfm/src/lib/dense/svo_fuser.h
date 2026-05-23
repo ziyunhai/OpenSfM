@@ -54,10 +54,17 @@ class SVOFuser {
   // Throws if CountVoxels() was not called first.
   void Fuse();
 
-  // Photometric refinement on the GPU hash table (in-place).
-  // Phase 1: color-only (color_iters), Phase 2: joint SDF+color (joint_iters).
+  // SDF-only photometric refinement (Pons-Keriven 2007 level-set).
+  // All views must have the same resolution.
+  // lambda_reg: Laplacian regularization weight (0 = disabled, default).
   // Must be called after Fuse().
-  void Refine(int color_iters, int joint_iters, float lambda_reg);
+  void RefineGeometry(int iters, float lambda_reg);
+
+  // Bake colors onto extracted points via top-2 view selection.
+  // Must be called after ExtractPoints() fills points/normals.
+  // Mutates colors in-place.
+  void BakeColors(std::vector<Vec3f>& points, std::vector<Vec3f>& normals,
+                  std::vector<Vec3<uint8_t>>* colors);
 
   // Visibility-based pruning of the TSDF hash table.
   // Raycasts the hash table from each integrated view, compares with its
@@ -98,13 +105,13 @@ class SVOFuser {
   float voxel_size_;
   float trunc_factor_;
   float min_weight_;
-  uint32_t decimate_flat_ = 1;     // 1 = keep all, N = keep 1/N on flats
-  float edge_threshold_ = 0.15f;   // normal divergence threshold for "edge"
-  int min_count_ = 2;              // min observation count for extraction
+  uint32_t decimate_flat_ = 1;        // 1 = keep all, N = keep 1/N on flats
+  float edge_threshold_ = 0.15f;      // normal divergence threshold for "edge"
+  int min_count_ = 2;                 // min observation count for extraction
   float relative_min_weight_ = 0.0f;  // local adaptive threshold (0=off)
-  int num_levels_ = 1;             // Multi-level fill: 1 = fine only
-  int device_idx_ = 0;             // OpenCL device index
-  uint32_t last_voxel_count_ = 0;  // cached from CountVoxels()
+  int num_levels_ = 1;                // Multi-level fill: 1 = fine only
+  int device_idx_ = 0;                // OpenCL device index
+  uint32_t last_voxel_count_ = 0;     // cached from CountVoxels()
   bool has_bbox_ = false;
   Eigen::Vector3f bbox_min_world_ = Eigen::Vector3f::Zero();
   Eigen::Vector3f bbox_max_world_ = Eigen::Vector3f::Zero();
