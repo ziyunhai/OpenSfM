@@ -93,8 +93,14 @@ class SVOIntegratorCL {
   // in the hash table and interpolates position/normal/color.
   // Much faster than Download() + SVO::ExtractPoints() because only
   // the surface points (~5-10% of voxels) are transferred back.
-  void ExtractPoints(float min_weight, float voxel_size,
-                     std::vector<Vec3f>* points, std::vector<Vec3f>* normals,
+  // decimate_flat: 1=keep all, N=keep 1/N on flat surfaces.
+  // edge_threshold: normal divergence below which a crossing is "flat".
+  // min_count: minimum observation count for both voxels in a crossing.
+  // relative_min_weight: local adaptive threshold (0=disabled).
+  void ExtractPoints(float min_weight, float voxel_size, uint32_t decimate_flat,
+                     float edge_threshold, int min_count,
+                     float relative_min_weight, std::vector<Vec3f>* points,
+                     std::vector<Vec3f>* normals,
                      std::vector<Vec3<uint8_t>>* colors);
 
   // Multi-level fill extraction: sub-sample coarse TSDF crossings at

@@ -30,6 +30,10 @@ class SVOFuser {
   void SetMinWeight(float w);
   void SetDevice(int device_idx);
   void SetNumLevels(int n);
+  void SetDecimateFat(uint32_t n);
+  void SetEdgeThreshold(float t);
+  void SetMinCount(int n);
+  void SetRelativeMinWeight(float w);
   void SetBBox(const Eigen::Vector3f& min_world,
                const Eigen::Vector3f& max_world);
   static bool IsGPUAvailable();
@@ -94,6 +98,10 @@ class SVOFuser {
   float voxel_size_;
   float trunc_factor_;
   float min_weight_;
+  uint32_t decimate_flat_ = 1;     // 1 = keep all, N = keep 1/N on flats
+  float edge_threshold_ = 0.15f;   // normal divergence threshold for "edge"
+  int min_count_ = 2;              // min observation count for extraction
+  float relative_min_weight_ = 0.0f;  // local adaptive threshold (0=off)
   int num_levels_ = 1;             // Multi-level fill: 1 = fine only
   int device_idx_ = 0;             // OpenCL device index
   uint32_t last_voxel_count_ = 0;  // cached from CountVoxels()

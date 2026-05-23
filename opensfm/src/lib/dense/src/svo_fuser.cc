@@ -28,6 +28,18 @@ void SVOFuser::SetDevice(int device_idx) { device_idx_ = device_idx; }
 
 void SVOFuser::SetNumLevels(int n) { num_levels_ = std::max(1, n); }
 
+void SVOFuser::SetDecimateFat(uint32_t n) { decimate_flat_ = std::max(1u, n); }
+
+void SVOFuser::SetEdgeThreshold(float t) {
+  edge_threshold_ = std::max(0.0f, std::min(1.0f, t));
+}
+
+void SVOFuser::SetMinCount(int n) { min_count_ = std::max(1, n); }
+
+void SVOFuser::SetRelativeMinWeight(float w) {
+  relative_min_weight_ = std::max(0.0f, w);
+}
+
 void SVOFuser::SetBBox(const Eigen::Vector3f& min_world,
                        const Eigen::Vector3f& max_world) {
   has_bbox_ = true;
@@ -347,8 +359,9 @@ void SVOFuser::ExtractPoints(std::vector<Vec3f>* fused_points,
   }
 
   // Phase 1: Extract fine level (L=0).
-  integrator_->ExtractPoints(min_weight_, voxel_size_, fused_points,
-                             fused_normals, fused_colors);
+  integrator_->ExtractPoints(min_weight_, voxel_size_, decimate_flat_,
+                             edge_threshold_, min_count_, relative_min_weight_,
+                             fused_points, fused_normals, fused_colors);
   std::cerr << "[SVOFuser] Fine (L=0): " << fused_points->size()
             << " surface points\n";
 

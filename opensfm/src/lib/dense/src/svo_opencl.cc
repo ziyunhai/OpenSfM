@@ -629,6 +629,9 @@ VoxelMap SVOIntegratorCL::Download() const {
 }
 
 void SVOIntegratorCL::ExtractPoints(float min_weight, float voxel_size,
+                                    uint32_t decimate_flat,
+                                    float edge_threshold, int min_count,
+                                    float relative_min_weight,
                                     std::vector<Vec3f>* points,
                                     std::vector<Vec3f>* normals,
                                     std::vector<Vec3<uint8_t>>* colors) {
@@ -685,6 +688,10 @@ void SVOIntegratorCL::ExtractPoints(float min_weight, float voxel_size,
   k_extract_.setArg(arg++, capacity_);
   k_extract_.setArg(arg++, min_weight_scaled);
   k_extract_.setArg(arg++, voxel_size);
+  k_extract_.setArg(arg++, static_cast<cl_uint>(decimate_flat));
+  k_extract_.setArg(arg++, edge_threshold);
+  k_extract_.setArg(arg++, static_cast<cl_int>(min_count));
+  k_extract_.setArg(arg++, relative_min_weight);
   k_extract_.setArg(arg++, cl_out_pts);
   k_extract_.setArg(arg++, cl_out_nrm);
   k_extract_.setArg(arg++, cl_out_clr);

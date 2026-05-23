@@ -596,6 +596,10 @@ __kernel void svo_extract_points(
     uint                      capacity,
     float                     min_weight_scaled,
     float                     voxel_size,
+    uint                      decimate_flat,
+    float                     edge_threshold,
+    int                       min_count,
+    float                     relative_min_weight,
     __global float*           out_points,
     __global float*           out_normals,
     __global uchar*           out_colors,
@@ -609,7 +613,7 @@ __kernel void svo_extract_points(
     uint key_ab_a = table[i].key_ab;
     if (key_ab_a == EMPTY_KEY) return;
     int count_a = table[i].count;
-    if (count_a == 0) return;
+    if (count_a < min_count) return;
 
     float sw_a = (float)table[i].sum_weight;
     if (sw_a < min_weight_scaled) return;
@@ -642,6 +646,9 @@ __kernel void svo_extract_points(
 
         uint nb_idx = hash_lookup(table, capacity_mask, nx, ny, nz);
         if (nb_idx == 0xFFFFFFFF) continue;
+
+        int count_b = table[nb_idx].count;
+        if (count_b < min_count) continue;
 
         float sw_b = (float)table[nb_idx].sum_weight;
         if (sw_b < min_weight_scaled) continue;
@@ -684,6 +691,34 @@ __kernel void svo_extract_points(
         float rb = (float)table[nb_idx].sum_r * inv_sw_b;
         float gb = (float)table[nb_idx].sum_g * inv_sw_b;
         float bb = (float)table[nb_idx].sum_b * inv_sw_b;
+
+        // Local adaptive weight threshold: require weight to be a fraction
+        // of the local neighborhood maximum.  Skipped when relative_min_weight <= 0.
+        if (relative_min_weight > 0.0f) {
+            float local_max_w = fmax(sw_a, sw_b);
+            // Sample 6-connected neighborhood for maximum weight.
+            int nb6_dx[6] = {1, -1, 0,  0, 0,  0};
+            int nb6_dy[6] = {0,  0, 1, -1, 0,  0};
+            int nb6_dz[6] = {0,  0, 0,  0, 1, -1};
+            for (int n = 0; n < 6; n++) {
+                uint nidx = hash_lookup(table, capacity_mask,
+                    kx + nb6_dx[n], ky + nb6_dy[n], kz + nb6_dz[n]);
+                if (nidx != 0xFFFFFFFF)
+                    local_max_w = fmax(local_max_w, (float)table[nidx].sum_weight);
+            }
+            float adaptive_min = fmax(min_weight_scaled, local_max_w * relative_min_weight);
+            if (sw_a < adaptive_min || sw_b < adaptive_min) continue;
+        }
+
+        // Curvature-adaptive decimation: skip flat-region points.
+        if (decimate_flat > 1u) {
+            float cos_nn = na_x*nb_x + na_y*nb_y + na_z*nb_z;
+            float edge_score = 1.0f - fabs(cos_nn);
+            if (edge_score < edge_threshold) {
+                // Flat region: deterministic spatial skip.
+                if (voxel_hash(kx, ky, kz) % decimate_flat != 0u) continue;
+            }
+        }
 
         // Atomic output index.
         uint out_idx = atomic_add(out_counter, 1u);

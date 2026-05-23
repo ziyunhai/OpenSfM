@@ -497,10 +497,23 @@ class OpenSfMConfig:
     # SVO truncation factor: truncation_distance = factor * voxel_size.
     depthmap_fusion_svo_trunc_factor: float = 8
     # SVO minimum weight for extracting points
-    depthmap_fusion_svo_min_weight: float = 3
+    depthmap_fusion_svo_min_weight: float = 2.0
     # Number of multi-level fill passes (1=fine only, 3=fine+2 coarser).
     # Coarser levels fill in holes where the fine grid has no coverage.
     depthmap_fusion_svo_num_levels: int = 3
+    # Flat-surface decimation factor for extraction (1=off, 4=keep 1/4).
+    # Reduces point density on flat surfaces while preserving sharp edges.
+    depthmap_fusion_svo_decimate_flat: int = 4
+    # Edge detection threshold for decimation (0-1). Crossings with
+    # normal divergence above this are considered edges and never decimated.
+    depthmap_fusion_svo_edge_threshold: float = 0.15
+    # Minimum observation count for both voxels in a zero-crossing.
+    # Rejects single-view noise when min_weight is set low for recall.
+    depthmap_fusion_svo_min_count: int = 2
+    # Local adaptive weight threshold (0=disabled). A crossing is only
+    # extracted if both voxels have weight >= this fraction of the local
+    # 6-neighborhood maximum weight. Allows weak areas to self-calibrate.
+    depthmap_fusion_svo_relative_min_weight: float = 0.5
     # Maximum unique voxels per SVO sub-volume.
     # Clusters are spatially split so each piece stays within this budget.
     # The GPU hash table is sized to 2x this (50% load factor).

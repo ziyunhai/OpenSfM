@@ -317,6 +317,10 @@ class SVOFuserWrapper {
   void SetMinWeight(float w) { sf_.SetMinWeight(w); }
   void SetDevice(int device_idx) { sf_.SetDevice(device_idx); }
   void SetNumLevels(int n) { sf_.SetNumLevels(n); }
+  void SetDecimateFat(int n) { sf_.SetDecimateFat(static_cast<uint32_t>(n)); }
+  void SetEdgeThreshold(float t) { sf_.SetEdgeThreshold(t); }
+  void SetMinCount(int n) { sf_.SetMinCount(n); }
+  void SetRelativeMinWeight(float w) { sf_.SetRelativeMinWeight(w); }
   void SetBBox(const Vec3f& min_world, const Vec3f& max_world) {
     sf_.SetBBox(min_world, max_world);
   }
