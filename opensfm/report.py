@@ -102,11 +102,12 @@ def _quality_color_lower_is_better(
 
 
 class Report:
-    def __init__(self, data: DataSet) -> None:
+    def __init__(self, data: DataSet, title: Optional[str] = None) -> None:
         self.output_path: str = os.path.join(data.data_path, "stats")
         self.dataset_name: str = os.path.basename(data.data_path)
         self.io_handler: io.IoFilesystemBase = data.io_handler
         self.data_path: str = data.data_path
+        self.custom_title: Optional[str] = title
 
         self.pdf = FPDF("P", "mm", "A4")
         self.pdf.set_auto_page_break(auto=True, margin=MARGIN)
@@ -332,6 +333,26 @@ class Report:
         self.pdf.cell(size, CELL_HEIGHT, "       " + text, align="L")
 
     def make_title(self) -> None:
+        if self.custom_title is not None:
+            # Custom title: title in accent, "Quality Report" in panel, "Powered by OpenSfM" below
+            self.pdf.set_xy(MARGIN, MARGIN)
+            self.pdf.set_font("Helvetica", "B", FONT_TITLE)
+            self.pdf.set_text_color(*COLOR_ACCENT)
+            self.pdf.cell(CONTENT_WIDTH, 10, self.custom_title, align="C")
+
+            self.pdf.set_xy(MARGIN, MARGIN + 9)
+            self.pdf.set_font("Helvetica", "", FONT_H1)
+            self.pdf.set_text_color(*COLOR_PANEL)
+            self.pdf.cell(CONTENT_WIDTH, 8, "Quality Report", align="C")
+
+            self.pdf.set_xy(MARGIN, MARGIN + 17)
+            self.pdf.set_font("Helvetica", "", FONT_SMALL)
+            self.pdf.set_text_color(*COLOR_TEXT_SECONDARY)
+            self.pdf.cell(CONTENT_WIDTH, 6, "Powered by OpenSfM", align="C")
+
+            self.pdf.set_xy(MARGIN, MARGIN + 26)
+            return
+
         # Logo
         logo_path = os.path.normpath(LOGO_PATH)
         if os.path.exists(logo_path):
@@ -712,7 +733,7 @@ class Report:
         if not details:
             return
 
-        self._make_section("GCP/CP Details")
+        self._make_section("Ground Control Point/Checkpoint Details")
 
         # GSD-based quality thresholds for error cells
         gsd = self.stats["reconstruction_statistics"].get("gsd", -1.0)

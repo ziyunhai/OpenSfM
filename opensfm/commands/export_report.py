@@ -12,7 +12,11 @@ class Command(command.CommandBase):
     help = "Export a nice report based on previously generated statistics"
 
     def run_impl(self, dataset: DataSet, args: argparse.Namespace) -> None:
-        export_report.run_dataset(dataset)
+        export_report.run_dataset(dataset, title=args.title)
 
     def add_arguments_impl(self, parser: argparse.ArgumentParser) -> None:
-        pass
+        parser.add_argument(
+            "--title",
+            default=None,
+            help="Custom report title (replaces the default OpenSfM branding)",
+        )
