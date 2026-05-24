@@ -100,6 +100,6 @@ depthmap_speckle_min_size: 0
 # Maximum gap size in pixels for linear depth interpolation (0 = disabled)
 depthmap_gap_max_size: 0
 # Weight for geometric consistency cost (0 = disabled). Applied per source view.
-depthmap_geom_consistency_weight: 0
+depthmap_geom_consistency_weight: 0.05
 # Use SfM points to seed a Delaunay planar prior before PatchMatch iterations
 depthmap_sfm_planar_prior: False

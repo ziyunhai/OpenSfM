@@ -469,6 +469,15 @@ int compute_cost_vector(
     jdy_x[i] = proj_dy.x / proj_dy.z - src_cxs[i];
     jdy_y[i] = proj_dy.y / proj_dy.z - src_cys[i];
 
+    // Reject degenerate warps via Jacobian determinant (patch area ratio).
+    // det ≈ 0: patch collapses to a line (badly-oriented normal) → samples
+    //          near-identical pixels → artificially high NCC.
+    // det >> 1: patch explodes → correlates unrelated content.
+    float det = jdx_x[i] * jdy_y[i] - jdx_y[i] * jdy_x[i];
+    if (det < 0.02f || det > 50.0f) {
+      src_valid[i] = 0; out_costs[i] = 2.0f; continue;
+    }
+
     src_centers[i] = read_imagef(src_images, samp,
         (float4)(src_cxs[i] + 0.5f, src_cys[i] + 0.5f, (float)i, 0.0f)).x;
     src_valid[i] = 1;

@@ -481,8 +481,9 @@ class OpenSfMConfig:
     depthmap_slic_compactness: float = 60.0    # Mahalanobis distance threshold for per-segment outlier rejection
     # during cleaning.  Points exceeding this in the segment's robust
     # covariance are zeroed.  Lower = more aggressive filtering.
-    depthmap_slic_mahal_threshold: float = 3.0    # Weight for geometric consistency cost (0 = disabled). Applied per source view.
-    depthmap_geom_consistency_weight: float = 0
+    depthmap_slic_mahal_threshold: float = 3.0    
+    # Weight for geometric consistency cost (0 = disabled). Applied per source view.
+    depthmap_geom_consistency_weight: float = 0.05
     # Maximum number of reference views per cluster for geometric consistency.
     depthmap_cluster_max_size: int = 8
     # Use SfM points to seed a Delaunay planar prior before PatchMatch iterations
