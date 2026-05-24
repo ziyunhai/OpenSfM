@@ -102,12 +102,13 @@ def _quality_color_lower_is_better(
 
 
 class Report:
-    def __init__(self, data: DataSet, title: Optional[str] = None) -> None:
+    def __init__(self, data: DataSet, title: Optional[str] = None, accent_color: Optional[Tuple[int, int, int]] = None) -> None:
         self.output_path: str = os.path.join(data.data_path, "stats")
         self.dataset_name: str = os.path.basename(data.data_path)
         self.io_handler: io.IoFilesystemBase = data.io_handler
         self.data_path: str = data.data_path
         self.custom_title: Optional[str] = title
+        self.accent_color: Tuple[int, int, int] = accent_color if accent_color is not None else COLOR_ACCENT
 
         self.pdf = FPDF("P", "mm", "A4")
         self.pdf.set_auto_page_break(auto=True, margin=MARGIN)
@@ -130,7 +131,7 @@ class Report:
     def _draw_accent_rule(self) -> None:
         """Draw a thin green accent line under the current position."""
         y = self.pdf.get_y()
-        self.pdf.set_draw_color(*COLOR_ACCENT)
+        self.pdf.set_draw_color(*self.accent_color)
         self.pdf.set_line_width(0.8)
         self.pdf.line(MARGIN, y, MARGIN + CONTENT_WIDTH, y)
         self.pdf.set_xy(MARGIN, y + 2)
@@ -337,7 +338,7 @@ class Report:
             # Custom title: title in accent, "Quality Report" in panel, "Powered by OpenSfM" below
             self.pdf.set_xy(MARGIN, MARGIN)
             self.pdf.set_font("Helvetica", "B", FONT_TITLE)
-            self.pdf.set_text_color(*COLOR_ACCENT)
+            self.pdf.set_text_color(*self.accent_color)
             self.pdf.cell(CONTENT_WIDTH, 10, self.custom_title, align="C")
 
             self.pdf.set_xy(MARGIN, MARGIN + 9)
@@ -367,7 +368,7 @@ class Report:
         # Title
         self.pdf.set_xy(title_x, MARGIN)
         self.pdf.set_font("Helvetica", "B", FONT_TITLE)
-        self.pdf.set_text_color(*COLOR_ACCENT)
+        self.pdf.set_text_color(*self.accent_color)
         self.pdf.cell(0, 10, "OpenSfM", align="L")
 
         self.pdf.set_xy(title_x, MARGIN + 9)
