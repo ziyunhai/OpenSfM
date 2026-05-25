@@ -141,11 +141,14 @@ class SVOIntegratorCL {
 
   // --- Photometric refinement (Pons-Keriven 2007 level-set) ---
 
-  // Upload all view color images and cameras to GPU for refinement.
+  // Upload all view color images, masks, and cameras to GPU for refinement.
   // All images must have the same resolution (img_width × img_height).
-  // Must be called after Initialize() + Integrate() (hash table populated).
+  // packed_masks: per-pixel validity (255=valid, 0=invalid), encoded in RGBA
+  // alpha. Must be called after Initialize() + Integrate() (hash table
+  // populated).
   void PrepareRefinement(const std::vector<SVOCameraGPU>& cameras,
                          const std::vector<uint8_t>& packed_colors,
+                         const std::vector<uint8_t>& packed_masks,
                          const std::vector<float>& packed_depths, int img_width,
                          int img_height, int n_views);
 

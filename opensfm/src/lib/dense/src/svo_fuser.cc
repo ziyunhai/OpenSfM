@@ -256,6 +256,16 @@ void SVOFuser::RefineGeometry(int iters, float lambda_reg) {
     }
   }
 
+  // Pack validity masks (uint8, per-view contiguous).
+  std::vector<uint8_t> packed_masks(npix * n_views, 255);
+  for (int i = 0; i < n_views; ++i) {
+    const auto& sv = views_[i];
+    if (sv.mask.size() > 0) {
+      uint8_t* dst = packed_masks.data() + i * npix;
+      std::memcpy(dst, sv.mask.data(), npix);
+    }
+  }
+
   // Pack clean depth maps (float, row-major, per-view contiguous).
   std::vector<float> packed_depths(npix * n_views, 0.0f);
   for (int i = 0; i < n_views; ++i) {
@@ -266,8 +276,8 @@ void SVOFuser::RefineGeometry(int iters, float lambda_reg) {
     }
   }
 
-  integrator_->PrepareRefinement(cameras, packed_colors, packed_depths, w0, h0,
-                                 n_views);
+  integrator_->PrepareRefinement(cameras, packed_colors, packed_masks,
+                                 packed_depths, w0, h0, n_views);
   integrator_->RefineGeometry(iters, lambda_reg, voxel_size_, trunc_dist,
                               min_weight_);
 
@@ -337,6 +347,16 @@ void SVOFuser::BakeColors(std::vector<Vec3f>& points,
     }
   }
 
+  // Pack validity masks.
+  std::vector<uint8_t> packed_masks(npix * n_views, 255);
+  for (int i = 0; i < n_views; ++i) {
+    const auto& sv = views_[i];
+    if (sv.mask.size() > 0) {
+      uint8_t* dst = packed_masks.data() + i * npix;
+      std::memcpy(dst, sv.mask.data(), npix);
+    }
+  }
+
   // Pack clean depth maps for PrepareRefinement.
   std::vector<float> packed_depths(npix * n_views, 0.0f);
   for (int i = 0; i < n_views; ++i) {
@@ -347,8 +367,8 @@ void SVOFuser::BakeColors(std::vector<Vec3f>& points,
     }
   }
 
-  integrator_->PrepareRefinement(cameras, packed_colors, packed_depths, w0, h0,
-                                 n_views);
+  integrator_->PrepareRefinement(cameras, packed_colors, packed_masks,
+                                 packed_depths, w0, h0, n_views);
   integrator_->BakeColors(points, normals, colors);
 }
 

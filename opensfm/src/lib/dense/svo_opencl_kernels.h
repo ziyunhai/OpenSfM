@@ -946,22 +946,38 @@ float sample_sdf_trilinear(
 }
 
 // ---- SDF gradient via central differences ----
+// Nearest-neighbor SDF sample: single hash lookup, no 8-corner requirement.
+// Returns 1.0 if the voxel is missing or under-weighted.
+float sample_sdf_nearest(
+    __global const VoxelSlot* table, uint mask,
+    float3 p, float inv_vs, float min_weight_scaled)
+{
+    int kx = (int)floor(p.x * inv_vs);
+    int ky = (int)floor(p.y * inv_vs);
+    int kz = (int)floor(p.z * inv_vs);
+    uint si = hash_lookup(table, mask, kx, ky, kz);
+    if (si == 0xFFFFFFFF) return 1.0f;
+    float sw = (float)table[si].sum_weight;
+    if (sw < min_weight_scaled) return 1.0f;
+    return (float)table[si].sum_tsdf / (sw * (float)FP_SCALE);
+}
+
 float3 compute_sdf_gradient(
     __global const VoxelSlot* table, uint mask,
     float3 p, float inv_vs, float eps, float min_weight_scaled)
 {
     float3 grad;
-    grad.x = sample_sdf_trilinear(table, mask,
+    grad.x = sample_sdf_nearest(table, mask,
                  p + (float3)(eps, 0.0f, 0.0f), inv_vs, min_weight_scaled)
-           - sample_sdf_trilinear(table, mask,
+           - sample_sdf_nearest(table, mask,
                  p - (float3)(eps, 0.0f, 0.0f), inv_vs, min_weight_scaled);
-    grad.y = sample_sdf_trilinear(table, mask,
+    grad.y = sample_sdf_nearest(table, mask,
                  p + (float3)(0.0f, eps, 0.0f), inv_vs, min_weight_scaled)
-           - sample_sdf_trilinear(table, mask,
+           - sample_sdf_nearest(table, mask,
                  p - (float3)(0.0f, eps, 0.0f), inv_vs, min_weight_scaled);
-    grad.z = sample_sdf_trilinear(table, mask,
+    grad.z = sample_sdf_nearest(table, mask,
                  p + (float3)(0.0f, 0.0f, eps), inv_vs, min_weight_scaled)
-           - sample_sdf_trilinear(table, mask,
+           - sample_sdf_nearest(table, mask,
                  p - (float3)(0.0f, 0.0f, eps), inv_vs, min_weight_scaled);
     return grad / (2.0f * eps);
 }
@@ -1039,7 +1055,7 @@ float2 compute_zncc_array(
             float src_g = gray_from_array(images, samp, src_cx + fdx, src_cy + fdy, src_layer);
 
             float dr = ref_g - ref_center;
-            float w = exp(inv_sigma_s2 * (fdx*fdx + fdy*fdy) + inv_sigma_c2 * dr * dr);
+            float w = exp(inv_sigma_s2 * (fdx*fdx + fdy*fdy));
 
             float r = dr;                  // centered at ref_center
             float s = src_g - src_center;  // centered at src_center
@@ -1171,36 +1187,23 @@ __kernel void svo_refine_accumulate(
     x_surface.z = cam->Rinv[6]*diff.x + cam->Rinv[7]*diff.y + cam->Rinv[8]*diff.z;
 
     // ---- Surface normal via central-difference SDF gradient ----
-    float eps = 0.5f * voxel_size;
+    // eps must be >= 1.5*voxel_size so nearest-neighbor samples are guaranteed
+    // to land in distinct voxels regardless of sub-voxel position.
+    float eps = 1.5f * voxel_size;
     float3 grad_sdf = compute_sdf_gradient(table, capacity_mask,
                           x_surface, inv_voxel_size, eps, min_weight_scaled);
     float grad_len = length(grad_sdf);
     if (grad_len < 1e-6f) return;
     float3 normal = grad_sdf / grad_len;
 
-    // ---- Trilinear corner slots (for gradient distribution) ----
-    float fx = x_surface.x * inv_voxel_size - 0.5f;
-    float fy = x_surface.y * inv_voxel_size - 0.5f;
-    float fz = x_surface.z * inv_voxel_size - 0.5f;
-    int ix = (int)floor(fx), iy = (int)floor(fy), iz = (int)floor(fz);
-    float tx = fx - (float)ix, ty = fy - (float)iy, tz = fz - (float)iz;
-
-    float weights[8];
-    uint  slots[8];
-    int cdx[8] = {0,1,0,1,0,1,0,1};
-    int cdy[8] = {0,0,1,1,0,0,1,1};
-    int cdz[8] = {0,0,0,0,1,1,1,1};
-    bool all_valid = true;
-    for (int c = 0; c < 8; c++) {
-        slots[c] = hash_lookup(table, capacity_mask,
-                               ix + cdx[c], iy + cdy[c], iz + cdz[c]);
-        if (slots[c] == 0xFFFFFFFF) { all_valid = false; break; }
-        float wx = cdx[c] ? tx : (1.0f - tx);
-        float wy = cdy[c] ? ty : (1.0f - ty);
-        float wz = cdz[c] ? tz : (1.0f - tz);
-        weights[c] = wx * wy * wz;
-    }
-    if (!all_valid) return;
+    // ---- Find nearest voxel slot for gradient deposition ----
+    // Trilinear 8-corner distribution is ideal but fails at truncation band
+    // edges where neighbor voxels don't exist. Use single nearest slot.
+    int nearest_kx = (int)floor(x_surface.x * inv_voxel_size);
+    int nearest_ky = (int)floor(x_surface.y * inv_voxel_size);
+    int nearest_kz = (int)floor(x_surface.z * inv_voxel_size);
+    uint nearest_slot = hash_lookup(table, capacity_mask, nearest_kx, nearest_ky, nearest_kz);
+    if (nearest_slot == 0xFFFFFFFF) return;
 
     // ---- Accumulate photometric gradient from neighbor views ----
     float total_grad_d = 0.0f;
@@ -1232,11 +1235,15 @@ __kernel void svo_refine_accumulate(
         if (px < (float)margin || px >= (float)(img_width  - margin) ||
             py < (float)margin || py >= (float)(img_height - margin)) continue;
 
-        // TSDF-rendered occlusion check: x_surface occluded from j if it lies
-        // behind the TSDF front surface (5% margin for grazing tolerance).
+        // Validity mask check: alpha channel at nearest pixel.
+        float alpha_j = read_imagef(color_images, nn_samp,
+                            (float4)(px + 0.5f, py + 0.5f, (float)j, 0.0f)).w;
+        if (alpha_j < 0.5f) continue;  // masked pixel
+
+        // TSDF-rendered occlusion check: absolute depth margin (3 voxels).
         float tsdf_d = read_imagef(tsdf_depths, nn_samp,
                            (float4)(px + 0.5f, py + 0.5f, (float)j, 0.0f)).x;
-        if (tsdf_d > 0.0f && p_j.z > tsdf_d * 1.05f) continue;
+        if (tsdf_d > 0.0f && p_j.z > tsdf_d + 3.0f * voxel_size) continue;
 
         // Viewing angle (cos between surface normal and view direction).
         float3 cam_j_pos = (float3)(cam_j->cam_pos[0], cam_j->cam_pos[1], cam_j->cam_pos[2]);
@@ -1270,10 +1277,11 @@ __kernel void svo_refine_accumulate(
                                    CLK_FILTER_LINEAR;
         float2 ig = image_grad_array(color_images, lin_samp, px, py, j);
 
-        // Chain rule: ∂E/∂TSDF = −d2ncc × ∇I_j·(du_dn,dv_dn) × cos_angle / |∇SDF|
+        // Chain rule: ∂E/∂φ = d2ncc × ∇I_j·(du_dn,dv_dn) × cos_angle / |∇φ|
+        // where E = 1 - NCC. Update kernel does φ_new = φ - lr*grad → descent.
         float proj_grad = ig.x * du_dn + ig.y * dv_dn;
         float g = d2ncc * proj_grad * cos_angle / (grad_len + 1e-6f);
-        total_grad_d -= g;  // sign: minimize E = 1 − NCC
+        total_grad_d -= g;  // accumulate ∂E/∂φ for gradient descent
 
         n_valid_views++;
     }
@@ -1283,12 +1291,8 @@ __kernel void svo_refine_accumulate(
     float inv_n = 1.0f / (float)n_valid_views;
     total_grad_d *= inv_n;
 
-    // Distribute gradient to 8 trilinear corner voxels.
-    for (int c = 0; c < 8; c++) {
-        float w = weights[c];
-        if (w < 1e-8f) continue;
-        atomic_add_f(&grad_buf[slots[c]], w * total_grad_d);
-    }
+    // Deposit gradient to nearest voxel slot.
+    atomic_add_f(&grad_buf[nearest_slot], total_grad_d);
 }
 
 )CL"
@@ -1314,7 +1318,8 @@ __kernel void svo_refine_update(
     float               beta1,
     float               beta2,
     float               epsilon,
-    int                 iteration)
+    int                 iteration,
+    int                 n_views)     
 {
     uint i = get_global_id(0);
     if (i >= capacity) return;
@@ -1328,14 +1333,17 @@ __kernel void svo_refine_update(
 
     float inv_fp_sw = 1.0f / (sw * (float)FP_SCALE);
     float tsdf = (float)table[i].sum_tsdf * inv_fp_sw;
-    // Only update near-surface voxels.
-    if (fabs(tsdf) > 0.5f) return;
+    // Only update voxels within the truncation band.
+    if (fabs(tsdf) > 4.f) return;
 
     float grad_d = grad_buf[i];
     // Clear for next iteration.
     grad_buf[i] = 0.0f;
 
     if (fabs(grad_d) < 1e-10f) return;
+
+    // Normalize: accumulate dispatches once per source view (n_views times).
+    grad_d /= (float)n_views;
 
     int kx = (int)((key_ab >> 16) & 0xFFFF) - 32768;
     int ky = (int)(key_ab & 0xFFFF) - 32768;
@@ -1364,60 +1372,49 @@ __kernel void svo_refine_update(
         }
     }
 
-    // ---- Weight-scaled learning rate ----
-    float weight_factor = 1.0f / (1.0f + 0.002f * sw / (float)WEIGHT_SCALE);
-    float lr_eff = lr_sdf * weight_factor;
+    // ---- Gradient clipping: prevent steps > 0.1 in normalized TSDF ----
+    float max_grad = 0.25f;
+    grad_d = clamp(grad_d, -max_grad, max_grad);
 
-    // ---- Adam update ----
-    int t_adam = iteration + 1;
-    float bc1 = 1.0f - pown(beta1, t_adam);
-    float bc2 = 1.0f - pown(beta2, t_adam);
-
+    // ---- SGD with momentum ----
     float m_d = adam_buf[i * 2 + 0];
-    float v_d = adam_buf[i * 2 + 1];
-
     m_d = beta1 * m_d + (1.0f - beta1) * grad_d;
-    v_d = beta2 * v_d + (1.0f - beta2) * grad_d * grad_d;
-
     adam_buf[i * 2 + 0] = m_d;
-    adam_buf[i * 2 + 1] = v_d;
 
-    float m_hat = m_d / bc1;
-    float v_hat = v_d / bc2;
-    float delta_d = lr_eff * m_hat / (sqrt(v_hat) + epsilon);
-
+    float delta_d = lr_sdf * m_d;
     float new_tsdf = clamp(tsdf - delta_d, -1.0f, 1.0f);
     table[i].sum_tsdf = (int)(new_tsdf * sw * (float)FP_SCALE);
 }
 
 // =====================================================================
-// svo_bake_colors — GPU color baking from image2d_array_t
+// svo_bake_colors — Robust multi-view color baking via IRLS consensus
 //
 // Dispatched 1D over M extracted surface points.
-// For each point, select the best 1 or 2 front-facing visible views
-// (scored by cos_theta), blend their colors, and write to out_colors.
+// For each point, gather ALL valid views, compute a weighted mean, then
+// apply Cauchy-kernel IRLS reweighting to suppress outlier views
+// (occluded/wrong color).  This eliminates speckle from failed occlusion.
 //
 // color_images: CL_RGBA CL_UNORM_INT8, slice per view.
-// tsdf_depths:  CL_R   CL_FLOAT, slice per view (final TSDF render).
-// points:  M×3 float (world xyz).
-// normals: M×3 float (unit normals).
+//   Alpha channel encodes validity mask (0 = invalid pixel).
+// tsdf_depths:  CL_R CL_FLOAT, slice per view (final TSDF render).
+// occlusion_margin: absolute world-space depth tolerance (e.g. 3*voxel_size).
 // =====================================================================
 __kernel void svo_bake_colors(
     __global const float*    points,
     __global const float*    normals,
     __global uchar*          out_colors,       // M × 3 RGB bytes
-    read_only image2d_array_t color_images,
+    read_only image2d_array_t color_images,    // RGBA with alpha = mask
     read_only image2d_array_t tsdf_depths,
     __constant SVOCamera*    cameras,
     int                      n_views,
     int                      img_width,
-    int                      img_height)
+    int                      img_height,
+    float                    occlusion_margin) // absolute depth margin
 {
     uint gid = get_global_id(0);
-    // M is encoded as capacity of this kernel; boundary handled by Python dispatch.
 
     float3 x = (float3)(points[gid*3], points[gid*3+1], points[gid*3+2]);
-    float3 n = (float3)(normals[gid*3], normals[gid*3+1], normals[gid*3+2]);
+    float3 norm = (float3)(normals[gid*3], normals[gid*3+1], normals[gid*3+2]);
 
     const sampler_t nn_samp  = CLK_NORMALIZED_COORDS_FALSE |
                                CLK_ADDRESS_CLAMP_TO_EDGE |
@@ -1426,13 +1423,12 @@ __kernel void svo_bake_colors(
                                CLK_ADDRESS_CLAMP_TO_EDGE |
                                CLK_FILTER_LINEAR;
 
-    // Track top-2 views by cos_theta score.
-    float best_score[2]  = {-1.0f, -1.0f};
-    int   best_view[2]   = {-1,    -1};
-    float best_px[2]     = { 0.0f,  0.0f};
-    float best_py[2]     = { 0.0f,  0.0f};
+    // Gather phase: collect valid observations (color + weight).
+    // Use private arrays; n_views is bounded by host (typically ≤ 36).
+    float obs_r[36], obs_g[36], obs_b[36], obs_w[36];
+    int n_valid = 0;
 
-    for (int j = 0; j < n_views; j++) {
+    for (int j = 0; j < n_views && j < 36; j++) {
         __constant SVOCamera* cam_j = &cameras[j];
 
         // Project point into view j.
@@ -1453,47 +1449,95 @@ __kernel void svo_bake_colors(
         if (px < 1.0f || px >= (float)(img_width  - 1) ||
             py < 1.0f || py >= (float)(img_height - 1)) continue;
 
-        // TSDF occlusion check.
+        // Validity mask check: alpha channel at nearest pixel.
+        float4 rgba_nn = read_imagef(color_images, nn_samp,
+                             (float4)(px + 0.5f, py + 0.5f, (float)j, 0.0f));
+        if (rgba_nn.w < 0.5f) continue;  // masked pixel (alpha=0)
+
+        // Occlusion check: absolute depth margin (not relative!).
+        // If TSDF rendered a surface here and our point is behind it, skip.
         float tsdf_d = read_imagef(tsdf_depths, nn_samp,
                            (float4)(px + 0.5f, py + 0.5f, (float)j, 0.0f)).x;
-        if (tsdf_d > 0.0f && p_j.z > tsdf_d * 1.05f) continue;
+        if (tsdf_d > 0.0f && p_j.z > tsdf_d + occlusion_margin) continue;
 
-        // Score = viewing angle cosine.
+        // Viewing angle: cos between normal and view direction.
         float3 cam_pos_j = (float3)(cam_j->cam_pos[0], cam_j->cam_pos[1], cam_j->cam_pos[2]);
         float3 view_dir  = normalize(cam_pos_j - x);
-        float cos_theta  = dot(n, view_dir);
-        if (cos_theta < 0.15f) continue;  // grazing
+        float cos_theta  = dot(norm, view_dir);
+        if (cos_theta < 0.2f) continue;  // grazing angle
 
-        // Insert into top-2.
-        if (cos_theta > best_score[0]) {
-            best_score[1] = best_score[0]; best_view[1] = best_view[0];
-            best_px[1]    = best_px[0];    best_py[1]   = best_py[0];
-            best_score[0] = cos_theta; best_view[0] = j;
-            best_px[0] = px; best_py[0] = py;
-        } else if (cos_theta > best_score[1]) {
-            best_score[1] = cos_theta; best_view[1] = j;
-            best_px[1] = px; best_py[1] = py;
-        }
+        // Sample color with bilinear interpolation.
+        float4 rgba = read_imagef(color_images, lin_samp,
+                          (float4)(px + 0.5f, py + 0.5f, (float)j, 0.0f));
+
+        // Weight = cos^2(theta): strongly prefer frontal views.
+        float w = cos_theta * cos_theta;
+
+        obs_r[n_valid] = rgba.x;
+        obs_g[n_valid] = rgba.y;
+        obs_b[n_valid] = rgba.z;
+        obs_w[n_valid] = w;
+        n_valid++;
     }
 
-    float3 color = (float3)(0.5f, 0.5f, 0.5f);  // grey fallback
-
-    if (best_view[0] >= 0) {
-        float3 c0 = color_from_array(color_images, lin_samp,
-                                     best_px[0], best_py[0], best_view[0]);
-        if (best_view[1] >= 0) {
-            float3 c1 = color_from_array(color_images, lin_samp,
-                                         best_px[1], best_py[1], best_view[1]);
-            float s0 = best_score[0], s1 = best_score[1];
-            color = (s0 * c0 + s1 * c1) / (s0 + s1);
-        } else {
-            color = c0;
-        }
+    // Fallback: no valid observation.
+    if (n_valid == 0) {
+        out_colors[gid * 3 + 0] = 128;
+        out_colors[gid * 3 + 1] = 128;
+        out_colors[gid * 3 + 2] = 128;
+        return;
     }
 
-    out_colors[gid * 3 + 0] = (uchar)clamp(color.x * 255.0f, 0.0f, 255.0f);
-    out_colors[gid * 3 + 1] = (uchar)clamp(color.y * 255.0f, 0.0f, 255.0f);
-    out_colors[gid * 3 + 2] = (uchar)clamp(color.z * 255.0f, 0.0f, 255.0f);
+    // Pass 1: Weighted mean (initial estimate).
+    float sum_w = 0.0f;
+    float mu_r = 0.0f, mu_g = 0.0f, mu_b = 0.0f;
+    for (int i = 0; i < n_valid; i++) {
+        sum_w += obs_w[i];
+        mu_r  += obs_w[i] * obs_r[i];
+        mu_g  += obs_w[i] * obs_g[i];
+        mu_b  += obs_w[i] * obs_b[i];
+    }
+    float inv_sw = 1.0f / (sum_w + 1e-10f);
+    mu_r *= inv_sw;
+    mu_g *= inv_sw;
+    mu_b *= inv_sw;
+
+    // Pass 2: Cauchy-kernel IRLS reweighting.
+    // Robust scale estimate (MAD-like via weighted variance).
+    float var_sum = 0.0f;
+    for (int i = 0; i < n_valid; i++) {
+        float dr = obs_r[i] - mu_r;
+        float dg = obs_g[i] - mu_g;
+        float db = obs_b[i] - mu_b;
+        var_sum += obs_w[i] * (dr*dr + dg*dg + db*db);
+    }
+    // sigma^2 for Cauchy kernel — minimum prevents division issues.
+    // In [0,1] color space, 0.003 ≈ (14/255)^2 → differences ~14 grey levels.
+    float sigma2 = fmax(var_sum * inv_sw, 0.003f);
+
+    // Reweighted sum.
+    float sum_w2 = 0.0f;
+    float fin_r = 0.0f, fin_g = 0.0f, fin_b = 0.0f;
+    for (int i = 0; i < n_valid; i++) {
+        float dr = obs_r[i] - mu_r;
+        float dg = obs_g[i] - mu_g;
+        float db = obs_b[i] - mu_b;
+        float dev2 = dr*dr + dg*dg + db*db;
+        // Cauchy weight: w' = w / (1 + dev^2 / sigma^2)
+        float w2 = obs_w[i] / (1.0f + dev2 / sigma2);
+        sum_w2 += w2;
+        fin_r  += w2 * obs_r[i];
+        fin_g  += w2 * obs_g[i];
+        fin_b  += w2 * obs_b[i];
+    }
+    float inv_sw2 = 1.0f / (sum_w2 + 1e-10f);
+    fin_r *= inv_sw2;
+    fin_g *= inv_sw2;
+    fin_b *= inv_sw2;
+
+    out_colors[gid * 3 + 0] = (uchar)clamp(fin_r * 255.0f, 0.0f, 255.0f);
+    out_colors[gid * 3 + 1] = (uchar)clamp(fin_g * 255.0f, 0.0f, 255.0f);
+    out_colors[gid * 3 + 2] = (uchar)clamp(fin_b * 255.0f, 0.0f, 255.0f);
 }
 
 // =====================================================================

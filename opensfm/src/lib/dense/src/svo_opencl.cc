@@ -858,6 +858,7 @@ void SVOIntegratorCL::ExtractFill(const cl::Buffer& fine_table,
 void SVOIntegratorCL::PrepareRefinement(
     const std::vector<SVOCameraGPU>& cameras,
     const std::vector<uint8_t>& packed_colors,
+    const std::vector<uint8_t>& packed_masks,
     const std::vector<float>& packed_depths, int img_width, int img_height,
     int n_views) {
   if (capacity_ == 0) {
@@ -888,17 +889,20 @@ void SVOIntegratorCL::PrepareRefinement(
   opencl::CheckCL(err, "refine adam buffer");
 
   // Upload color images as image2d_array_t (CL_RGBA CL_UNORM_INT8).
-  // Input packed_colors is RGB (3 bytes/pixel); we need to expand to RGBA (4).
+  // Input packed_colors is RGB (3 bytes/pixel); expand to RGBA (4).
+  // Alpha channel = validity mask (0=invalid, 255=valid).
   const size_t npix = static_cast<size_t>(img_width) * img_height;
+  const bool has_masks = (packed_masks.size() == npix * n_views);
   std::vector<uint8_t> rgba_data(npix * 4 * n_views);
   for (int v = 0; v < n_views; ++v) {
     const uint8_t* src = packed_colors.data() + v * npix * 3;
+    const uint8_t* mask = has_masks ? packed_masks.data() + v * npix : nullptr;
     uint8_t* dst = rgba_data.data() + v * npix * 4;
     for (size_t p = 0; p < npix; ++p) {
       dst[p * 4 + 0] = src[p * 3 + 0];
       dst[p * 4 + 1] = src[p * 3 + 1];
       dst[p * 4 + 2] = src[p * 3 + 2];
-      dst[p * 4 + 3] = 255;
+      dst[p * 4 + 3] = mask ? mask[p] : 255;
     }
   }
 
@@ -967,10 +971,11 @@ void SVOIntegratorCL::RefineGeometry(int iters, float lambda_reg,
 
   const float inv_voxel_size = 1.0f / voxel_size;
   const float min_weight_scaled = min_weight * kWeightScale;
-  const float lr_sdf = 10.0f * voxel_size;
-  const float beta1 = 0.9f;
-  const float beta2 = 0.999f;
-  const float epsilon = 1e-8f;
+  const float lr_sdf =
+      5000.0f * voxel_size;  // 1.0 for voxel=0.02: 20mm/iter max (clipped)
+  const float beta1 = 0.7f;
+  const float beta2 = 0.999f;   // unused, kept for kernel API compat
+  const float epsilon = 1e-8f;  // unused
   const int half_patch = 3;
   const float inv_sigma_s2 = -0.5f;    // sigma_spatial = 1 px
   const float inv_sigma_c2 = -325.0f;  // sigma_color = 10/255 ≈ 0.039
@@ -1098,7 +1103,8 @@ void SVOIntegratorCL::RefineGeometry(int iters, float lambda_reg,
       k_raycast_guided_.setArg(rarg++, voxel_size);
       k_raycast_guided_.setArg(rarg++, inv_voxel_size);
       k_raycast_guided_.setArg(rarg++, search_margin);
-      k_raycast_guided_.setArg(rarg++, min_weight_scaled);
+      k_raycast_guided_.setArg(
+          rarg++, min_weight);  // raw units; kernel multiplies by WEIGHT_SCALE
 
       cl::NDRange global_rc(static_cast<size_t>((W + 15) / 16 * 16),
                             static_cast<size_t>((H + 15) / 16 * 16));
@@ -1145,6 +1151,31 @@ void SVOIntegratorCL::RefineGeometry(int iters, float lambda_reg,
     }
     queue.finish();
 
+    // ---- Diagnostic: gradient buffer stats after accumulation ----
+    if (iter == 0) {
+      std::vector<float> grad_cpu(capacity_);
+      queue.enqueueReadBuffer(cl_refine_grad_, CL_TRUE, 0,
+                              capacity_ * sizeof(float), grad_cpu.data());
+      int n_nonzero = 0;
+      float max_abs = 0.0f;
+      double sum_abs = 0.0;
+      for (uint32_t gi = 0; gi < capacity_; ++gi) {
+        float gv = grad_cpu[gi];
+        if (gv != 0.0f) {
+          ++n_nonzero;
+          float a = std::abs(gv);
+          if (a > max_abs) {
+            max_abs = a;
+          }
+          sum_abs += a;
+        }
+      }
+      std::cerr << "[SVORefine] iter 0 grad stats: nonzero=" << n_nonzero << "/"
+                << capacity_ << " max_abs=" << max_abs
+                << " mean_abs=" << (n_nonzero > 0 ? sum_abs / n_nonzero : 0.0)
+                << " lr_sdf=" << lr_sdf << "\n";
+    }
+
     // ---- Step 3: Adam update on SDF ----
     {
       int arg = 0;
@@ -1161,6 +1192,7 @@ void SVOIntegratorCL::RefineGeometry(int iters, float lambda_reg,
       k_refine_update_.setArg(arg++, beta2);
       k_refine_update_.setArg(arg++, epsilon);
       k_refine_update_.setArg(arg++, static_cast<cl_int>(iter));
+      k_refine_update_.setArg(arg++, static_cast<cl_int>(n_refine_views_));
       queue.enqueueNDRangeKernel(k_refine_update_, cl::NullRange,
                                  cl::NDRange(update_global), cl::NDRange(256));
       queue.finish();
@@ -1276,6 +1308,7 @@ void SVOIntegratorCL::BakeColors(const std::vector<Vec3f>& points,
 
   // Dispatch svo_bake_colors kernel.
   {
+    const float occlusion_margin = 3.0f * refine_voxel_size_;
     int arg = 0;
     k_bake_colors_.setArg(arg++, cl_pts);
     k_bake_colors_.setArg(arg++, cl_nrm);
@@ -1286,6 +1319,7 @@ void SVOIntegratorCL::BakeColors(const std::vector<Vec3f>& points,
     k_bake_colors_.setArg(arg++, static_cast<cl_int>(n_refine_views_));
     k_bake_colors_.setArg(arg++, static_cast<cl_int>(W));
     k_bake_colors_.setArg(arg++, static_cast<cl_int>(H));
+    k_bake_colors_.setArg(arg++, occlusion_margin);
 
     const size_t global = ((M + 255) / 256) * 256;
     queue.enqueueNDRangeKernel(k_bake_colors_, cl::NullRange,
