@@ -182,6 +182,17 @@ class SVOIntegratorCL {
   // Clear vote counters (call between iterations if doing multiple passes).
   void ClearVotes();
 
+  // Render DSM + ortho (hillshade) + surface normals by orthographic raycast.
+  // Fires vertical rays downward through the hash table for each grid cell.
+  // dsm_out: (height × width) float, NaN where no surface.
+  // ortho_out: (height × width × 4) uint8 RGBA.
+  // normals_out: (height × width × 3) float, surface normal per cell.
+  void RenderDSMOrtho(float origin_x, float origin_y, float gsd, int width,
+                      int height, float z_min, float z_max, float voxel_size,
+                      float min_weight, std::vector<float>* dsm_out,
+                      std::vector<uint8_t>* ortho_out,
+                      std::vector<float>* normals_out);
+
  private:
   void BuildKernels();
   void EnsureFrameBuffers(int rows, int cols, bool has_normal, bool has_mask,
@@ -228,7 +239,8 @@ class SVOIntegratorCL {
   cl::Buffer cl_refine_adam_;         // 2 floats/slot: m_d, v_d
   cl::Image2DArray cl_color_images_;  // CL_RGBA CL_UNORM_INT8 [n_views × H × W]
   cl::Image2DArray cl_tsdf_depths_;   // CL_R CL_FLOAT [n_views × H × W]
-  cl::Image2DArray cl_clean_depths_;  // CL_R CL_FLOAT [n_views × H × W] (immutable, for bake occlusion)
+  cl::Image2DArray cl_clean_depths_;  // CL_R CL_FLOAT [n_views × H × W]
+                                      // (immutable, for bake occlusion)
   cl::Buffer cl_cameras_array_;       // N × SVOCameraGPU
   int n_refine_views_ = 0;
   int refine_img_width_ = 0;

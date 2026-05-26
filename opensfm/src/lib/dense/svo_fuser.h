@@ -84,6 +84,15 @@ class SVOFuser {
                      std::vector<Vec3f>* fused_normals,
                      std::vector<Vec3<uint8_t>>* fused_colors);
 
+  // Render DSM + ortho by orthographic top-down raycast of the fused TSDF.
+  // Call after Fuse(). Outputs: dsm (H×W float), ortho (H×W×4 uint8 RGBA),
+  // normals (H×W×3 float, surface normal per cell).
+  void RenderDSMOrtho(float origin_x, float origin_y, float gsd, int width,
+                      int height, float z_min, float z_max,
+                      std::vector<float>* dsm_out,
+                      std::vector<uint8_t>* ortho_out,
+                      std::vector<float>* normals_out);
+
   // Legacy API: Fuse + ExtractPoints in one call (backward compat).
   void Fuse(std::vector<Vec3f>* fused_points, std::vector<Vec3f>* fused_normals,
             std::vector<Vec3<uint8_t>>* fused_colors);

@@ -32,6 +32,17 @@ def compute_dsm(
     """
     config = data.config
 
+    # SVO DSM is produced during the fusion step (compute_depthmaps).
+    dsm_method: str = config.get("dsm_method", "triangles")
+    if dsm_method == "svo":
+        if os.path.isfile(data.dsm_file()):
+            logger.info("DSM already produced by fusion (dsm_method=svo)")
+        else:
+            logger.warning(
+                "dsm_method=svo but no DSM found — run compute_depthmaps first"
+            )
+        return
+
     # --- Collect shots with a clean depthmap ---
     shots_with_dm = []
     for shot in reconstruction.shots.values():
@@ -79,7 +90,6 @@ def compute_dsm(
     diffusion_iters: int = config.get("dsm_diffusion_iterations", 50)
     diffusion_kappa: float = config.get("dsm_diffusion_kappa", 0.5)
     diffusion_dt: float = config.get("dsm_diffusion_dt", 0.2)
-    dsm_method: str = config.get("dsm_method", "triangles")
 
     # Build level GSDs from coarsest to finest.
     # e.g. num_levels=3, factor=2: [4*gsd, 2*gsd, gsd]

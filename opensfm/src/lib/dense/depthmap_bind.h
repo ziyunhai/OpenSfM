@@ -436,6 +436,76 @@ class SVOFuserWrapper {
     return retn;
   }
 
+  py::tuple RenderDSMOrtho(float origin_x, float origin_y, float gsd, int width,
+                           int height, float z_min, float z_max) {
+    std::vector<float> dsm;
+    std::vector<uint8_t> ortho_rgba;
+    std::vector<float> normals;
+
+    {
+      py::gil_scoped_release release;
+      sf_.RenderDSMOrtho(origin_x, origin_y, gsd, width, height, z_min, z_max,
+                         &dsm, &ortho_rgba, &normals);
+    }
+
+    const size_t ncells = static_cast<size_t>(width) * height;
+
+    // DSM: float32 [height, width]
+    py::array_t<float> dsm_arr({height, width});
+    std::memcpy(dsm_arr.mutable_data(), dsm.data(), ncells * sizeof(float));
+
+    // Ortho: unpack RGBA (uint32) → RGB (uint8 H×W×3)
+    py::array_t<uint8_t> ortho_arr({height, width, 3});
+    auto* dst = ortho_arr.mutable_data();
+    const auto* src = reinterpret_cast<const uint32_t*>(ortho_rgba.data());
+    for (size_t i = 0; i < ncells; ++i) {
+      uint32_t rgba = src[i];
+      dst[i * 3 + 0] = static_cast<uint8_t>(rgba & 0xFF);
+      dst[i * 3 + 1] = static_cast<uint8_t>((rgba >> 8) & 0xFF);
+      dst[i * 3 + 2] = static_cast<uint8_t>((rgba >> 16) & 0xFF);
+    }
+
+    // Normals: float32 [height, width, 3]
+    py::array_t<float> nrm_arr({height, width, 3});
+    std::memcpy(nrm_arr.mutable_data(), normals.data(),
+                ncells * 3 * sizeof(float));
+
+    return py::make_tuple(dsm_arr, ortho_arr, nrm_arr);
+  }
+
+  py::array_t<uint8_t> BakeColorsStandalone(
+      const py::array_t<float, py::array::c_style>& points,
+      const py::array_t<float, py::array::c_style>& normals) {
+    if (points.ndim() != 2 || points.shape(1) != 3) {
+      throw std::invalid_argument("points must be (N, 3)");
+    }
+    if (normals.ndim() != 2 || normals.shape(1) != 3) {
+      throw std::invalid_argument("normals must be (N, 3)");
+    }
+    const int n = static_cast<int>(points.shape(0));
+    if (normals.shape(0) != n) {
+      throw std::invalid_argument("points and normals must have same length");
+    }
+
+    // Copy into Eigen-mapped vectors expected by BakeColors.
+    std::vector<Vec3f> pts(n);
+    std::vector<Vec3f> nrm(n);
+    std::memcpy(pts.data(), points.data(), n * 3 * sizeof(float));
+    std::memcpy(nrm.data(), normals.data(), n * 3 * sizeof(float));
+
+    std::vector<Vec3<uint8_t>> colors(n, Vec3<uint8_t>(128, 128, 128));
+
+    {
+      py::gil_scoped_release release;
+      sf_.BakeColors(pts, nrm, &colors);
+    }
+
+    py::array_t<uint8_t> colors_arr({n, 3});
+    std::memcpy(colors_arr.mutable_data(), colors.data(),
+                n * 3 * sizeof(uint8_t));
+    return colors_arr;
+  }
+
  private:
   SVOFuser sf_;
 };
@@ -971,6 +1041,50 @@ class DSMRasterizerWrapper {
     return foundation::py_array_from_data(host_grid.data(), grid_h_, grid_w_);
   }
 
+  // Upload an external grid for post-processing (diffusion, bilateral).
+  // Allocates GPU buffers sized to match the input grid.
+  // NaN cells in the input are marked as non-observed (evolve under diffusion).
+  void UploadGrid(const py::array_t<float, py::array::c_style>& grid_np) {
+    if (grid_np.ndim() != 2) {
+      throw std::invalid_argument("UploadGrid: input must be 2D float32");
+    }
+    grid_h_ = static_cast<int>(grid_np.shape(0));
+    grid_w_ = static_cast<int>(grid_np.shape(1));
+    ncells_ = static_cast<size_t>(grid_h_) * grid_w_;
+    if (ncells_ == 0) {
+      throw std::invalid_argument("UploadGrid: empty grid");
+    }
+
+    auto& dev = opencl::CLContext::Instance().Device(device_idx_);
+    prog_ = dev.GetOrBuildProgram("dsm_mode_v2", kDSMKernelSource);
+    auto& ctx = dev.context();
+    auto& q = dev.queue();
+
+    // Allocate GPU buffers
+    cl_out_a_ = cl::Buffer(ctx, CL_MEM_READ_WRITE, ncells_ * sizeof(float));
+    cl_out_b_ = cl::Buffer(ctx, CL_MEM_READ_WRITE, ncells_ * sizeof(float));
+    cl_valid_ = cl::Buffer(ctx, CL_MEM_READ_WRITE, ncells_);
+    cl_guide_ = cl::Buffer(ctx, CL_MEM_READ_WRITE, ncells_ * sizeof(float));
+
+    // Build host validity mask and replace NaN with 0 for upload
+    const float* src = grid_np.data();
+    std::vector<float> host_grid(ncells_);
+    std::vector<uint8_t> host_valid(ncells_);
+    for (size_t i = 0; i < ncells_; ++i) {
+      if (std::isnan(src[i])) {
+        host_grid[i] = NAN;  // Preserve NaN; diffusion kernel handles it.
+        host_valid[i] = 0;
+      } else {
+        host_grid[i] = src[i];
+        host_valid[i] = 1;
+      }
+    }
+
+    q.enqueueWriteBuffer(cl_out_a_, CL_TRUE, 0, ncells_ * sizeof(float),
+                         host_grid.data());
+    q.enqueueWriteBuffer(cl_valid_, CL_TRUE, 0, ncells_, host_valid.data());
+  }
+
   int grid_width() const { return grid_w_; }
   int grid_height() const { return grid_h_; }
 
@@ -1083,6 +1197,9 @@ class DSMRasterizerWrapper {
     throw std::runtime_error("DSMRasterizer: OpenCL not available");
   }
   foundation::pyarray_f FinishZBuf() {
+    throw std::runtime_error("DSMRasterizer: OpenCL not available");
+  }
+  void UploadGrid(const py::array_t<float, py::array::c_style>&) {
     throw std::runtime_error("DSMRasterizer: OpenCL not available");
   }
   int grid_width() const { return 0; }

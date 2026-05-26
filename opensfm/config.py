@@ -561,7 +561,7 @@ class OpenSfMConfig:
     ##################################
     # Method: "triangles" (per-view triangle rasterization with MAX z-buffer)
     # or "modes" (legacy: per-point scatter with mode tracking).
-    dsm_method: str = "triangles"
+    dsm_method: str = "svo"
     # Ground sample distance in meters/pixel. 0 = auto from voxel size.
     dsm_gsd: float = 0.0
     # Mode-seeking threshold in meters: incoming Z samples closer than
@@ -591,7 +591,7 @@ class OpenSfMConfig:
     # Bilateral filter range sigma in meters.
     dsm_bilateral_range: float = 0.3
     # Number of Perona-Malik diffusion iterations per level.
-    dsm_diffusion_iterations: int = 50
+    dsm_diffusion_iterations: int = 200
     # Edge-stopping parameter kappa (meters). Controls how much gradient
     # magnitude inhibits diffusion across edges.
     dsm_diffusion_kappa: float = 0.5
@@ -599,6 +599,10 @@ class OpenSfMConfig:
     dsm_diffusion_dt: float = 0.2
     # Post-process median filter radius (0 = disabled, 1 = 3x3, 2 = 5x5).
     dsm_median_radius: int = 2
+    # Maximum Z range (meters) across a Delaunay triangle for hole
+    # interpolation. Triangles spanning larger Z gaps are rejected
+    # (avoids bridging across cliffs/building edges).
+    dsm_max_interp_z_range: float = 2.0
 
     ##################################
     # Params for multi-processing/threading

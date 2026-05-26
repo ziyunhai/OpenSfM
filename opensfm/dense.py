@@ -1396,6 +1396,361 @@ def _split_into_subvolumes(
     return _split(np.arange(len(all_coords)))
 
 
+# ── DSM post-processing helpers ─────────────────────────────────────
+
+
+def _dsm_median_filter(grid: NDArray, radius: int) -> NDArray:
+    """Apply median filter to valid cells only, preserving NaN holes."""
+    from scipy.ndimage import median_filter
+
+    kernel_size = 2 * radius + 1
+    valid = ~np.isnan(grid)
+    if not valid.any():
+        return grid
+    # Use a sentinel below all data for NaN cells
+    sentinel = float(np.nanmin(grid)) - 9999.0
+    work = np.where(valid, grid, sentinel)
+    filtered = median_filter(work, size=kernel_size).astype(np.float32)
+    # Only keep filtered values where originally valid
+    return np.where(valid, filtered, np.nan).astype(np.float32)
+
+
+def _dsm_delaunay_fill(
+    dsm_grid: NDArray,
+    ortho_grid: Optional[NDArray],
+    max_z_range: float,
+) -> int:
+    """Fill NaN holes via Delaunay triangulation of boundary cells.
+
+    Boundary cells = valid cells 4-connected to at least one NaN cell.
+    For each NaN cell inside a Delaunay triangle, interpolate Z using
+    barycentric weights. Reject triangles where Z span > max_z_range.
+
+    Returns number of cells filled.
+    """
+    from scipy.spatial import Delaunay
+
+    h, w = dsm_grid.shape
+    valid = ~np.isnan(dsm_grid)
+    nan_mask = ~valid
+
+    if not nan_mask.any() or not valid.any():
+        return 0
+
+    # Build point set: all boundary cells + subsampled interior valid cells.
+    # Boundary gives accurate hole edges; interior cells ensure triangles
+    # span large gaps so interpolation can reach deep into holes.
+    boundary = np.zeros_like(valid)
+    boundary[:-1, :] |= valid[:-1, :] & nan_mask[1:, :]
+    boundary[1:, :] |= valid[1:, :] & nan_mask[:-1, :]
+    boundary[:, :-1] |= valid[:, :-1] & nan_mask[:, 1:]
+    boundary[:, 1:] |= valid[:, 1:] & nan_mask[:, :-1]
+
+    bnd_rows, bnd_cols = np.where(boundary)
+
+    # Subsample interior valid cells (every 4th cell in each axis)
+    stride = 4
+    interior = valid & ~boundary
+    int_rows, int_cols = np.where(interior)
+    if len(int_rows) > 0:
+        # Keep every stride-th point
+        subsample = ((int_rows % stride == 0) & (int_cols % stride == 0))
+        int_rows = int_rows[subsample]
+        int_cols = int_cols[subsample]
+
+    # Combine boundary + subsampled interior
+    all_rows = np.concatenate([bnd_rows, int_rows]) if len(int_rows) > 0 else bnd_rows
+    all_cols = np.concatenate([bnd_cols, int_cols]) if len(int_cols) > 0 else bnd_cols
+    n_pts = len(all_rows)
+    if n_pts < 3:
+        return 0
+
+    # Build Delaunay triangulation
+    tri_pts = np.column_stack([all_cols.astype(np.float64),
+                               all_rows.astype(np.float64)])
+    try:
+        tri = Delaunay(tri_pts)
+    except Exception:
+        return 0
+
+    # Get NaN cell coordinates
+    nan_rows, nan_cols = np.where(nan_mask)
+    if len(nan_rows) == 0:
+        return 0
+
+    # Find which triangle each NaN cell belongs to
+    nan_pts = np.column_stack([nan_cols.astype(np.float64),
+                               nan_rows.astype(np.float64)])
+    simplex_idx = tri.find_simplex(nan_pts)
+
+    # Process cells that are inside some triangle
+    inside = simplex_idx >= 0
+    if not inside.any():
+        return 0
+
+    n_filled = 0
+    # Get boundary Z values
+    all_z = dsm_grid[all_rows, all_cols]
+    all_color: Optional[NDArray] = None
+    if ortho_grid is not None:
+        all_color = ortho_grid[all_rows, all_cols, :]  # (N, 3)
+
+    # Process in bulk per simplex
+    simplices = tri.simplices  # (n_tri, 3) indices into bnd_pts
+    inside_indices = np.where(inside)[0]
+    tri_indices = simplex_idx[inside_indices]
+
+    # Barycentric coordinates for all inside points
+    # For point P in triangle (A, B, C):
+    #   bary = T^-1 * (P - C), where T = [[Ax-Cx, Bx-Cx], [Ay-Cy, By-Cy]]
+    for chunk_start in range(0, len(inside_indices), 100000):
+        chunk = inside_indices[chunk_start:chunk_start + 100000]
+        chunk_tri = tri_indices[chunk_start:chunk_start + 100000]
+
+        # Get triangle vertex indices (into boundary arrays)
+        v0 = simplices[chunk_tri, 0]
+        v1 = simplices[chunk_tri, 1]
+        v2 = simplices[chunk_tri, 2]
+
+        # Z values at vertices
+        z0 = all_z[v0]
+        z1 = all_z[v1]
+        z2 = all_z[v2]
+
+        # Reject triangles with excessive Z range
+        z_min_t = np.minimum(np.minimum(z0, z1), z2)
+        z_max_t = np.maximum(np.maximum(z0, z1), z2)
+        z_ok = (z_max_t - z_min_t) <= max_z_range
+
+        if not z_ok.any():
+            continue
+
+        # Compute barycentric coordinates
+        ax = all_cols[v0].astype(np.float64)
+        ay = all_rows[v0].astype(np.float64)
+        bx = all_cols[v1].astype(np.float64)
+        by = all_rows[v1].astype(np.float64)
+        cx = all_cols[v2].astype(np.float64)
+        cy = all_rows[v2].astype(np.float64)
+
+        px = nan_cols[chunk].astype(np.float64)
+        py_arr = nan_rows[chunk].astype(np.float64)
+
+        # Barycentric via cross products
+        d00 = (bx - ax) * (bx - ax) + (by - ay) * (by - ay)
+        d01 = (bx - ax) * (cx - ax) + (by - ay) * (cy - ay)
+        d11 = (cx - ax) * (cx - ax) + (cy - ay) * (cy - ay)
+        d20 = (px - ax) * (bx - ax) + (py_arr - ay) * (by - ay)
+        d21 = (px - ax) * (cx - ax) + (py_arr - ay) * (cy - ay)
+
+        denom = d00 * d11 - d01 * d01
+        # Avoid division by zero for degenerate triangles
+        denom_safe = np.where(np.abs(denom) < 1e-10, 1.0, denom)
+        bary_v = (d11 * d20 - d01 * d21) / denom_safe
+        bary_w = (d00 * d21 - d01 * d20) / denom_safe
+        bary_u = 1.0 - bary_v - bary_w
+
+        # Interpolate Z
+        z_interp = (
+            bary_u * z0 + bary_v * z1 + bary_w * z2
+        ).astype(np.float32)
+
+        # Final mask: z_ok and non-degenerate
+        fill_mask = z_ok & (np.abs(denom) > 1e-10)
+
+        # Write into grid
+        fill_rows = nan_rows[chunk[fill_mask]]
+        fill_cols = nan_cols[chunk[fill_mask]]
+        dsm_grid[fill_rows, fill_cols] = z_interp[fill_mask]
+        n_filled += int(fill_mask.sum())
+
+        # Interpolate ortho colors
+        if ortho_grid is not None and all_color is not None:
+            c0 = all_color[v0[fill_mask]]  # (K, 3)
+            c1 = all_color[v1[fill_mask]]
+            c2 = all_color[v2[fill_mask]]
+            bu = bary_u[fill_mask, np.newaxis]
+            bv = bary_v[fill_mask, np.newaxis]
+            bw = bary_w[fill_mask, np.newaxis]
+            c_interp = (
+                bu * c0.astype(np.float64)
+                + bv * c1.astype(np.float64)
+                + bw * c2.astype(np.float64)
+            )
+            ortho_grid[fill_rows, fill_cols, :] = np.clip(
+                c_interp, 0, 255
+            ).astype(np.uint8)
+
+    return n_filled
+
+
+def _dsm_gpu_diffuse(
+    grid: NDArray, iterations: int, kappa: float, dt: float
+) -> NDArray:
+    """Run Perona-Malik diffusion on the DSM grid via GPU DSMRasterizer."""
+    rasterizer = pydense.DSMRasterizer()
+    rasterizer.set_device(0)
+    rasterizer.upload_grid(grid.astype(np.float32, copy=False))
+
+    # Self-guided diffusion (empty guide → compute gradient from grid itself)
+    guide = np.empty(0, dtype=np.float32)
+    result = rasterizer.diffuse(guide, iterations, kappa, dt)
+    result = np.asarray(result, dtype=np.float32)
+
+    # Restore NaN where original was NaN (diffusion fills them, which
+    # is desired, but we only want to keep fills where the grid was
+    # previously filled by triangulation — so don't restore NaN here).
+    # Actually: we DO want diffusion to fill remaining tiny holes.
+    return result
+
+
+def _ortho_diffuse_holes(
+    ortho_grid: NDArray, dsm_grid: NDArray, iterations: int
+) -> NDArray:
+    """Diffuse ortho colors into cells that have a valid DSM but no color.
+
+    Uses iterative nearest-neighbor averaging: for each colorless cell
+    with a valid DSM value, average colors from valid neighbors.
+    """
+    if iterations <= 0:
+        return ortho_grid
+
+    h, w, _ = ortho_grid.shape
+    has_dsm = ~np.isnan(dsm_grid)
+    # "Has color" = at least one channel > 0 AND has DSM
+    has_color = has_dsm & (ortho_grid.sum(axis=2) > 0)
+    needs_color = has_dsm & ~has_color
+
+    if not needs_color.any():
+        return ortho_grid
+
+    result = ortho_grid.astype(np.float32)
+
+    for _ in range(iterations):
+        filled = has_color.copy()
+        # Average from 4-neighbors that have color
+        for ch in range(3):
+            channel = result[:, :, ch]
+            # Sum of neighbor values
+            neighbor_sum = np.zeros((h, w), dtype=np.float32)
+            neighbor_cnt = np.zeros((h, w), dtype=np.float32)
+
+            # Up
+            neighbor_sum[1:, :] += np.where(filled[:-1, :], channel[:-1, :], 0)
+            neighbor_cnt[1:, :] += filled[:-1, :].astype(np.float32)
+            # Down
+            neighbor_sum[:-1, :] += np.where(filled[1:, :], channel[1:, :], 0)
+            neighbor_cnt[:-1, :] += filled[1:, :].astype(np.float32)
+            # Left
+            neighbor_sum[:, 1:] += np.where(filled[:, :-1], channel[:, :-1], 0)
+            neighbor_cnt[:, 1:] += filled[:, :-1].astype(np.float32)
+            # Right
+            neighbor_sum[:, :-1] += np.where(filled[:, 1:], channel[:, 1:], 0)
+            neighbor_cnt[:, :-1] += filled[:, 1:].astype(np.float32)
+
+            # Fill cells that need color and have at least one colored neighbor
+            can_fill = needs_color & (neighbor_cnt > 0)
+            avg = np.where(
+                neighbor_cnt > 0,
+                neighbor_sum / neighbor_cnt,
+                0.0,
+            )
+            result[:, :, ch] = np.where(can_fill, avg, channel)
+
+        # Update masks
+        newly_filled = needs_color & (neighbor_cnt > 0)
+        has_color |= newly_filled
+        needs_color &= ~newly_filled
+
+        if not needs_color.any():
+            break
+
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+
+def _render_dsm_patch_from_sv(
+    fuser: "pydense.SVOFuser",
+    sv: "_SubVolume",
+    dsm_grid: NDArray,
+    ortho_grid: Optional[NDArray],
+    origin_x: float,
+    origin_y: float,
+    gsd: float,
+    grid_w: int,
+    grid_h: int,
+    z_min: float,
+    z_max: float,
+) -> None:
+    """Render DSM + color ortho for a sub-volume's core XY footprint.
+
+    Renders only the cells that overlap with ``sv.core_min[:2]`` to
+    ``sv.core_max[:2]``, then composites into the global grids using
+    MAX-z (highest surface wins).
+    """
+    # Compute the sub-grid pixel range corresponding to this sub-volume's core.
+    col_start = max(0, int(np.floor((sv.core_min[0] - origin_x) / gsd)))
+    col_end = min(grid_w, int(np.ceil((sv.core_max[0] - origin_x) / gsd)))
+    row_start = max(0, int(np.floor((sv.core_min[1] - origin_y) / gsd)))
+    row_end = min(grid_h, int(np.ceil((sv.core_max[1] - origin_y) / gsd)))
+
+    patch_w = col_end - col_start
+    patch_h = row_end - row_start
+    if patch_w <= 0 or patch_h <= 0:
+        return
+
+    patch_origin_x = origin_x + col_start * gsd
+    patch_origin_y = origin_y + row_start * gsd
+
+    # Render DSM + hillshade + normals for this patch.
+    dsm_patch, _hillshade, normals_patch = fuser.render_dsm_ortho(
+        patch_origin_x, patch_origin_y, gsd,
+        patch_w, patch_h, z_min, z_max,
+    )
+    dsm_patch = np.asarray(dsm_patch, dtype=np.float32)
+    normals_patch = np.asarray(normals_patch, dtype=np.float32)
+
+    # Composite DSM: MAX-z (highest surface wins).
+    valid = ~np.isnan(dsm_patch)
+    dst_slice = dsm_grid[row_start:row_end, col_start:col_end]
+    higher = valid & (
+        np.isnan(dst_slice) | (dsm_patch > dst_slice)
+    )
+    dst_slice[higher] = dsm_patch[higher]
+
+    # Bake real photo colors onto the valid DSM cells.
+    if ortho_grid is not None and np.any(higher):
+        # Build 3D points for cells where we updated the DSM.
+        rows_idx, cols_idx = np.where(higher)
+        n_pts = len(rows_idx)
+        points = np.empty((n_pts, 3), dtype=np.float32)
+        points[:, 0] = patch_origin_x + (cols_idx + 0.5) * gsd
+        points[:, 1] = patch_origin_y + (rows_idx + 0.5) * gsd
+        points[:, 2] = dsm_patch[rows_idx, cols_idx]
+
+        # Use real surface normals from the raycast.
+        nrm = normals_patch.reshape(patch_h, patch_w, 3)
+        pts_normals = nrm[rows_idx, cols_idx, :]
+
+        # Bake colors from source images (IRLS + occlusion).
+        colors = fuser.bake_colors(
+            points.astype(np.float32, copy=False),
+            pts_normals.astype(np.float32, copy=False),
+        )
+        colors = np.asarray(colors, dtype=np.uint8)
+
+        # Write into global ortho grid.
+        ortho_grid[
+            row_start + rows_idx, col_start + cols_idx, :
+        ] = colors
+
+    n_valid = int(np.count_nonzero(valid))
+    n_updated = int(np.count_nonzero(higher))
+    logger.info(
+        f"    DSM patch {patch_w}×{patch_h}: "
+        f"{n_valid} valid, {n_updated} updated"
+    )
+
+
 def _fuse_per_cluster(
     data: UndistortedDataSet,
     neighbors: Dict[str, List[pymap.Shot]],
@@ -1562,6 +1917,50 @@ def _fuse_per_cluster(
         all_normals: List[NDArray] = []
         all_colors: List[NDArray] = []
 
+        # --- DSM/ortho grid (populated per sub-volume if svo method) ---
+        dsm_enabled = config.get("dsm_method", "triangles") == "svo"
+        dsm_gsd: float = config.get("dsm_gsd", 0.0)
+        if dsm_gsd <= 0.0:
+            dsm_gsd = voxel_size
+        dsm_grid: Optional[NDArray] = None
+        ortho_grid: Optional[NDArray] = None
+        dsm_origin_x: float = 0.0
+        dsm_origin_y: float = 0.0
+        dsm_z_min: float = 0.0
+        dsm_z_max: float = 0.0
+        dsm_w: int = 0
+        dsm_h: int = 0
+
+        if dsm_enabled and reconstruction.points:
+            coords = np.array(
+                [p.coordinates for p in reconstruction.points.values()]
+            )
+            min_xyz = coords.min(axis=0).astype(np.float32)
+            max_xyz = coords.max(axis=0).astype(np.float32)
+            extent_xy = max_xyz[:2] - min_xyz[:2]
+            margin_xy = np.maximum(
+                extent_xy * 0.05, dsm_gsd * 2
+            ).astype(np.float32)
+            dsm_origin_x = float(min_xyz[0] - margin_xy[0])
+            dsm_origin_y = float(min_xyz[1] - margin_xy[1])
+            max_x = float(max_xyz[0] + margin_xy[0])
+            max_y = float(max_xyz[1] + margin_xy[1])
+            dsm_w = int(np.ceil((max_x - dsm_origin_x) / dsm_gsd))
+            dsm_h = int(np.ceil((max_y - dsm_origin_y) / dsm_gsd))
+            z_margin = (max_xyz[2] - min_xyz[2]) * 0.1 + voxel_size * 5
+            dsm_z_min = float(min_xyz[2] - z_margin)
+            dsm_z_max = float(max_xyz[2] + z_margin)
+            dsm_grid = np.full(
+                (dsm_h, dsm_w), np.nan, dtype=np.float32
+            )
+            ortho_grid = np.zeros(
+                (dsm_h, dsm_w, 3), dtype=np.uint8
+            )
+            logger.info(
+                f"Cluster {batch_num}: DSM grid {dsm_w}×{dsm_h}, "
+                f"GSD={dsm_gsd:.4f}, Z=[{dsm_z_min:.2f}, {dsm_z_max:.2f}]"
+            )
+
         # Batch-load all views upfront (parallel I/O).
         view_cache = _prepare_views(augmented)
         logger.info(
@@ -1707,11 +2106,19 @@ def _fuse_per_cluster(
                             "depthmap_fusion_svo_refine_lambda_reg"
                         ],
                     )
-                # Always bake colors (voxels no longer store color).
-                pts_arr, nrm_arr, clr_arr = fuser.extract_and_bake()
             else:
                 fuser.fuse_only()
-                pts_arr, nrm_arr, clr_arr = fuser.extract_and_bake()
+
+            # --- Render DSM patch for this sub-volume's core footprint ---
+            if dsm_grid is not None:
+                _render_dsm_patch_from_sv(
+                    fuser, sv, dsm_grid, ortho_grid,
+                    dsm_origin_x, dsm_origin_y, dsm_gsd,
+                    dsm_w, dsm_h, dsm_z_min, dsm_z_max,
+                )
+
+            # Always bake colors (voxels no longer store color).
+            pts_arr, nrm_arr, clr_arr = fuser.extract_and_bake()
             pts = np.asarray(pts_arr, dtype=np.float32)
             nrm = np.asarray(nrm_arr, dtype=np.float32)
             clr = np.asarray(clr_arr, dtype=np.uint8)
@@ -1740,6 +2147,87 @@ def _fuse_per_cluster(
             gc.collect()
 
         view_cache.clear()
+
+        # --- Post-process and save DSM + ortho if enabled ---
+        if dsm_grid is not None:
+            valid_count = int(np.count_nonzero(~np.isnan(dsm_grid)))
+            logger.info(
+                f"Cluster {batch_num}: raw DSM composite, "
+                f"{valid_count}/{dsm_grid.size} valid cells"
+            )
+
+            # --- Step 1: Median filter (remove speckle) ---
+            median_radius: int = config.get("dsm_median_radius", 2)
+            if median_radius > 0:
+                dsm_grid = _dsm_median_filter(dsm_grid, median_radius)
+                logger.info(
+                    f"  Applied {2*median_radius+1}x"
+                    f"{2*median_radius+1} median filter"
+                )
+
+            # --- Step 2: Delaunay triangulation hole fill ---
+            max_z_range: float = config.get(
+                "dsm_max_interp_z_range", 2.0
+            )
+            n_filled = _dsm_delaunay_fill(
+                dsm_grid, ortho_grid, max_z_range
+            )
+            if n_filled > 0:
+                logger.info(
+                    f"  Triangulation filled {n_filled} cells"
+                )
+
+            # --- Step 3: Perona-Malik diffusion (GPU) ---
+            diff_iters: int = config.get(
+                "dsm_diffusion_iterations", 50
+            )
+            diff_kappa: float = config.get("dsm_diffusion_kappa", 0.5)
+            diff_dt: float = config.get("dsm_diffusion_dt", 0.2)
+            if diff_iters > 0:
+                dsm_grid = _dsm_gpu_diffuse(
+                    dsm_grid, diff_iters, diff_kappa, diff_dt
+                )
+                logger.info(
+                    f"  Applied {diff_iters} diffusion iterations"
+                )
+
+            # --- Step 3.5: Median filter ortho (remove boundary speckle) ---
+            if ortho_grid is not None and median_radius > 0:
+                from scipy.ndimage import median_filter as _mf
+                ks = 2 * median_radius + 1
+                for ch in range(3):
+                    ortho_grid[:, :, ch] = _mf(
+                        ortho_grid[:, :, ch], size=ks
+                    )
+                logger.info(
+                    f"  Applied {ks}x{ks} median to ortho"
+                )
+
+            # --- Step 4: Diffuse ortho colors into holes ---
+            if ortho_grid is not None:
+                ortho_grid = _ortho_diffuse_holes(
+                    ortho_grid, dsm_grid, diff_iters // 2
+                )
+                logger.info("  Diffused ortho colors into holes")
+
+            # --- Save ---
+            valid_count = int(np.count_nonzero(~np.isnan(dsm_grid)))
+            logger.info(
+                f"Cluster {batch_num}: final DSM, "
+                f"{valid_count}/{dsm_grid.size} valid cells"
+            )
+            reference = reconstruction.reference
+            data.save_dsm(
+                dsm_grid, dsm_origin_x, dsm_origin_y,
+                dsm_gsd, reference,
+            )
+            logger.info(f"DSM saved to {data.dsm_file()}")
+            if ortho_grid is not None:
+                data.save_ortho(
+                    ortho_grid, dsm_origin_x, dsm_origin_y,
+                    dsm_gsd, reference,
+                )
+                logger.info(f"Ortho saved to {data.ortho_file()}")
 
         # Concatenate all sub-volume results.
         if all_points:

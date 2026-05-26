@@ -1094,6 +1094,54 @@ class UndistortedDataSet:
         ds = None
         return arr, gt, wkt
 
+    def ortho_file(self) -> str:
+        return os.path.join(self._depthmap_path(), "ortho.tif")
+
+    def save_ortho(
+        self,
+        image: NDArray,
+        origin_x: float,
+        origin_y: float,
+        gsd: float,
+        reference: Optional["geo.TopocentricConverter"] = None,
+    ) -> None:
+        """Save an ortho image as a 3-band GeoTIFF (uint8 RGB).
+
+        Args:
+            image: (H, W, 3) uint8 array.
+            origin_x: X coordinate of the left edge.
+            origin_y: Y coordinate of the bottom edge.
+            gsd: ground sample distance.
+            reference: topocentric reference for CRS.
+        """
+        from osgeo import gdal, osr
+
+        self.io_handler.mkdir_p(self._depthmap_path())
+        path = self.ortho_file()
+        h, w = image.shape[:2]
+
+        driver = gdal.GetDriverByName("GTiff")
+        ds = driver.Create(path, w, h, 3, gdal.GDT_Byte)
+
+        top_left_y = origin_y + h * gsd
+        ds.SetGeoTransform((origin_x, gsd, 0.0, top_left_y, 0.0, -gsd))
+
+        if reference is not None:
+            srs = osr.SpatialReference()
+            utm_zone = int((reference.lon + 180.0) / 6.0) + 1
+            north = reference.lat >= 0.0
+            srs.SetUTM(utm_zone, north)
+            srs.SetWellKnownGeogCS("WGS84")
+            ds.SetProjection(srs.ExportToWkt())
+
+        # Flip vertically and write each band.
+        flipped = np.flipud(image)
+        for band_idx in range(3):
+            band = ds.GetRasterBand(band_idx + 1)
+            band.WriteArray(flipped[:, :, band_idx])
+            band.FlushCache()
+        ds = None
+
     def raw_depthmap_exists(self, image: str) -> bool:
         return self.io_handler.isfile(self.depthmap_file(image, "raw.npz"))
 

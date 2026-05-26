@@ -1488,6 +1488,61 @@ void SVOIntegratorCL::ClearVotes() {
   queue.finish();
 }
 
+void SVOIntegratorCL::RenderDSMOrtho(float origin_x, float origin_y, float gsd,
+                                     int width, int height, float z_min,
+                                     float z_max, float voxel_size,
+                                     float min_weight,
+                                     std::vector<float>* dsm_out,
+                                     std::vector<uint8_t>* ortho_out,
+                                     std::vector<float>* normals_out) {
+  auto& dev = opencl::CLContext::Instance().Device(device_idx_);
+  auto& ctx = dev.context();
+  cl::CommandQueue& queue = dev.queue();
+
+  const size_t ncells = static_cast<size_t>(width) * height;
+
+  // Allocate output buffers on GPU.
+  cl::Buffer cl_dsm(ctx, CL_MEM_WRITE_ONLY, ncells * sizeof(float));
+  cl::Buffer cl_ortho(ctx, CL_MEM_WRITE_ONLY, ncells * sizeof(uint32_t));
+  cl::Buffer cl_normals(ctx, CL_MEM_WRITE_ONLY, ncells * 3 * sizeof(float));
+
+  // Build kernel (reuses cached program).
+  cl::Kernel k(program_, "svo_render_dsm_ortho");
+  k.setArg(0, cl_table_);
+  k.setArg(1, capacity_mask_);
+  k.setArg(2, cl_dsm);
+  k.setArg(3, cl_ortho);
+  k.setArg(4, cl_normals);
+  k.setArg(5, origin_x);
+  k.setArg(6, origin_y);
+  k.setArg(7, gsd);
+  k.setArg(8, width);
+  k.setArg(9, height);
+  k.setArg(10, z_max);
+  k.setArg(11, z_min);
+  k.setArg(12, voxel_size);
+  k.setArg(13, min_weight);
+
+  const size_t gx = ((static_cast<size_t>(width) + 15) / 16) * 16;
+  const size_t gy = ((static_cast<size_t>(height) + 15) / 16) * 16;
+  queue.enqueueNDRangeKernel(k, cl::NullRange, cl::NDRange(gx, gy),
+                             cl::NDRange(16, 16));
+  queue.finish();
+
+  // Download results.
+  dsm_out->resize(ncells);
+  queue.enqueueReadBuffer(cl_dsm, CL_TRUE, 0, ncells * sizeof(float),
+                          dsm_out->data());
+
+  ortho_out->resize(ncells * 4);
+  queue.enqueueReadBuffer(cl_ortho, CL_TRUE, 0, ncells * sizeof(uint32_t),
+                          ortho_out->data());
+
+  normals_out->resize(ncells * 3);
+  queue.enqueueReadBuffer(cl_normals, CL_TRUE, 0, ncells * 3 * sizeof(float),
+                          normals_out->data());
+}
+
 }  // namespace dense
 
 #endif  // OPENSFM_HAVE_OPENCL

@@ -41,7 +41,13 @@ PYBIND11_MODULE(pydense, m) {
       .def("prune_by_visibility", &dense::SVOFuserWrapper::PruneByVisibility,
            py::arg("iterations"), py::arg("carve_margin"),
            py::arg("carve_threshold"), py::arg("support_min"))
-      .def("extract_points", &dense::SVOFuserWrapper::ExtractPoints);
+      .def("extract_points", &dense::SVOFuserWrapper::ExtractPoints)
+      .def("render_dsm_ortho", &dense::SVOFuserWrapper::RenderDSMOrtho,
+           py::arg("origin_x"), py::arg("origin_y"), py::arg("gsd"),
+           py::arg("width"), py::arg("height"), py::arg("z_min"),
+           py::arg("z_max"))
+      .def("bake_colors", &dense::SVOFuserWrapper::BakeColorsStandalone,
+           py::arg("points"), py::arg("normals"));
 
   py::class_<dense::DepthmapClusterEstimatorWrapper>(m,
                                                      "DepthmapClusterEstimator")
@@ -176,6 +182,8 @@ PYBIND11_MODULE(pydense, m) {
       .def("upsample_nn", &dense::DSMRasterizerWrapper::UpsampleNN,
            py::arg("coarse"), py::arg("coarse_w"), py::arg("coarse_h"))
       .def("apply_bilateral", &dense::DSMRasterizerWrapper::ApplyBilateral)
+      .def("upload_grid", &dense::DSMRasterizerWrapper::UploadGrid,
+           py::arg("grid"))
       .def("begin_zbuf", &dense::DSMRasterizerWrapper::BeginZBuf)
       .def("rasterize_view", &dense::DSMRasterizerWrapper::RasterizeView,
            py::arg("K"), py::arg("R"), py::arg("t"), py::arg("depth"),

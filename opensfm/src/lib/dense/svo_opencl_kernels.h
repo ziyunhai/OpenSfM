@@ -1874,6 +1874,140 @@ __kernel void svo_clear_votes(
     support_count[i] = 0;
 }
 
+
+// =====================================================================
+// svo_render_dsm_ortho: Orthographic top-down raycast of the TSDF.
+//
+// 2D dispatch: one work-item per DSM grid cell.
+// Fires a vertical ray downward (z_max -> z_min) through the hash table,
+// detects the FIRST zero-crossing (highest surface), writes Z and color.
+//
+// DSM: Float32 grid -- NaN where no surface.
+// Ortho: RGBA8 (4 bytes packed as uint).
+// Normals: float3 per cell (nx, ny, nz); (0,0,0) where no surface.
+// =====================================================================
+__kernel void svo_render_dsm_ortho(
+    __global const VoxelSlot* table,
+    uint                      capacity_mask,
+    __global float*           dsm_out,
+    __global uint*            ortho_out,
+    __global float*           normals_out,
+    const float               origin_x,
+    const float               origin_y,
+    const float               gsd,
+    const int                 grid_w,
+    const int                 grid_h,
+    const float               z_max,
+    const float               z_min,
+    const float               voxel_size,
+    const float               min_weight)
+{
+    const int gx = get_global_id(0);
+    const int gy = get_global_id(1);
+    if (gx >= grid_w || gy >= grid_h) return;
+
+    const int cell = gy * grid_w + gx;
+
+    // World XY at cell center.
+    const float wx = origin_x + ((float)gx + 0.5f) * gsd;
+    const float wy = origin_y + ((float)gy + 0.5f) * gsd;
+
+    const float inv_vs = 1.0f / voxel_size;
+    const int min_weight_fp = (int)(min_weight * (float)WEIGHT_SCALE);
+
+    // Voxel column coordinates (X and Y are constant along the ray).
+    const int vx = (int)floor(wx * inv_vs);
+    const int vy = (int)floor(wy * inv_vs);
+
+    if (vx < -32768 || vx > 32766 || vy < -32768 || vy > 32766) {
+        dsm_out[cell] = NAN;
+        ortho_out[cell] = 0;
+        normals_out[cell * 3 + 0] = 0.0f;
+        normals_out[cell * 3 + 1] = 0.0f;
+        normals_out[cell * 3 + 2] = 0.0f;
+        return;
+    }
+
+    // March from top (z_max) downward to z_min in voxel_size steps.
+    // Detect zero-crossing: prev_tsdf > 0, current <= 0 means we hit
+    // the surface from above (exterior is positive).
+    float prev_tsdf = 2.0f;  // sentinel (invalid)
+    float prev_z = z_max;
+    int   prev_vz = (int)floor(z_max * inv_vs) + 1;  // impossible value
+
+    for (float z = z_max; z >= z_min; z -= voxel_size) {
+        const int vz = (int)floor(z * inv_vs);
+
+        // Skip if same voxel as previous step (can happen due to float precision).
+        if (vz == prev_vz && prev_tsdf < 2.0f) {
+            prev_z = z;
+            continue;
+        }
+
+        uint slot_idx = hash_lookup(table, capacity_mask, vx, vy, vz);
+        if (slot_idx > capacity_mask) {
+            prev_tsdf = 2.0f;
+            prev_z = z;
+            prev_vz = vz;
+            continue;
+        }
+
+        int sw = table[slot_idx].sum_weight;
+        if (sw < min_weight_fp) {
+            prev_tsdf = 2.0f;
+            prev_z = z;
+            prev_vz = vz;
+            continue;
+        }
+
+        float tsdf = (float)table[slot_idx].sum_tsdf
+                   / ((float)sw * (float)FP_SCALE);
+
+        // Zero-crossing: positive -> negative/zero (entering surface from above).
+        if (prev_tsdf > 0.0f && prev_tsdf <= 1.0f && tsdf <= 0.0f) {
+            // Interpolate exact Z.
+            float t_frac = prev_tsdf / (prev_tsdf - tsdf + 1e-8f);
+            float hit_z = prev_z - t_frac * (prev_z - z);
+
+            dsm_out[cell] = hit_z;
+
+            // Normal = (sum_nx, sum_ny, sum_nz) / sum_weight * (1/FP_SCALE)
+            float inv_sw = 1.0f / (float)sw;
+            float nx = (float)table[slot_idx].sum_nx * inv_sw / (float)FP_SCALE;
+            float ny = (float)table[slot_idx].sum_ny * inv_sw / (float)FP_SCALE;
+            float nz = (float)table[slot_idx].sum_nz * inv_sw / (float)FP_SCALE;
+            float len = sqrt(nx*nx + ny*ny + nz*nz);
+            if (len > 0.001f) { nx /= len; ny /= len; nz /= len; }
+            else { nx = 0.0f; ny = 0.0f; nz = 1.0f; }
+
+            // Store surface normal.
+            normals_out[cell * 3 + 0] = nx;
+            normals_out[cell * 3 + 1] = ny;
+            normals_out[cell * 3 + 2] = nz;
+
+            // Simple Lambert shading: light from (0.3, 0.3, 0.9) normalized.
+            float shade = fmax(0.0f, 0.3f*nx + 0.3f*ny + 0.9f*nz);
+            // Normalize to [0.2, 1.0] range to avoid pure black.
+            shade = 0.2f + 0.8f * shade;
+            uint gray = (uint)(shade * 255.0f);
+            gray = min(gray, 255u);
+            // Pack as RGBA (R=G=B=gray, A=255).
+            ortho_out[cell] = gray | (gray << 8) | (gray << 16) | (255u << 24);
+            return;
+        }
+
+        prev_tsdf = tsdf;
+        prev_z = z;
+        prev_vz = vz;
+    }
+
+    // No surface found.
+    dsm_out[cell] = NAN;
+    ortho_out[cell] = 0;
+    normals_out[cell * 3 + 0] = 0.0f;
+    normals_out[cell * 3 + 1] = 0.0f;
+    normals_out[cell * 3 + 2] = 0.0f;
+}
 )CL";
 
 }  // namespace dense

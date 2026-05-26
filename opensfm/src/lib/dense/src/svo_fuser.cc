@@ -611,4 +611,18 @@ void SVOFuser::Fuse(std::vector<Vec3f>* fused_points,
   ExtractPoints(fused_points, fused_normals, fused_colors);
 }
 
+void SVOFuser::RenderDSMOrtho(float origin_x, float origin_y, float gsd,
+                              int width, int height, float z_min, float z_max,
+                              std::vector<float>* dsm_out,
+                              std::vector<uint8_t>* ortho_out,
+                              std::vector<float>* normals_out) {
+  if (!integrator_) {
+    throw std::runtime_error(
+        "SVOFuser::RenderDSMOrtho: must call Fuse() first");
+  }
+  integrator_->RenderDSMOrtho(origin_x, origin_y, gsd, width, height, z_min,
+                              z_max, voxel_size_, min_weight_, dsm_out,
+                              ortho_out, normals_out);
+}
+
 }  // namespace dense
