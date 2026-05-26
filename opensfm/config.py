@@ -414,15 +414,18 @@ class OpenSfMConfig:
     # Maximum image dimension for processing (longer side)
     depthmap_max_image_size: int = 3200
     # Maximum PatchMatch cost to keep a pixel (0 = disabled)
-    depthmap_max_cost: float = 0.9
+    depthmap_max_cost: float = 0
     # Threshold to measure depth closeness (clean stage)
-    depthmap_same_depth_threshold: float = 0.01
+    depthmap_same_depth_threshold: float = 0.05
     # Min number of consistent views in clean stage
     depthmap_min_consistent_views: int = 3
     # Relative depth margin for space-carving votes; neighbor sees further by this fraction → carve vote.
     depthmap_carving_threshold: float = 0.05
     # Max carve votes a pixel can accumulate before being discarded.
-    depthmap_max_carved_views: int = 2
+    depthmap_max_carved_views: int = 1
+    # Two-pass cleaning: pass 1 uses consistency only (no carving) on raw
+    # depthmaps, pass 2 uses carving on the cleaned depthmaps from pass 1.
+    depthmap_carving_two_pass: bool = True
     # Cosine threshold for grazing-angle detection (below → pixel is grazing, stricter filtering).
     depthmap_grazing_cos_threshold: float = 0.2
     # Depth ratio threshold for 3×3 edge detection (e.g. 1.10 → 10% discontinuity = edge pixel).

@@ -2757,7 +2757,32 @@ __kernel void acmmp_clean_depthmap(
 
     // ---- Space carving: source sees significantly further ----
     if (src_depth > sz * (1.0f + carving_threshold)) {
-      carved++;
+      float src_fx = src_cam.K[0], src_cx = src_cam.K[2];
+      float src_fy = src_cam.K[4], src_cy = src_cam.K[5];
+
+      float src_cam_x = (su - src_cx) / src_fx * src_depth;
+      float src_cam_y = (sv_coord - src_cy) / src_fy * src_depth;
+      float src_cam_z = src_depth;
+
+      float spc_x = src_cam_x - src_cam.t[0];
+      float spc_y = src_cam_y - src_cam.t[1];
+      float spc_z = src_cam_z - src_cam.t[2];
+
+      float wx2 = src_cam.R[0]*spc_x + src_cam.R[3]*spc_y + src_cam.R[6]*spc_z;
+      float wy2 = src_cam.R[1]*spc_x + src_cam.R[4]*spc_y + src_cam.R[7]*spc_z;
+      float wz2 = src_cam.R[2]*spc_x + src_cam.R[5]*spc_y + src_cam.R[8]*spc_z;
+      float rz = ref_cam.R[6]*wx2 + ref_cam.R[7]*wy2 + ref_cam.R[8]*wz2 + ref_cam.t[2];
+
+      if (rz > 1e-6f) {
+        // Carve vote: the source surface point is behind the reference
+        // depth.  No reproj_ok gate — it blocked votes for both floaters
+        // and real surfaces equally.  Consistency-weighted carve_budget
+        // protects well-corroborated surfaces instead.
+        int behind_ref = (rz > ref_depth * (1.0f + same_depth_threshold));
+        if (behind_ref) {
+          carved++;
+        }
+      }
       continue;
     }
 
@@ -2799,7 +2824,8 @@ __kernel void acmmp_clean_depthmap(
   int eff_min = is_suspicious ? (min_consistent_views + 1) : min_consistent_views;
   int eff_max_carve = is_suspicious ? max(1, max_carved_views - 1) : max_carved_views;
 
-  int keep = (consistent >= eff_min) && (carved <= eff_max_carve);
+  int carve_budget = eff_max_carve + max(0, consistent - eff_min);
+  int keep = (consistent >= eff_min) && (carved <= carve_budget);
   clean_depth[idx] = keep ? ref_depth : 0.0f;
 }
 

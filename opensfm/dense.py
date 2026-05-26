@@ -900,9 +900,12 @@ def _clean_views_batched_gpu(
         cluster_shots_set = set(cluster_shots)
 
         loaded = data.load_raw_depthmaps_parallel(ordered_shots)
+        # Keep raw depths for potential pass-2 reload.
+        raw_depths: Dict[str, NDArray] = {}
         for sid, (depth, normal, _, _, _, confidence) in zip(
             ordered_shots, loaded
         ):
+            raw_depths[sid] = depth
             shot = reconstruction.shots[sid]
             h, w = depth.shape[:2]
             K = shot.camera.get_K_in_pixel_coordinates(w, h)
@@ -924,8 +927,14 @@ def _clean_views_batched_gpu(
 
         del loaded
 
-        # ── Clean each ref view and save to disk immediately ───────
-        save_items = []
+        two_pass = config.get("depthmap_carving_two_pass", True)
+
+        # ── PASS 1: consistency-only (carving disabled) ────────────
+        if two_pass:
+            cleaner.set_max_carved_views(999)  # effectively disable carving
+        # else: use configured max_carved_views (single-pass behavior)
+
+        pass1_depths: Dict[str, NDArray] = {}
         use_segment_filter = config.get("depthmap_segmentation_enabled", False)
         for sid in cluster_shots:
             nbr_indices = np.array(
@@ -964,11 +973,78 @@ def _clean_views_batched_gpu(
                     dtype=np.float32,
                 )
 
+            pass1_depths[sid] = cleaned_arr
+
+        if not two_pass:
+            # Single-pass: save directly.
+            save_items = []
+            for sid in cluster_shots:
+                norm = raw_normals.pop(sid)
+                conf = raw_confidence.pop(sid, None)
+                score = np.zeros_like(pass1_depths[sid])
+                save_items.append((sid, pass1_depths[sid], norm, score, conf))
+
+            data.save_clean_depthmaps_parallel(save_items)
+            if config["depthmap_save_debug_ply"]:
+                for sid, cleaned, _norm, _sc, _conf in save_items:
+                    _save_depthmap_as_ply(
+                        data, reconstruction, sid, cleaned, "clean")
+            del raw_normals, raw_depths, pass1_depths
+            cleaner.clear()
+            gc.collect()
+            return len(save_items)
+
+        # ── PASS 2: carving with cleaned neighbor depths ───────────
+        # Reload the cleaner with pass-1 cleaned depths for all views.
+        # Reference shots use their pass-1 result; neighbor-only shots
+        # that were not ref in this cluster keep their raw depth (they
+        # may have been cleaned in another cluster — but we don't have
+        # their clean result here, so raw is the best approximation).
+        cleaner.clear()
+        cleaner.set_max_carved_views(config["depthmap_max_carved_views"])
+
+        ordered_shots2 = sorted(needed)
+        shot_to_idx2: Dict[str, int] = {
+            sid: i for i, sid in enumerate(ordered_shots2)
+        }
+
+        for sid in ordered_shots2:
+            shot = reconstruction.shots[sid]
+            # Use pass-1 cleaned depth if available, otherwise raw.
+            depth = pass1_depths.get(sid, raw_depths[sid])
+            h, w = depth.shape[:2]
+            K = shot.camera.get_K_in_pixel_coordinates(w, h)
+            R = shot.pose.get_rotation_matrix()
+            t = shot.pose.translation
+            if sid in cluster_shots_set and raw_normals.get(sid) is not None:
+                norm_3n = np.asfortranarray(
+                    raw_normals[sid].reshape(-1, 3).T.astype(np.float32)
+                )
+                cleaner.add_view_with_normal(K, R, t, depth, norm_3n)
+            else:
+                cleaner.add_view(K, R, t, depth)
+
+        del raw_depths
+
+        logger.info(
+            f"GPU clean cluster pass 2 (carving): "
+            f"{len(cluster_shots)} ref shots"
+        )
+
+        save_items = []
+        for sid in cluster_shots:
+            nbr_indices = np.array(
+                [shot_to_idx2[n] for n in per_ref_nbrs[sid]],
+                dtype=np.int32,
+            )
+            cleaned_depth = cleaner.clean(shot_to_idx2[sid], nbr_indices)
+            cleaned_arr = np.asarray(cleaned_depth, dtype=np.float32)
             norm = raw_normals.pop(sid)
             conf = raw_confidence.pop(sid, None)
             score = np.zeros_like(cleaned_arr)
             save_items.append((sid, cleaned_arr, norm, score, conf))
 
+        del pass1_depths
         data.save_clean_depthmaps_parallel(save_items)
 
         # Export each clean depthmap as a binary PLY.
