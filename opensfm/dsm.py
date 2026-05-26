@@ -69,6 +69,7 @@ def compute_dsm(
     num_levels: int = config.get("dsm_num_levels", 3)
     level_factor: float = config.get("dsm_level_factor", 2.0)
     mode_threshold: float = config.get("dsm_mode_threshold", 1.0)
+    max_triangle_edge: float = config.get("dsm_max_triangle_edge", 3.0)
     min_count: int = config.get("dsm_min_count", 3)
     min_normal_z: float = config.get("dsm_min_normal_z", 0.2)
     soft_upper_nz: float = config.get("dsm_soft_upper_nz", 0.7)
@@ -78,6 +79,7 @@ def compute_dsm(
     diffusion_iters: int = config.get("dsm_diffusion_iterations", 50)
     diffusion_kappa: float = config.get("dsm_diffusion_kappa", 0.5)
     diffusion_dt: float = config.get("dsm_diffusion_dt", 0.2)
+    dsm_method: str = config.get("dsm_method", "triangles")
 
     # Build level GSDs from coarsest to finest.
     # e.g. num_levels=3, factor=2: [4*gsd, 2*gsd, gsd]
@@ -110,38 +112,61 @@ def compute_dsm(
         rasterizer.set_bbox(min_xy, max_xy)
         rasterizer.set_device(0)
         rasterizer.set_mode_threshold(mode_threshold)
+        rasterizer.set_max_triangle_edge(max_triangle_edge)
         rasterizer.set_min_count(min_count)
         rasterizer.set_min_normal_z(min_normal_z, soft_upper_nz)
         rasterizer.set_bilateral(bilateral_enabled, bilateral_spatial,
                                  bilateral_range)
-        rasterizer.begin()
 
-        # Scatter all views + update modes after each
-        for i, shot in enumerate(shots_with_dm):
-            depth, plane, _score, confidence = data.load_clean_depthmap(
-                shot.id
-            )
-            if confidence is None:
-                confidence = np.ones_like(depth)
-            h, w = depth.shape
-            K = np.asarray(shot.camera.get_K_in_pixel_coordinates(w, h))
-            R = np.asarray(shot.pose.get_rotation_matrix())
-            t = np.asarray(shot.pose.translation)
-            rasterizer.scatter(
-                K, R, t,
-                depth.astype(np.float32, copy=False),
-                plane.astype(np.float32, copy=False),
-                confidence.astype(np.float32, copy=False),
-            )
-            rasterizer.update_modes()
-            if (i + 1) % 20 == 0 or i + 1 == len(shots_with_dm):
-                logger.info(
-                    "  Level %d: %d / %d views",
-                    level_idx + 1, i + 1, len(shots_with_dm),
+        if dsm_method == "triangles":
+            # --- Triangle rasterization with MAX z-buffer ---
+            rasterizer.begin_zbuf()
+            for i, shot in enumerate(shots_with_dm):
+                depth, plane, _score, _confidence = data.load_clean_depthmap(
+                    shot.id
                 )
+                h, w = depth.shape
+                K = np.asarray(shot.camera.get_K_in_pixel_coordinates(w, h))
+                R = np.asarray(shot.pose.get_rotation_matrix())
+                t = np.asarray(shot.pose.translation)
+                rasterizer.rasterize_view(
+                    K, R, t,
+                    depth.astype(np.float32, copy=False),
+                    plane.astype(np.float32, copy=False),
+                )
+                if (i + 1) % 20 == 0 or i + 1 == len(shots_with_dm):
+                    logger.info(
+                        "  Level %d: %d / %d views (triangles)",
+                        level_idx + 1, i + 1, len(shots_with_dm),
+                    )
+            grid: NDArray = rasterizer.finish_zbuf()
+        else:
+            # --- Legacy: per-point scatter with mode tracking ---
+            rasterizer.begin()
+            for i, shot in enumerate(shots_with_dm):
+                depth, plane, _score, confidence = data.load_clean_depthmap(
+                    shot.id
+                )
+                if confidence is None:
+                    confidence = np.ones_like(depth)
+                h, w = depth.shape
+                K = np.asarray(shot.camera.get_K_in_pixel_coordinates(w, h))
+                R = np.asarray(shot.pose.get_rotation_matrix())
+                t = np.asarray(shot.pose.translation)
+                rasterizer.scatter(
+                    K, R, t,
+                    depth.astype(np.float32, copy=False),
+                    plane.astype(np.float32, copy=False),
+                    confidence.astype(np.float32, copy=False),
+                )
+                rasterizer.update_modes()
+                if (i + 1) % 20 == 0 or i + 1 == len(shots_with_dm):
+                    logger.info(
+                        "  Level %d: %d / %d views (modes)",
+                        level_idx + 1, i + 1, len(shots_with_dm),
+                    )
+            grid: NDArray = rasterizer.finish()
 
-        # Finalize → grid + validity mask
-        grid: NDArray = rasterizer.finish()
         valid_count = int(np.count_nonzero(~np.isnan(grid)))
         logger.info(
             "  Level %d finalized: %d / %d valid cells",

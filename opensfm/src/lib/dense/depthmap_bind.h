@@ -456,6 +456,7 @@ class DSMRasterizerWrapper {
   }
   void SetDevice(int idx) { device_idx_ = idx; }
   void SetModeThreshold(float meters) { mode_threshold_ = meters; }
+  void SetMaxTriangleEdge(float grid_cells) { max_triangle_edge_ = grid_cells; }
   void SetMinCount(int n) { min_count_ = n; }
   void SetMinNormalZ(float hard_gate, float soft_upper) {
     min_normal_z_ = hard_gate;
@@ -830,6 +831,146 @@ class DSMRasterizerWrapper {
     return foundation::py_array_from_data(host_grid.data(), grid_h_, grid_w_);
   }
 
+  // --- Triangle rasterization approach (dsm_method = "triangles") ---
+
+  // Allocate z-buffer for triangle rasterization.
+  void BeginZBuf() {
+    if (!has_bbox_ || gsd_ <= 0.0f) {
+      throw std::runtime_error(
+          "DSMRasterizer: must set GSD and bbox before BeginZBuf()");
+    }
+
+    grid_w_ = static_cast<int>(std::ceil((max_x_ - origin_x_) / gsd_));
+    grid_h_ = static_cast<int>(std::ceil((max_y_ - origin_y_) / gsd_));
+    if (grid_w_ <= 0 || grid_h_ <= 0) {
+      throw std::runtime_error("DSMRasterizer: degenerate grid size");
+    }
+    ncells_ = static_cast<size_t>(grid_h_) * grid_w_;
+
+    auto& dev = opencl::CLContext::Instance().Device(device_idx_);
+    prog_ = dev.GetOrBuildProgram("dsm_mode_v2", kDSMKernelSource);
+
+    auto& ctx = dev.context();
+    auto& q = dev.queue();
+
+    cl_zbuf_ = cl::Buffer(ctx, CL_MEM_READ_WRITE, ncells_ * sizeof(int32_t));
+    cl_valid_ = cl::Buffer(ctx, CL_MEM_READ_WRITE, ncells_ * sizeof(uint8_t));
+    cl_out_a_ = cl::Buffer(ctx, CL_MEM_READ_WRITE, ncells_ * sizeof(float));
+    cl_out_b_ = cl::Buffer(ctx, CL_MEM_READ_WRITE, ncells_ * sizeof(float));
+    cl_guide_ = cl::Buffer(ctx, CL_MEM_READ_WRITE, ncells_ * sizeof(float));
+
+    // Clear z-buffer
+    const int ncells_i = static_cast<int>(ncells_);
+    const size_t global = ((ncells_ + 255) / 256) * 256;
+    cl::Kernel k(prog_, "dsm_clear_zbuf");
+    k.setArg(0, cl_zbuf_);
+    k.setArg(1, cl_valid_);
+    k.setArg(2, ncells_i);
+    q.enqueueNDRangeKernel(k, cl::NullRange, cl::NDRange(global),
+                           cl::NDRange(256));
+    q.finish();
+  }
+
+  // Rasterize one depthmap view as triangles into the MAX z-buffer.
+  void RasterizeView(const Mat3d& K, const Mat3d& R, const Vec3d& t,
+                     Eigen::Ref<const ImageF> depth,
+                     const py::array_t<float, py::array::c_style>& normal) {
+    const int h = static_cast<int>(depth.rows());
+    const int w = static_cast<int>(depth.cols());
+    const int npx = h * w;
+
+    if (normal.ndim() != 3 || normal.shape(0) != h || normal.shape(1) != w ||
+        normal.shape(2) != 3) {
+      throw std::invalid_argument("normal must be (H, W, 3) float32");
+    }
+
+    // Pack camera params: K_inv(9) + R_inv(9) + t(3) = 21 floats
+    Eigen::Matrix3f Kinvf = K.cast<float>().inverse();
+    Eigen::Matrix3f Rinvf = R.cast<float>().transpose();
+    Eigen::Vector3f tf = t.cast<float>();
+
+    float cam[21];
+    for (int i = 0; i < 3; ++i) {
+      for (int j = 0; j < 3; ++j) {
+        cam[i * 3 + j] = Kinvf(i, j);
+        cam[9 + i * 3 + j] = Rinvf(i, j);
+      }
+    }
+    cam[18] = tf.x();
+    cam[19] = tf.y();
+    cam[20] = tf.z();
+
+    auto& dev = opencl::CLContext::Instance().Device(device_idx_);
+    auto& ctx = dev.context();
+    auto& q = dev.queue();
+
+    cl::Buffer cl_depth(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                        npx * sizeof(float), const_cast<float*>(depth.data()));
+    cl::Buffer cl_normal(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                         npx * 3 * sizeof(float),
+                         const_cast<float*>(normal.data()));
+    cl::Buffer cl_cam(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                      21 * sizeof(float), cam);
+
+    const float inv_gsd = 1.0f / gsd_;
+    const int ncells_i = static_cast<int>(ncells_);
+    const float max_z_diff = mode_threshold_;
+    // Max triangle edge in grid cells (squared).  Prevents triangles
+    // from spanning too many cells at depth discontinuities.
+    const float max_edge = max_triangle_edge_;
+    const float max_edge_sq = max_edge * max_edge;
+    const size_t global = ((static_cast<size_t>(npx) + 255) / 256) * 256;
+
+    cl::Kernel k(prog_, "dsm_rasterize_triangles");
+    k.setArg(0, cl_depth);
+    k.setArg(1, cl_normal);
+    k.setArg(2, cl_cam);
+    k.setArg(3, cl_zbuf_);
+    k.setArg(4, cl_valid_);
+    k.setArg(5, origin_x_);
+    k.setArg(6, origin_y_);
+    k.setArg(7, inv_gsd);
+    k.setArg(8, grid_w_);
+    k.setArg(9, grid_h_);
+    k.setArg(10, w);
+    k.setArg(11, h);
+    k.setArg(12, ncells_i);
+    k.setArg(13, max_z_diff);
+    k.setArg(14, max_edge_sq);
+    k.setArg(15, min_normal_z_);
+
+    py::gil_scoped_release release;
+    q.enqueueNDRangeKernel(k, cl::NullRange, cl::NDRange(global),
+                           cl::NDRange(256));
+    q.finish();
+  }
+
+  // Finalize z-buffer: convert int->float, download as grid.
+  foundation::pyarray_f FinishZBuf() {
+    auto& dev = opencl::CLContext::Instance().Device(device_idx_);
+    auto& q = dev.queue();
+    const int ncells_i = static_cast<int>(ncells_);
+    const size_t global = ((ncells_ + 255) / 256) * 256;
+
+    cl::Kernel k(prog_, "dsm_finalize_zbuf");
+    k.setArg(0, cl_zbuf_);
+    k.setArg(1, cl_out_a_);
+    k.setArg(2, cl_valid_);
+    k.setArg(3, ncells_i);
+
+    {
+      py::gil_scoped_release release;
+      q.enqueueNDRangeKernel(k, cl::NullRange, cl::NDRange(global),
+                             cl::NDRange(256));
+      q.finish();
+    }
+
+    std::vector<float> host_grid(ncells_);
+    q.enqueueReadBuffer(cl_out_a_, CL_TRUE, 0, ncells_ * sizeof(float),
+                        host_grid.data());
+    return foundation::py_array_from_data(host_grid.data(), grid_h_, grid_w_);
+  }
+
   int grid_width() const { return grid_w_; }
   int grid_height() const { return grid_h_; }
 
@@ -867,6 +1008,7 @@ class DSMRasterizerWrapper {
   int min_count_ = 3;
   float min_normal_z_ = 0.2f;
   float soft_upper_nz_ = 0.7f;
+  float max_triangle_edge_ = 3.0f;
   int bilateral_radius_ = 2;
   float bilateral_range_ = 0.3f;
   bool bilateral_enabled_ = true;
@@ -885,6 +1027,7 @@ class DSMRasterizerWrapper {
   cl::Buffer cl_out_b_;
   cl::Buffer cl_valid_;
   cl::Buffer cl_guide_;
+  cl::Buffer cl_zbuf_;
 };
 
 #else  // !OPENSFM_HAVE_OPENCL
@@ -895,6 +1038,7 @@ class DSMRasterizerWrapper {
   void SetBBox(const Eigen::Vector2f&, const Eigen::Vector2f&) {}
   void SetDevice(int) {}
   void SetModeThreshold(float) {}
+  \n void SetMaxTriangleEdge(float) {}
   void SetMinCount(int) {}
   void SetMinNormalZ(float, float) {}
   void SetBilateral(bool, int, float) {}
@@ -928,6 +1072,17 @@ class DSMRasterizerWrapper {
     throw std::runtime_error("DSMRasterizer: OpenCL not available");
   }
   foundation::pyarray_f ApplyBilateral() {
+    throw std::runtime_error("DSMRasterizer: OpenCL not available");
+  }
+  void BeginZBuf() {
+    throw std::runtime_error("DSMRasterizer: OpenCL not available");
+  }
+  void RasterizeView(const Mat3d&, const Mat3d&, const Vec3d&,
+                     Eigen::Ref<const ImageF>,
+                     const py::array_t<float, py::array::c_style>&) {
+    throw std::runtime_error("DSMRasterizer: OpenCL not available");
+  }
+  foundation::pyarray_f FinishZBuf() {
     throw std::runtime_error("DSMRasterizer: OpenCL not available");
   }
   int grid_width() const { return 0; }

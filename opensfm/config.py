@@ -559,12 +559,19 @@ class OpenSfMConfig:
     ##################################
     # Params for DSM (Digital Surface Model) generation
     ##################################
+    # Method: "triangles" (per-view triangle rasterization with MAX z-buffer)
+    # or "modes" (legacy: per-point scatter with mode tracking).
+    dsm_method: str = "triangles"
     # Ground sample distance in meters/pixel. 0 = auto from voxel size.
     dsm_gsd: float = 0.0
     # Mode-seeking threshold in meters: incoming Z samples closer than
     # this to an existing mode are merged; farther samples go to the
     # ring buffer for new-mode detection.
     dsm_mode_threshold: float = 0.5
+    # Max triangle edge length in grid cells for triangle rasterization.
+    # Triangles with any edge longer than this are rejected (prevents
+    # overgrowth of thin structures and capping of concave regions).
+    dsm_max_triangle_edge: float = 6.0
     # Minimum number of depthmap pixel contributions per mode.  Modes
     # with fewer observations are discarded during finalization.
     dsm_min_count: int = 3

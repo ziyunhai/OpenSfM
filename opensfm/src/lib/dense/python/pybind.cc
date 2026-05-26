@@ -156,6 +156,8 @@ PYBIND11_MODULE(pydense, m) {
            py::arg("max_xy"))
       .def("set_device", &dense::DSMRasterizerWrapper::SetDevice)
       .def("set_mode_threshold", &dense::DSMRasterizerWrapper::SetModeThreshold)
+      .def("set_max_triangle_edge",
+           &dense::DSMRasterizerWrapper::SetMaxTriangleEdge)
       .def("set_min_count", &dense::DSMRasterizerWrapper::SetMinCount)
       .def("set_min_normal_z", &dense::DSMRasterizerWrapper::SetMinNormalZ,
            py::arg("hard_gate"), py::arg("soft_upper"))
@@ -174,6 +176,11 @@ PYBIND11_MODULE(pydense, m) {
       .def("upsample_nn", &dense::DSMRasterizerWrapper::UpsampleNN,
            py::arg("coarse"), py::arg("coarse_w"), py::arg("coarse_h"))
       .def("apply_bilateral", &dense::DSMRasterizerWrapper::ApplyBilateral)
+      .def("begin_zbuf", &dense::DSMRasterizerWrapper::BeginZBuf)
+      .def("rasterize_view", &dense::DSMRasterizerWrapper::RasterizeView,
+           py::arg("K"), py::arg("R"), py::arg("t"), py::arg("depth"),
+           py::arg("normal"))
+      .def("finish_zbuf", &dense::DSMRasterizerWrapper::FinishZBuf)
       .def_property_readonly("grid_width",
                              &dense::DSMRasterizerWrapper::grid_width)
       .def_property_readonly("grid_height",
