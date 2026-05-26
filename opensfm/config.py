@@ -564,24 +564,34 @@ class OpenSfMConfig:
     # Mode-seeking threshold in meters: incoming Z samples closer than
     # this to an existing mode are merged; farther samples go to the
     # ring buffer for new-mode detection.
-    dsm_mode_threshold: float = 1.0
+    dsm_mode_threshold: float = 0.5
     # Minimum number of depthmap pixel contributions per mode.  Modes
     # with fewer observations are discarded during finalization.
     dsm_min_count: int = 3
-    # Enable edge-preserving bilateral smoothing on the DSM grid.
+    # Number of pyramid levels for multi-scale DSM (coarsest first).
+    dsm_num_levels: int = 3
+    # GSD multiplier between consecutive levels (e.g. 2.0 → 4x, 2x, 1x).
+    dsm_level_factor: float = 2.0
+    # Hard gate on world normal Z: samples with wnz below this are rejected.
+    dsm_min_normal_z: float = 0.2
+    # Upper bound for soft normal weighting smoothstep.
+    # Surfaces with wnz >= this get full confidence weight.
+    dsm_soft_upper_nz: float = 0.7
+    # Enable edge-preserving bilateral smoothing on the final DSM grid.
     dsm_bilateral_enabled: bool = True
     # Bilateral filter spatial radius in pixels.
     dsm_bilateral_spatial: int = 2
     # Bilateral filter range sigma in meters.
     dsm_bilateral_range: float = 0.3
-    # Fill small holes in the DSM via iterative nearest-neighbor dilation.
-    dsm_fill_holes: bool = True
-    # Maximum dilation radius (in pixels) for small-hole filling.
-    dsm_fill_max_radius: int = 40
-    # Use Delaunay triangulation to fill larger interior holes after dilation.
-    dsm_fill_triangulate: bool = True
+    # Number of Perona-Malik diffusion iterations per level.
+    dsm_diffusion_iterations: int = 50
+    # Edge-stopping parameter kappa (meters). Controls how much gradient
+    # magnitude inhibits diffusion across edges.
+    dsm_diffusion_kappa: float = 0.5
+    # Diffusion time-step (must be ≤ 0.25 for stability).
+    dsm_diffusion_dt: float = 0.2
     # Post-process median filter radius (0 = disabled, 1 = 3x3, 2 = 5x5).
-    dsm_median_radius: int = 1
+    dsm_median_radius: int = 2
 
     ##################################
     # Params for multi-processing/threading

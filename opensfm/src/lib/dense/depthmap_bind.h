@@ -457,6 +457,10 @@ class DSMRasterizerWrapper {
   void SetDevice(int idx) { device_idx_ = idx; }
   void SetModeThreshold(float meters) { mode_threshold_ = meters; }
   void SetMinCount(int n) { min_count_ = n; }
+  void SetMinNormalZ(float hard_gate, float soft_upper) {
+    min_normal_z_ = hard_gate;
+    soft_upper_nz_ = soft_upper;
+  }
   void SetBilateral(bool enabled, int radius, float range_sigma) {
     bilateral_enabled_ = enabled;
     bilateral_radius_ = radius;
@@ -479,25 +483,32 @@ class DSMRasterizerWrapper {
     ncells_ = static_cast<size_t>(grid_h_) * grid_w_;
 
     auto& dev = opencl::CLContext::Instance().Device(device_idx_);
-    prog_ = dev.GetOrBuildProgram("dsm_mode_v1", kDSMKernelSource);
+    prog_ = dev.GetOrBuildProgram("dsm_mode_v2", kDSMKernelSource);
 
     auto& ctx = dev.context();
+    auto& q = dev.queue();
 
     // N_MODES=3, K_BUF=10
     cl_mode_z_ =
+        cl::Buffer(ctx, CL_MEM_READ_WRITE, 3 * ncells_ * sizeof(int32_t));
+    cl_mode_weight_ =
         cl::Buffer(ctx, CL_MEM_READ_WRITE, 3 * ncells_ * sizeof(int32_t));
     cl_mode_count_ =
         cl::Buffer(ctx, CL_MEM_READ_WRITE, 3 * ncells_ * sizeof(int32_t));
     cl_buf_z_ =
         cl::Buffer(ctx, CL_MEM_READ_WRITE, 10 * ncells_ * sizeof(int32_t));
+    cl_buf_w_ =
+        cl::Buffer(ctx, CL_MEM_READ_WRITE, 10 * ncells_ * sizeof(int32_t));
     cl_buf_pos_ = cl::Buffer(ctx, CL_MEM_READ_WRITE, ncells_ * sizeof(int32_t));
     cl_out_a_ = cl::Buffer(ctx, CL_MEM_READ_WRITE, ncells_ * sizeof(float));
     cl_out_b_ = cl::Buffer(ctx, CL_MEM_READ_WRITE, ncells_ * sizeof(float));
+    cl_valid_ = cl::Buffer(ctx, CL_MEM_READ_WRITE, ncells_ * sizeof(uint8_t));
+    cl_guide_ = cl::Buffer(ctx, CL_MEM_READ_WRITE, ncells_ * sizeof(float));
 
     ClearAll();
   }
 
-  // Scatter one depthmap view into the mode grid.
+  // Scatter one depthmap view into the mode grid (confidence-weighted).
   void Scatter(const Mat3d& K, const Mat3d& R, const Vec3d& t,
                Eigen::Ref<const ImageF> depth,
                const py::array_t<float, py::array::c_style>& normal,
@@ -546,7 +557,6 @@ class DSMRasterizerWrapper {
     const float inv_gsd = 1.0f / gsd_;
     const int ncells_i = static_cast<int>(ncells_);
     const int fp_threshold = static_cast<int>(mode_threshold_ * 8192.0f);
-    const float min_normal_z = 0.35f;
     const size_t global = ((static_cast<size_t>(npx) + 255) / 256) * 256;
 
     cl::Kernel k(prog_, "dsm_scatter");
@@ -555,19 +565,22 @@ class DSMRasterizerWrapper {
     k.setArg(2, cl_conf);
     k.setArg(3, cl_cam);
     k.setArg(4, cl_mode_z_);
-    k.setArg(5, cl_mode_count_);
-    k.setArg(6, cl_buf_z_);
-    k.setArg(7, cl_buf_pos_);
-    k.setArg(8, origin_x_);
-    k.setArg(9, origin_y_);
-    k.setArg(10, inv_gsd);
-    k.setArg(11, grid_w_);
-    k.setArg(12, grid_h_);
-    k.setArg(13, w);
-    k.setArg(14, h);
-    k.setArg(15, ncells_i);
-    k.setArg(16, fp_threshold);
-    k.setArg(17, min_normal_z);
+    k.setArg(5, cl_mode_weight_);
+    k.setArg(6, cl_mode_count_);
+    k.setArg(7, cl_buf_z_);
+    k.setArg(8, cl_buf_w_);
+    k.setArg(9, cl_buf_pos_);
+    k.setArg(10, origin_x_);
+    k.setArg(11, origin_y_);
+    k.setArg(12, inv_gsd);
+    k.setArg(13, grid_w_);
+    k.setArg(14, grid_h_);
+    k.setArg(15, w);
+    k.setArg(16, h);
+    k.setArg(17, ncells_i);
+    k.setArg(18, fp_threshold);
+    k.setArg(19, min_normal_z_);
+    k.setArg(20, soft_upper_nz_);
 
     py::gil_scoped_release release;
     q.enqueueNDRangeKernel(k, cl::NullRange, cl::NDRange(global),
@@ -586,12 +599,14 @@ class DSMRasterizerWrapper {
 
     cl::Kernel k(prog_, "dsm_update_modes");
     k.setArg(0, cl_mode_z_);
-    k.setArg(1, cl_mode_count_);
-    k.setArg(2, cl_buf_z_);
-    k.setArg(3, cl_buf_pos_);
-    k.setArg(4, ncells_i);
-    k.setArg(5, fp_threshold);
-    k.setArg(6, min_buf_samples);
+    k.setArg(1, cl_mode_weight_);
+    k.setArg(2, cl_mode_count_);
+    k.setArg(3, cl_buf_z_);
+    k.setArg(4, cl_buf_w_);
+    k.setArg(5, cl_buf_pos_);
+    k.setArg(6, ncells_i);
+    k.setArg(7, fp_threshold);
+    k.setArg(8, min_buf_samples);
 
     py::gil_scoped_release release;
     q.enqueueNDRangeKernel(k, cl::NullRange, cl::NDRange(global),
@@ -599,20 +614,23 @@ class DSMRasterizerWrapper {
     q.finish();
   }
 
-  // Finalize: pick highest mode, optional bilateral, download result.
+  // Finalize: pick highest mode → out_z + validity mask.
+  // Does NOT apply bilateral (that's done separately after diffusion).
   foundation::pyarray_f Finish() {
     auto& dev = opencl::CLContext::Instance().Device(device_idx_);
     auto& q = dev.queue();
     const int ncells_i = static_cast<int>(ncells_);
     const size_t global1d = ((ncells_ + 255) / 256) * 256;
 
-    // Finalize → cl_out_a_
+    // Finalize → cl_out_a_ + cl_valid_
     cl::Kernel k_fin(prog_, "dsm_finalize");
     k_fin.setArg(0, cl_mode_z_);
-    k_fin.setArg(1, cl_mode_count_);
-    k_fin.setArg(2, cl_out_a_);
-    k_fin.setArg(3, ncells_i);
-    k_fin.setArg(4, min_count_);
+    k_fin.setArg(1, cl_mode_weight_);
+    k_fin.setArg(2, cl_mode_count_);
+    k_fin.setArg(3, cl_out_a_);
+    k_fin.setArg(4, cl_valid_);
+    k_fin.setArg(5, ncells_i);
+    k_fin.setArg(6, min_count_);
     {
       py::gil_scoped_release release;
       q.enqueueNDRangeKernel(k_fin, cl::NullRange, cl::NDRange(global1d),
@@ -620,39 +638,200 @@ class DSMRasterizerWrapper {
       q.finish();
     }
 
-    // Bilateral filter: cl_out_a_ → cl_out_b_
-    cl::Buffer* result_buf = &cl_out_a_;
-    if (bilateral_enabled_ && bilateral_radius_ > 0) {
-      cl::Kernel k_bi(prog_, "dsm_bilateral");
-      k_bi.setArg(0, cl_out_a_);
-      k_bi.setArg(1, cl_out_b_);
-      k_bi.setArg(2, grid_w_);
-      k_bi.setArg(3, grid_h_);
-      k_bi.setArg(4, bilateral_radius_);
-      const float sigma_s = static_cast<float>(bilateral_radius_) / 2.0f;
-      const float inv_2ss = 1.0f / (2.0f * sigma_s * sigma_s);
-      const float inv_2sr = 1.0f / (2.0f * bilateral_range_ * bilateral_range_);
-      k_bi.setArg(5, inv_2ss);
-      k_bi.setArg(6, inv_2sr);
-
-      const size_t gx = ((static_cast<size_t>(grid_w_) + 15) / 16) * 16;
-      const size_t gy = ((static_cast<size_t>(grid_h_) + 15) / 16) * 16;
-      {
-        py::gil_scoped_release release;
-        q.enqueueNDRangeKernel(k_bi, cl::NullRange, cl::NDRange(gx, gy),
-                               cl::NDRange(16, 16));
-        q.finish();
-      }
-      result_buf = &cl_out_b_;
-    }
-
-    // Download
+    // Download grid
     const size_t float_bytes = ncells_ * sizeof(float);
     std::vector<float> host_grid(ncells_);
-    q.enqueueReadBuffer(*result_buf, CL_TRUE, 0, float_bytes, host_grid.data());
+    q.enqueueReadBuffer(cl_out_a_, CL_TRUE, 0, float_bytes, host_grid.data());
 
     return foundation::py_array_from_data(host_grid.data(), grid_h_, grid_w_);
   }
+
+  // Get the validity mask (1 = observed, 0 = hole). Call after Finish().
+  py::array_t<uint8_t> GetValidityMask() {
+    auto& dev = opencl::CLContext::Instance().Device(device_idx_);
+    auto& q = dev.queue();
+    std::vector<uint8_t> host_mask(ncells_);
+    q.enqueueReadBuffer(cl_valid_, CL_TRUE, 0, ncells_, host_mask.data());
+    auto result = py::array_t<uint8_t>({grid_h_, grid_w_});
+    std::memcpy(result.mutable_data(), host_mask.data(), ncells_);
+    return result;
+  }
+
+  // Run Perona-Malik diffusion on the current grid (cl_out_a_).
+  // guide_np: gradient magnitude array (same size as grid), or empty for
+  //           self-guided mode (computes gradient from current grid).
+  // Returns the diffused grid.
+  foundation::pyarray_f Diffuse(
+      const py::array_t<float, py::array::c_style>& guide_np, int iterations,
+      float kappa, float dt) {
+    auto& dev = opencl::CLContext::Instance().Device(device_idx_);
+    auto& q = dev.queue();
+    const size_t gx = ((static_cast<size_t>(grid_w_) + 15) / 16) * 16;
+    const size_t gy = ((static_cast<size_t>(grid_h_) + 15) / 16) * 16;
+
+    // Upload or compute guide
+    if (guide_np.size() > 0) {
+      if (guide_np.size() != static_cast<ssize_t>(ncells_)) {
+        throw std::invalid_argument(
+            "guide must have same number of cells as grid");
+      }
+      q.enqueueWriteBuffer(cl_guide_, CL_TRUE, 0, ncells_ * sizeof(float),
+                           const_cast<float*>(guide_np.data()));
+    } else {
+      // Self-guided: compute gradient magnitude from cl_out_a_
+      cl::Kernel k_grad(prog_, "dsm_gradient_magnitude");
+      k_grad.setArg(0, cl_out_a_);
+      k_grad.setArg(1, cl_guide_);
+      k_grad.setArg(2, grid_w_);
+      k_grad.setArg(3, grid_h_);
+      q.enqueueNDRangeKernel(k_grad, cl::NullRange, cl::NDRange(gx, gy),
+                             cl::NDRange(16, 16));
+      q.finish();
+    }
+
+    // Ping-pong diffusion: cl_out_a_ ↔ cl_out_b_
+    cl::Buffer* src = &cl_out_a_;
+    cl::Buffer* dst = &cl_out_b_;
+
+    {
+      py::gil_scoped_release release;
+      for (int iter = 0; iter < iterations; ++iter) {
+        cl::Kernel k_diff(prog_, "dsm_diffuse");
+        k_diff.setArg(0, *src);
+        k_diff.setArg(1, *dst);
+        k_diff.setArg(2, cl_guide_);
+        k_diff.setArg(3, cl_valid_);
+        k_diff.setArg(4, grid_w_);
+        k_diff.setArg(5, grid_h_);
+        k_diff.setArg(6, kappa);
+        k_diff.setArg(7, dt);
+        q.enqueueNDRangeKernel(k_diff, cl::NullRange, cl::NDRange(gx, gy),
+                               cl::NDRange(16, 16));
+        q.finish();
+        std::swap(src, dst);
+      }
+    }
+
+    // Result is in *src after the last swap.
+    // Copy back to cl_out_a_ if needed.
+    if (src != &cl_out_a_) {
+      q.enqueueCopyBuffer(*src, cl_out_a_, 0, 0, ncells_ * sizeof(float));
+      q.finish();
+    }
+
+    // Download
+    std::vector<float> host_grid(ncells_);
+    q.enqueueReadBuffer(cl_out_a_, CL_TRUE, 0, ncells_ * sizeof(float),
+                        host_grid.data());
+    return foundation::py_array_from_data(host_grid.data(), grid_h_, grid_w_);
+  }
+
+  // Compute gradient magnitude of the current grid on GPU.
+  // Call after Finish() or Diffuse(). Returns float32 array.
+  foundation::pyarray_f ComputeGradient() {
+    auto& dev = opencl::CLContext::Instance().Device(device_idx_);
+    auto& q = dev.queue();
+    const size_t gx = ((static_cast<size_t>(grid_w_) + 15) / 16) * 16;
+    const size_t gy = ((static_cast<size_t>(grid_h_) + 15) / 16) * 16;
+
+    cl::Kernel k_grad(prog_, "dsm_gradient_magnitude");
+    k_grad.setArg(0, cl_out_a_);
+    k_grad.setArg(1, cl_guide_);
+    k_grad.setArg(2, grid_w_);
+    k_grad.setArg(3, grid_h_);
+    {
+      py::gil_scoped_release release;
+      q.enqueueNDRangeKernel(k_grad, cl::NullRange, cl::NDRange(gx, gy),
+                             cl::NDRange(16, 16));
+      q.finish();
+    }
+
+    std::vector<float> host_grad(ncells_);
+    q.enqueueReadBuffer(cl_guide_, CL_TRUE, 0, ncells_ * sizeof(float),
+                        host_grad.data());
+    return foundation::py_array_from_data(host_grad.data(), grid_h_, grid_w_);
+  }
+
+  // Upsample a coarse grid by factor 2 into the current fine grid on GPU.
+  // coarse_np must be (coarse_h, coarse_w). Result stored in cl_out_b_
+  // and returned. Does not affect cl_out_a_ (the finalized grid).
+  foundation::pyarray_f UpsampleNN(
+      const py::array_t<float, py::array::c_style>& coarse_np, int coarse_w,
+      int coarse_h) {
+    auto& dev = opencl::CLContext::Instance().Device(device_idx_);
+    auto& ctx = dev.context();
+    auto& q = dev.queue();
+
+    const size_t coarse_cells = static_cast<size_t>(coarse_w) * coarse_h;
+    cl::Buffer cl_coarse(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                         coarse_cells * sizeof(float),
+                         const_cast<float*>(coarse_np.data()));
+
+    const size_t gx = ((static_cast<size_t>(grid_w_) + 15) / 16) * 16;
+    const size_t gy = ((static_cast<size_t>(grid_h_) + 15) / 16) * 16;
+
+    cl::Kernel k_up(prog_, "dsm_upsample_nn");
+    k_up.setArg(0, cl_coarse);
+    k_up.setArg(1, cl_out_b_);
+    k_up.setArg(2, coarse_w);
+    k_up.setArg(3, coarse_h);
+    k_up.setArg(4, grid_w_);
+    k_up.setArg(5, grid_h_);
+    {
+      py::gil_scoped_release release;
+      q.enqueueNDRangeKernel(k_up, cl::NullRange, cl::NDRange(gx, gy),
+                             cl::NDRange(16, 16));
+      q.finish();
+    }
+
+    std::vector<float> host_grid(ncells_);
+    q.enqueueReadBuffer(cl_out_b_, CL_TRUE, 0, ncells_ * sizeof(float),
+                        host_grid.data());
+    return foundation::py_array_from_data(host_grid.data(), grid_h_, grid_w_);
+  }
+
+  // Apply bilateral filter on cl_out_a_ → result.
+  foundation::pyarray_f ApplyBilateral() {
+    auto& dev = opencl::CLContext::Instance().Device(device_idx_);
+    auto& q = dev.queue();
+
+    if (!bilateral_enabled_ || bilateral_radius_ <= 0) {
+      // Just download cl_out_a_ as-is
+      std::vector<float> host_grid(ncells_);
+      q.enqueueReadBuffer(cl_out_a_, CL_TRUE, 0, ncells_ * sizeof(float),
+                          host_grid.data());
+      return foundation::py_array_from_data(host_grid.data(), grid_h_, grid_w_);
+    }
+
+    cl::Kernel k_bi(prog_, "dsm_bilateral");
+    k_bi.setArg(0, cl_out_a_);
+    k_bi.setArg(1, cl_out_b_);
+    k_bi.setArg(2, grid_w_);
+    k_bi.setArg(3, grid_h_);
+    k_bi.setArg(4, bilateral_radius_);
+    const float sigma_s = static_cast<float>(bilateral_radius_) / 2.0f;
+    const float inv_2ss = 1.0f / (2.0f * sigma_s * sigma_s);
+    const float inv_2sr = 1.0f / (2.0f * bilateral_range_ * bilateral_range_);
+    k_bi.setArg(5, inv_2ss);
+    k_bi.setArg(6, inv_2sr);
+
+    const size_t gx = ((static_cast<size_t>(grid_w_) + 15) / 16) * 16;
+    const size_t gy = ((static_cast<size_t>(grid_h_) + 15) / 16) * 16;
+    {
+      py::gil_scoped_release release;
+      q.enqueueNDRangeKernel(k_bi, cl::NullRange, cl::NDRange(gx, gy),
+                             cl::NDRange(16, 16));
+      q.finish();
+    }
+
+    std::vector<float> host_grid(ncells_);
+    q.enqueueReadBuffer(cl_out_b_, CL_TRUE, 0, ncells_ * sizeof(float),
+                        host_grid.data());
+    return foundation::py_array_from_data(host_grid.data(), grid_h_, grid_w_);
+  }
+
+  int grid_width() const { return grid_w_; }
+  int grid_height() const { return grid_h_; }
 
   static bool IsAvailable() {
     return opencl::CLContext::Instance().IsAvailable();
@@ -665,10 +844,12 @@ class DSMRasterizerWrapper {
     const int ncells_i = static_cast<int>(ncells_);
     cl::Kernel k(prog_, "dsm_clear");
     k.setArg(0, cl_mode_z_);
-    k.setArg(1, cl_mode_count_);
-    k.setArg(2, cl_buf_z_);
-    k.setArg(3, cl_buf_pos_);
-    k.setArg(4, ncells_i);
+    k.setArg(1, cl_mode_weight_);
+    k.setArg(2, cl_mode_count_);
+    k.setArg(3, cl_buf_z_);
+    k.setArg(4, cl_buf_w_);
+    k.setArg(5, cl_buf_pos_);
+    k.setArg(6, ncells_i);
     const size_t global = ((ncells_ + 255) / 256) * 256;
     q.enqueueNDRangeKernel(k, cl::NullRange, cl::NDRange(global),
                            cl::NDRange(256));
@@ -684,6 +865,8 @@ class DSMRasterizerWrapper {
   int device_idx_ = 0;
   float mode_threshold_ = 1.0f;
   int min_count_ = 3;
+  float min_normal_z_ = 0.2f;
+  float soft_upper_nz_ = 0.7f;
   int bilateral_radius_ = 2;
   float bilateral_range_ = 0.3f;
   bool bilateral_enabled_ = true;
@@ -693,11 +876,15 @@ class DSMRasterizerWrapper {
   size_t ncells_ = 0;
   cl::Program prog_;
   cl::Buffer cl_mode_z_;
+  cl::Buffer cl_mode_weight_;
   cl::Buffer cl_mode_count_;
   cl::Buffer cl_buf_z_;
+  cl::Buffer cl_buf_w_;
   cl::Buffer cl_buf_pos_;
   cl::Buffer cl_out_a_;
   cl::Buffer cl_out_b_;
+  cl::Buffer cl_valid_;
+  cl::Buffer cl_guide_;
 };
 
 #else  // !OPENSFM_HAVE_OPENCL
@@ -709,6 +896,7 @@ class DSMRasterizerWrapper {
   void SetDevice(int) {}
   void SetModeThreshold(float) {}
   void SetMinCount(int) {}
+  void SetMinNormalZ(float, float) {}
   void SetBilateral(bool, int, float) {}
   void Begin() {
     throw std::runtime_error("DSMRasterizer: OpenCL not available");
@@ -725,6 +913,25 @@ class DSMRasterizerWrapper {
   foundation::pyarray_f Finish() {
     throw std::runtime_error("DSMRasterizer: OpenCL not available");
   }
+  py::array_t<uint8_t> GetValidityMask() {
+    throw std::runtime_error("DSMRasterizer: OpenCL not available");
+  }
+  foundation::pyarray_f Diffuse(const py::array_t<float, py::array::c_style>&,
+                                int, float, float) {
+    throw std::runtime_error("DSMRasterizer: OpenCL not available");
+  }
+  foundation::pyarray_f ComputeGradient() {
+    throw std::runtime_error("DSMRasterizer: OpenCL not available");
+  }
+  foundation::pyarray_f UpsampleNN(
+      const py::array_t<float, py::array::c_style>&, int, int) {
+    throw std::runtime_error("DSMRasterizer: OpenCL not available");
+  }
+  foundation::pyarray_f ApplyBilateral() {
+    throw std::runtime_error("DSMRasterizer: OpenCL not available");
+  }
+  int grid_width() const { return 0; }
+  int grid_height() const { return 0; }
   static bool IsAvailable() { return false; }
 };
 

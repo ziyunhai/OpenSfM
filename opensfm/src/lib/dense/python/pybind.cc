@@ -157,6 +157,8 @@ PYBIND11_MODULE(pydense, m) {
       .def("set_device", &dense::DSMRasterizerWrapper::SetDevice)
       .def("set_mode_threshold", &dense::DSMRasterizerWrapper::SetModeThreshold)
       .def("set_min_count", &dense::DSMRasterizerWrapper::SetMinCount)
+      .def("set_min_normal_z", &dense::DSMRasterizerWrapper::SetMinNormalZ,
+           py::arg("hard_gate"), py::arg("soft_upper"))
       .def("set_bilateral", &dense::DSMRasterizerWrapper::SetBilateral,
            py::arg("enabled"), py::arg("radius"), py::arg("range_sigma"))
       .def("begin", &dense::DSMRasterizerWrapper::Begin)
@@ -165,5 +167,16 @@ PYBIND11_MODULE(pydense, m) {
            py::arg("confidence"))
       .def("update_modes", &dense::DSMRasterizerWrapper::UpdateModes)
       .def("finish", &dense::DSMRasterizerWrapper::Finish)
+      .def("get_validity_mask", &dense::DSMRasterizerWrapper::GetValidityMask)
+      .def("diffuse", &dense::DSMRasterizerWrapper::Diffuse, py::arg("guide"),
+           py::arg("iterations"), py::arg("kappa"), py::arg("dt"))
+      .def("compute_gradient", &dense::DSMRasterizerWrapper::ComputeGradient)
+      .def("upsample_nn", &dense::DSMRasterizerWrapper::UpsampleNN,
+           py::arg("coarse"), py::arg("coarse_w"), py::arg("coarse_h"))
+      .def("apply_bilateral", &dense::DSMRasterizerWrapper::ApplyBilateral)
+      .def_property_readonly("grid_width",
+                             &dense::DSMRasterizerWrapper::grid_width)
+      .def_property_readonly("grid_height",
+                             &dense::DSMRasterizerWrapper::grid_height)
       .def_static("is_available", &dense::DSMRasterizerWrapper::IsAvailable);
 }
