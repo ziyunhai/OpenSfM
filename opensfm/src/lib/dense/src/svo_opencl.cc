@@ -924,6 +924,16 @@ void SVOIntegratorCL::PrepareRefinement(
       const_cast<float*>(packed_depths.data()), &err);
   opencl::CheckCL(err, "refine tsdf depth image2d_array");
 
+  // Immutable copy of clean depths for bake occlusion (not modified by
+  // refinement raycasts).  Clean depths represent the front-most surface
+  // each camera actually observed — ideal for occlusion testing.
+  cl_clean_depths_ = cl::Image2DArray(
+      ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, depth_fmt,
+      static_cast<size_t>(n_views), static_cast<size_t>(img_width),
+      static_cast<size_t>(img_height), 0, 0,
+      const_cast<float*>(packed_depths.data()), &err);
+  opencl::CheckCL(err, "clean depth image2d_array for bake occlusion");
+
   // Upload camera array.
   const size_t cam_bytes = static_cast<size_t>(n_views) * sizeof(SVOCameraGPU);
   cl_cameras_array_ =
@@ -1246,65 +1256,11 @@ void SVOIntegratorCL::BakeColors(const std::vector<Vec3f>& points,
   cl::Buffer cl_out(ctx, CL_MEM_WRITE_ONLY, color_bytes, nullptr, &err);
   opencl::CheckCL(err, "bake output buffer");
 
-  // We need TSDF depths for occlusion.  Render them one more time.
+  // Use clean depth maps for occlusion check in color baking.
+  // Clean depths represent the front-most surface each camera actually
+  // observed — guaranteed correct for occlusion without re-raycasting.
   const int W = refine_img_width_;
   const int H = refine_img_height_;
-  const float inv_voxel_size = 1.0f / refine_voxel_size_;
-  // cl_tsdf_depths_ has clean depths (from PrepareRefinement) or last
-  // RefineGeometry iteration. Use guided raycast with narrow band.
-  {
-    const float search_margin = 5.0f * refine_voxel_size_;
-    const size_t depth_buf_bytes = static_cast<size_t>(W) * H * sizeof(float);
-    cl::Buffer cl_rc_depth(ctx, CL_MEM_READ_WRITE, depth_buf_bytes, nullptr,
-                           &err);
-    opencl::CheckCL(err, "bake raycast depth");
-    cl::Buffer cl_rc_hit(ctx, CL_MEM_READ_WRITE,
-                         static_cast<size_t>(W) * H * sizeof(uint32_t), nullptr,
-                         &err);
-    opencl::CheckCL(err, "bake raycast hit");
-
-    for (int vi = 0; vi < n_refine_views_; ++vi) {
-      const size_t cam_offset = vi * sizeof(SVOCameraGPU);
-      cl_buffer_region region{cam_offset, sizeof(SVOCameraGPU)};
-      cl::Buffer cam_sub = cl_cameras_array_.createSubBuffer(
-          CL_MEM_READ_ONLY, CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
-      if (err != CL_SUCCESS) {
-        SVOCameraGPU single_cam;
-        queue.enqueueReadBuffer(cl_cameras_array_, CL_TRUE, cam_offset,
-                                sizeof(SVOCameraGPU), &single_cam);
-        queue.enqueueWriteBuffer(cl_camera_, CL_TRUE, 0, sizeof(SVOCameraGPU),
-                                 &single_cam);
-        cam_sub = cl_camera_;
-      }
-
-      int rarg = 0;
-      k_raycast_guided_.setArg(rarg++, cl_table_);
-      k_raycast_guided_.setArg(rarg++, capacity_mask_);
-      k_raycast_guided_.setArg(rarg++, cl_rc_depth);
-      k_raycast_guided_.setArg(rarg++, cl_rc_hit);
-      k_raycast_guided_.setArg(rarg++, cam_sub);
-      k_raycast_guided_.setArg(rarg++, cl_tsdf_depths_);
-      k_raycast_guided_.setArg(rarg++, static_cast<cl_int>(vi));
-      k_raycast_guided_.setArg(rarg++, static_cast<cl_int>(H));
-      k_raycast_guided_.setArg(rarg++, static_cast<cl_int>(W));
-      k_raycast_guided_.setArg(rarg++, refine_voxel_size_);
-      k_raycast_guided_.setArg(rarg++, inv_voxel_size);
-      k_raycast_guided_.setArg(rarg++, search_margin);
-      k_raycast_guided_.setArg(rarg++, 0.0f);  // min weight for bake = 0
-
-      cl::NDRange grc(static_cast<size_t>((W + 15) / 16 * 16),
-                      static_cast<size_t>((H + 15) / 16 * 16));
-      queue.enqueueNDRangeKernel(k_raycast_guided_, cl::NullRange, grc,
-                                 cl::NDRange(16, 16));
-
-      std::array<size_t, 3> origin = {0, 0, static_cast<size_t>(vi)};
-      std::array<size_t, 3> region_sz = {static_cast<size_t>(W),
-                                         static_cast<size_t>(H), 1};
-      queue.enqueueCopyBufferToImage(cl_rc_depth, cl_tsdf_depths_, 0, origin,
-                                     region_sz);
-    }
-    queue.finish();
-  }
 
   // Dispatch svo_bake_colors kernel.
   {
@@ -1314,7 +1270,7 @@ void SVOIntegratorCL::BakeColors(const std::vector<Vec3f>& points,
     k_bake_colors_.setArg(arg++, cl_nrm);
     k_bake_colors_.setArg(arg++, cl_out);
     k_bake_colors_.setArg(arg++, cl_color_images_);
-    k_bake_colors_.setArg(arg++, cl_tsdf_depths_);
+    k_bake_colors_.setArg(arg++, cl_clean_depths_);
     k_bake_colors_.setArg(arg++, cl_cameras_array_);
     k_bake_colors_.setArg(arg++, static_cast<cl_int>(n_refine_views_));
     k_bake_colors_.setArg(arg++, static_cast<cl_int>(W));
@@ -1334,6 +1290,7 @@ void SVOIntegratorCL::BakeColors(const std::vector<Vec3f>& points,
   // Release all refinement resources.
   cl_color_images_ = cl::Image2DArray();
   cl_tsdf_depths_ = cl::Image2DArray();
+  cl_clean_depths_ = cl::Image2DArray();
   cl_cameras_array_ = cl::Buffer();
   refine_prepared_ = false;
 

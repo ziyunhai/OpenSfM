@@ -1626,7 +1626,7 @@ __kernel void svo_raycast(
             continue;
         }
 
-        float tsdf = (float)table[slot_idx].sum_tsdf / ((float)sw * (float)FP_SCALE / (float)WEIGHT_SCALE);
+        float tsdf = (float)table[slot_idx].sum_tsdf / ((float)sw * (float)FP_SCALE);
 
         // Detect zero-crossing: prev > 0, current <= 0.
         if (prev_tsdf > 0.0f && prev_tsdf <= 1.0f && tsdf <= 0.0f) {
@@ -1752,7 +1752,7 @@ __kernel void svo_raycast_guided(
             continue;
         }
 
-        float tsdf = (float)table[slot_idx].sum_tsdf / ((float)sw * (float)FP_SCALE / (float)WEIGHT_SCALE);
+        float tsdf = (float)table[slot_idx].sum_tsdf / ((float)sw * (float)FP_SCALE);
 
         // Detect zero-crossing: prev > 0, current <= 0.
         if (prev_tsdf > 0.0f && prev_tsdf <= 1.0f && tsdf <= 0.0f) {

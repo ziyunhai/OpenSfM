@@ -228,6 +228,7 @@ class SVOIntegratorCL {
   cl::Buffer cl_refine_adam_;         // 2 floats/slot: m_d, v_d
   cl::Image2DArray cl_color_images_;  // CL_RGBA CL_UNORM_INT8 [n_views × H × W]
   cl::Image2DArray cl_tsdf_depths_;   // CL_R CL_FLOAT [n_views × H × W]
+  cl::Image2DArray cl_clean_depths_;  // CL_R CL_FLOAT [n_views × H × W] (immutable, for bake occlusion)
   cl::Buffer cl_cameras_array_;       // N × SVOCameraGPU
   int n_refine_views_ = 0;
   int refine_img_width_ = 0;
