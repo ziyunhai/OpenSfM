@@ -11,12 +11,14 @@
 #define CL_DEVICE_IMAGE_PITCH_ALIGNMENT 0x104A
 #endif
 
+#include <foundation/logging.h>
+
 #include <Eigen/SVD>
 #include <algorithm>
 #include <cmath>
-#include <iostream>
 #include <numeric>
 #include <set>
+#include <sstream>
 #include <unordered_map>
 
 namespace dense {
@@ -121,8 +123,12 @@ void DepthmapEstimator::SetSfMPoints(
   for (int i = 0; i < num_points; ++i) {
     sfm_points_.push_back(points.row(i).transpose());
   }
-  std::cerr << "[PatchMatch] Received " << sfm_points_.size()
-            << " SfM points for planar prior\n";
+  {
+    std::ostringstream oss;
+    oss << "[PatchMatch] Received " << sfm_points_.size()
+        << " SfM points for planar prior";
+    foundation::LogDebug("dense", oss.str());
+  }
 }
 
 void DepthmapEstimator::Run(DepthmapResult* result) {
@@ -906,13 +912,17 @@ void DepthmapEstimator::ComputeSfMPlanarPrior(int w, int h) {
     projections.push_back(p);
   }
 
-  std::cerr << "[PatchMatch]   SfM planar prior: " << projections.size() << "/"
-            << sfm_points_.size() << " points project into " << w << "x" << h
-            << " image\n";
+  {
+    std::ostringstream oss;
+    oss << "[PatchMatch]   SfM planar prior: " << projections.size() << "/"
+        << sfm_points_.size() << " points project into " << w << "x" << h
+        << " image";
+    foundation::LogDebug("dense", oss.str());
+  }
 
   if (projections.size() < 4) {
-    std::cerr
-        << "[PatchMatch]   Too few projected points, skipping SfM prior\n";
+    foundation::LogDebug(
+        "dense", "[PatchMatch]   Too few projected points, skipping SfM prior");
     // Upload empty masks so PriorReinit is a no-op.
     int npix = w * h;
     std::vector<cl_uint> masks_buf(npix, 0u);
@@ -1109,8 +1119,12 @@ void DepthmapEstimator::ComputeSfMPlanarPrior(int w, int h) {
     }
   }
 
-  std::cerr << "[PatchMatch]   SfM prior: " << triangles.size()
-            << " triangles, " << filled << "/" << npix << " pixels masked\n";
+  {
+    std::ostringstream oss;
+    oss << "[PatchMatch]   SfM prior: " << triangles.size() << " triangles, "
+        << filled << "/" << npix << " pixels masked";
+    foundation::LogDebug("dense", oss.str());
+  }
 
   // ---- 6. Upload prior planes and masks to GPU ----
   auto& queue = opencl::CLContext::Instance().Device(device_idx_).queue();
@@ -1315,8 +1329,12 @@ void DepthmapEstimator::RemoveSmallSegments(ImageF& depth, PixelData3f& normal,
   }
 
   if (total_removed > 0) {
-    std::cerr << "[PatchMatch] Speckle removal: " << total_removed
-              << " pixels removed (min segment " << min_segment_size << ")\n";
+    {
+      std::ostringstream oss;
+      oss << "[PatchMatch] Speckle removal: " << total_removed
+          << " pixels removed (min segment " << min_segment_size << ")";
+      foundation::LogDebug("dense", oss.str());
+    }
   }
 }
 
@@ -1418,8 +1436,12 @@ void DepthmapEstimator::GapInterpolation(ImageF& depth, PixelData3f& normal,
   }
 
   if (total_filled > 0) {
-    std::cerr << "[PatchMatch] Gap interpolation: " << total_filled
-              << " pixels filled (max gap " << max_gap_size << ")\n";
+    {
+      std::ostringstream oss;
+      oss << "[PatchMatch] Gap interpolation: " << total_filled
+          << " pixels filled (max gap " << max_gap_size << ")";
+      foundation::LogDebug("dense", oss.str());
+    }
   }
 }
 
@@ -1821,8 +1843,12 @@ void DepthmapEstimator::RunSLIC(int width, int height) {
     }
     fname += ".png";
     cv::imwrite(fname, debug_img);
-    std::cerr << "[SLIC] Saved debug segmentation to " << fname << " ("
-              << color_map.size() << " segments)\n";
+    {
+      std::ostringstream oss;
+      oss << "[SLIC] Saved debug segmentation to " << fname << " ("
+          << color_map.size() << " segments)";
+      foundation::LogDebug("dense", oss.str());
+    }
   }
 }
 

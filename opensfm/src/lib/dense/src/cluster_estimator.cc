@@ -4,12 +4,14 @@
 
 #include <dense/fuser.h>
 #include <dense/opencl_kernels.h>
+#include <foundation/logging.h>
 
 #include <Eigen/SVD>
 #include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <numeric>
+#include <sstream>
 #include <unordered_map>
 
 namespace dense {
@@ -102,8 +104,12 @@ void DepthmapClusterEstimator::Run(std::vector<DepthmapResult>* results) {
     n_levels = std::max(n_levels, nl);
   }
 
-  std::cerr << "[DepthmapClusterEstimator] " << K << " ref views, " << n_levels
-            << " levels, geom_weight=" << geom_weight_ << "\n";
+  {
+    std::ostringstream oss;
+    oss << "[DepthmapClusterEstimator] " << K << " ref views, " << n_levels
+        << " levels, geom_weight=" << geom_weight_;
+    foundation::LogInfo("dense", oss.str());
+  }
 
   // prev_depths[i] = intermediate depth from previous level for ref i.
   std::vector<ImageF> prev_depths(K);

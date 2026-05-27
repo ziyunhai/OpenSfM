@@ -1,12 +1,13 @@
 #include <dense/svo_fuser.h>
 #include <dense/svo_opencl.h>
+#include <foundation/logging.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstring>
-#include <iostream>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 
 namespace dense {
@@ -121,7 +122,11 @@ uint32_t SVOFuser::CountVoxels() {
   }
 
   uint32_t n_unique = integrator.GetUniqueCount();
-  std::cerr << "[SVOFuser] Counted " << n_unique << " unique voxels\n";
+  {
+    std::ostringstream oss;
+    oss << "[SVOFuser] Counted " << n_unique << " unique voxels";
+    foundation::LogInfo("dense", oss.str());
+  }
   last_voxel_count_ = n_unique;
   return n_unique;
 }
@@ -156,9 +161,13 @@ void SVOFuser::Fuse() {
       std::min<uint64_t>(static_cast<uint64_t>(last_voxel_count_) * 2,
                          std::numeric_limits<uint32_t>::max()));
   capacity = std::max<uint32_t>(capacity, 1u << 20);
-  std::cerr << "[SVOFuser] Voxel count " << last_voxel_count_ << " → capacity "
-            << capacity << "(" << float(capacity) / last_voxel_count_ * 100
-            << "%)\n";
+  {
+    std::ostringstream oss;
+    oss << "[SVOFuser] Voxel count " << last_voxel_count_ << " -> capacity "
+        << capacity << " (" << float(capacity) / last_voxel_count_ * 100
+        << "%)";
+    foundation::LogInfo("dense", oss.str());
+  }
 
   integrator_ = std::make_unique<SVOIntegratorCL>(device_idx_);
   integrator_->Initialize(capacity);
@@ -187,12 +196,17 @@ void SVOFuser::Fuse() {
   // Check for overflow (dropped contributions due to hash table exhaustion).
   const uint32_t overflow = integrator_->GetOverflowCount();
   if (overflow > 0) {
-    std::cerr << "[SVOFuser] WARNING: integration dropped " << overflow
-              << " contributions (hash table overflow, capacity="
-              << integrator_->capacity() << ")\n";
+    {
+      std::ostringstream oss;
+      oss << "[SVOFuser] WARNING: integration dropped " << overflow
+          << " contributions (hash table overflow, capacity="
+          << integrator_->capacity() << ")";
+      foundation::LogWarning("dense", oss.str());
+    }
   }
 
-  std::cerr << "[SVOFuser] Fuse complete, hash table alive on GPU\n";
+  foundation::LogInfo("dense",
+                      "[SVOFuser] Fuse complete, hash table alive on GPU");
 }
 
 void SVOFuser::RefineGeometry(int iters, float lambda_reg) {
@@ -281,8 +295,11 @@ void SVOFuser::RefineGeometry(int iters, float lambda_reg) {
   integrator_->RefineGeometry(iters, lambda_reg, voxel_size_, trunc_dist,
                               min_weight_);
 
-  std::cerr << "[SVOFuser] RefineGeometry complete (" << iters
-            << " iterations)\n";
+  {
+    std::ostringstream oss;
+    oss << "[SVOFuser] RefineGeometry complete (" << iters << " iterations)";
+    foundation::LogInfo("dense", oss.str());
+  }
 }
 
 void SVOFuser::BakeColors(std::vector<Vec3f>& points,
@@ -429,8 +446,12 @@ void SVOFuser::PruneByVisibility(int iterations, float carve_margin,
     }
 
     integrator_->Prune(carve_threshold, support_min, weight_penalty);
-    std::cerr << "[SVOFuser] Visibility prune iteration " << (iter + 1) << "/"
-              << iterations << " complete\n";
+    {
+      std::ostringstream oss;
+      oss << "[SVOFuser] Visibility prune iteration " << (iter + 1) << "/"
+          << iterations << " complete";
+      foundation::LogInfo("dense", oss.str());
+    }
   }
 }
 
@@ -446,8 +467,12 @@ void SVOFuser::ExtractPoints(std::vector<Vec3f>* fused_points,
   integrator_->ExtractPoints(min_weight_, voxel_size_, decimate_flat_,
                              edge_threshold_, min_count_, relative_min_weight_,
                              fused_points, fused_normals, fused_colors);
-  std::cerr << "[SVOFuser] Fine (L=0): " << fused_points->size()
-            << " surface points\n";
+  {
+    std::ostringstream oss;
+    oss << "[SVOFuser] Fine (L=0): " << fused_points->size()
+        << " surface points";
+    foundation::LogInfo("dense", oss.str());
+  }
 
   // Phase 2: Integrate all coarse levels with coverage check, then extract.
   if (num_levels_ > 1 && !views_.empty()) {
@@ -463,8 +488,12 @@ void SVOFuser::ExtractPoints(std::vector<Vec3f>* fused_points,
       const float coarse_vs = fine_voxel_size * static_cast<float>(1 << L);
       const float coarse_trunc = trunc_factor_ * coarse_vs;
 
-      std::cerr << "[SVOFuser] Coarse L=" << L << " voxel_size=" << coarse_vs
-                << " trunc=" << coarse_trunc << "\n";
+      {
+        std::ostringstream oss;
+        oss << "[SVOFuser] Coarse L=" << L << " voxel_size=" << coarse_vs
+            << " trunc=" << coarse_trunc;
+        foundation::LogInfo("dense", oss.str());
+      }
 
       auto coarse_integrator = std::make_unique<SVOIntegratorCL>(device_idx_);
 
@@ -510,8 +539,12 @@ void SVOFuser::ExtractPoints(std::vector<Vec3f>* fused_points,
       }
 
       uint32_t coarse_voxels = coarse_integrator->GetUniqueCount();
-      std::cerr << "[SVOFuser] Coarse L=" << L << " counted " << coarse_voxels
-                << " voxels\n";
+      {
+        std::ostringstream oss;
+        oss << "[SVOFuser] Coarse L=" << L << " counted " << coarse_voxels
+            << " voxels";
+        foundation::LogInfo("dense", oss.str());
+      }
 
       if (coarse_voxels == 0) {
         continue;
@@ -574,8 +607,12 @@ void SVOFuser::ExtractPoints(std::vector<Vec3f>* fused_points,
                               coarse_vs, fine_voxel_size, L, &fill_pts,
                               &fill_nrm, &fill_clr);
 
-      std::cerr << "[SVOFuser] Coarse L=" << L << " fill: " << fill_pts.size()
-                << " points\n";
+      {
+        std::ostringstream oss;
+        oss << "[SVOFuser] Coarse L=" << L << " fill: " << fill_pts.size()
+            << " points";
+        foundation::LogInfo("dense", oss.str());
+      }
 
       if (!fill_pts.empty()) {
         fused_points->insert(fused_points->end(), fill_pts.begin(),
@@ -591,8 +628,12 @@ void SVOFuser::ExtractPoints(std::vector<Vec3f>* fused_points,
     coarse_integrators.clear();
   }
 
-  std::cerr << "[SVOFuser] Total ExtractPoints: " << fused_points->size()
-            << " surface points (fine + fill)\n";
+  {
+    std::ostringstream oss;
+    oss << "[SVOFuser] Total ExtractPoints: " << fused_points->size()
+        << " surface points (fine + fill)";
+    foundation::LogInfo("dense", oss.str());
+  }
 }
 
 // Legacy API: Fuse + ExtractPoints in one call.

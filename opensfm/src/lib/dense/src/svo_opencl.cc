@@ -2,12 +2,13 @@
 
 #include <dense/svo_opencl.h>
 #include <dense/svo_opencl_kernels.h>
+#include <foundation/logging.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <iostream>
 #include <limits>
+#include <sstream>
 #include <vector>
 
 namespace dense {
@@ -109,9 +110,13 @@ void SVOIntegratorCL::Initialize(uint32_t capacity) {
     max_cap <<= 1;
   }
   if (cap > max_cap) {
-    std::cerr << "[SVOIntegratorCL] Clamping capacity from " << cap << " to "
-              << max_cap << " (max_alloc=" << (max_alloc >> 20)
-              << "MB, avail=" << (avail >> 20) << "MB)\n";
+    {
+      std::ostringstream oss;
+      oss << "[SVOIntegratorCL] Clamping capacity from " << cap << " to "
+          << max_cap << " (max_alloc=" << (max_alloc >> 20)
+          << "MB, avail=" << (avail >> 20) << "MB)";
+      foundation::LogWarning("dense", oss.str());
+    }
     cap = max_cap;
   }
 
@@ -123,8 +128,12 @@ void SVOIntegratorCL::Initialize(uint32_t capacity) {
 
   const size_t table_bytes =
       static_cast<size_t>(capacity_) * sizeof(GPUVoxelSlot);
-  std::cerr << "[SVOIntegratorCL] GPU hash table: " << capacity_ << " slots ("
-            << (table_bytes >> 20) << " MB) on " << dev.name() << "\n";
+  {
+    std::ostringstream oss;
+    oss << "[SVOIntegratorCL] GPU hash table: " << capacity_ << " slots ("
+        << (table_bytes >> 20) << " MB) on " << dev.name();
+    foundation::LogInfo("dense", oss.str());
+  }
   cl_int err;
   cl_table_ = cl::Buffer(ctx, CL_MEM_READ_WRITE, table_bytes, nullptr, &err);
   opencl::CheckCL(err, "hash table buffer");
@@ -352,8 +361,12 @@ void SVOIntegratorCL::InitializeCounting(uint32_t capacity) {
     max_cap <<= 1;
   }
   if (cap > max_cap) {
-    std::cerr << "[SVOIntegratorCL] Clamping count capacity from " << cap
-              << " to " << max_cap << "\n";
+    {
+      std::ostringstream oss;
+      oss << "[SVOIntegratorCL] Clamping count capacity from " << cap << " to "
+          << max_cap;
+      foundation::LogWarning("dense", oss.str());
+    }
     cap = max_cap;
   }
 
@@ -365,8 +378,12 @@ void SVOIntegratorCL::InitializeCounting(uint32_t capacity) {
 
   const size_t table_bytes =
       static_cast<size_t>(count_capacity_) * sizeof(GPUCountSlot);
-  std::cerr << "[SVOIntegratorCL] Count table: " << count_capacity_
-            << " slots (" << (table_bytes >> 20) << " MB)\n";
+  {
+    std::ostringstream oss;
+    oss << "[SVOIntegratorCL] Count table: " << count_capacity_ << " slots ("
+        << (table_bytes >> 20) << " MB)";
+    foundation::LogInfo("dense", oss.str());
+  }
 
   cl_int err;
   cl_count_table_ =
@@ -495,8 +512,12 @@ uint32_t SVOIntegratorCL::GetUniqueCount() const {
   queue.enqueueReadBuffer(cl_count_overflow_, CL_TRUE, 0, sizeof(uint32_t),
                           &overflow);
   if (overflow > 0) {
-    std::cerr << "[SVOIntegratorCL] WARNING: count pass dropped " << overflow
-              << " insertions (table too full)\n";
+    {
+      std::ostringstream oss;
+      oss << "[SVOIntegratorCL] WARNING: count pass dropped " << overflow
+          << " insertions (table too full)";
+      foundation::LogWarning("dense", oss.str());
+    }
   }
   return count;
 }
@@ -648,8 +669,12 @@ void SVOIntegratorCL::ExtractPoints(float min_weight, float voxel_size,
   const size_t clr_bytes =
       static_cast<size_t>(max_output) * 3 * sizeof(uint8_t);
 
-  std::cerr << "[SVOIntegratorCL] ExtractPoints: max_output=" << max_output
-            << " (" << ((pts_bytes * 2 + clr_bytes) >> 20) << " MB buffers)\n";
+  {
+    std::ostringstream oss;
+    oss << "[SVOIntegratorCL] ExtractPoints: max_output=" << max_output << " ("
+        << ((pts_bytes * 2 + clr_bytes) >> 20) << " MB buffers)";
+    foundation::LogDebug("dense", oss.str());
+  }
 
   cl_int err;
   cl::Buffer cl_out_pts(ctx, CL_MEM_WRITE_ONLY, pts_bytes, nullptr, &err);
@@ -698,13 +723,20 @@ void SVOIntegratorCL::ExtractPoints(float min_weight, float voxel_size,
   queue.enqueueReadBuffer(cl_out_counter, CL_TRUE, 0, sizeof(uint32_t),
                           &n_points);
   if (n_points > max_output) {
-    std::cerr << "[SVOIntegratorCL] Warning: extraction buffer overflow, "
-              << n_points << " > " << max_output << ". Clamping.\n";
+    {
+      std::ostringstream oss;
+      oss << "[SVOIntegratorCL] Warning: extraction buffer overflow, "
+          << n_points << " > " << max_output << ". Clamping.";
+      foundation::LogWarning("dense", oss.str());
+    }
     n_points = max_output;
   }
 
-  std::cerr << "[SVOIntegratorCL] GPU extracted " << n_points
-            << " surface points\n";
+  {
+    std::ostringstream oss;
+    oss << "[SVOIntegratorCL] GPU extracted " << n_points << " surface points";
+    foundation::LogInfo("dense", oss.str());
+  }
 
   if (n_points == 0) {
     return;
@@ -770,9 +802,13 @@ void SVOIntegratorCL::ExtractFill(const cl::Buffer& fine_table,
   const size_t clr_bytes =
       static_cast<size_t>(max_output) * 3 * sizeof(uint8_t);
 
-  std::cerr << "[SVOIntegratorCL] ExtractFill L" << level_shift
-            << ": max_output=" << max_output << " ("
-            << ((pts_bytes * 2 + clr_bytes) >> 20) << " MB buffers)\n";
+  {
+    std::ostringstream oss;
+    oss << "[SVOIntegratorCL] ExtractFill L" << level_shift
+        << ": max_output=" << max_output << " ("
+        << ((pts_bytes * 2 + clr_bytes) >> 20) << " MB buffers)";
+    foundation::LogDebug("dense", oss.str());
+  }
 
   cl_int err;
   cl::Buffer cl_out_pts(ctx, CL_MEM_WRITE_ONLY, pts_bytes, nullptr, &err);
@@ -815,13 +851,21 @@ void SVOIntegratorCL::ExtractFill(const cl::Buffer& fine_table,
   queue.enqueueReadBuffer(cl_out_counter, CL_TRUE, 0, sizeof(uint32_t),
                           &n_points);
   if (n_points > max_output) {
-    std::cerr << "[SVOIntegratorCL] Warning: extract_fill buffer overflow, "
-              << n_points << " > " << max_output << ". Clamping.\n";
+    {
+      std::ostringstream oss;
+      oss << "[SVOIntegratorCL] Warning: extract_fill buffer overflow, "
+          << n_points << " > " << max_output << ". Clamping.";
+      foundation::LogWarning("dense", oss.str());
+    }
     n_points = max_output;
   }
 
-  std::cerr << "[SVOIntegratorCL] GPU extract_fill L" << level_shift << ": "
-            << n_points << " fill points\n";
+  {
+    std::ostringstream oss;
+    oss << "[SVOIntegratorCL] GPU extract_fill L" << level_shift << ": "
+        << n_points << " fill points";
+    foundation::LogInfo("dense", oss.str());
+  }
 
   if (n_points == 0) {
     return;
@@ -956,9 +1000,13 @@ void SVOIntegratorCL::PrepareRefinement(
     queue.finish();
   }
 
-  std::cerr << "[SVOIntegratorCL] PrepareRefinement: " << n_views << " views ("
-            << img_width << "x" << img_height << "), "
-            << ((grad_bytes + adam_bytes) >> 20) << " MB grad+adam\n";
+  {
+    std::ostringstream oss;
+    oss << "[SVOIntegratorCL] PrepareRefinement: " << n_views << " views ("
+        << img_width << "x" << img_height << "), "
+        << ((grad_bytes + adam_bytes) >> 20) << " MB grad+adam";
+    foundation::LogInfo("dense", oss.str());
+  }
 
   refine_prepared_ = true;
 }
@@ -1180,10 +1228,14 @@ void SVOIntegratorCL::RefineGeometry(int iters, float lambda_reg,
           sum_abs += a;
         }
       }
-      std::cerr << "[SVORefine] iter 0 grad stats: nonzero=" << n_nonzero << "/"
-                << capacity_ << " max_abs=" << max_abs
-                << " mean_abs=" << (n_nonzero > 0 ? sum_abs / n_nonzero : 0.0)
-                << " lr_sdf=" << lr_sdf << "\n";
+      {
+        std::ostringstream oss;
+        oss << "[SVORefine] iter 0 grad stats: nonzero=" << n_nonzero << "/"
+            << capacity_ << " max_abs=" << max_abs
+            << " mean_abs=" << (n_nonzero > 0 ? sum_abs / n_nonzero : 0.0)
+            << " lr_sdf=" << lr_sdf;
+        foundation::LogDebug("dense", oss.str());
+      }
     }
 
     // ---- Step 3: Adam update on SDF ----
@@ -1209,8 +1261,12 @@ void SVOIntegratorCL::RefineGeometry(int iters, float lambda_reg,
     }
 
     if ((iter + 1) % 5 == 0 || iter == iters - 1) {
-      std::cerr << "[SVOIntegratorCL] RefineGeometry iter " << (iter + 1) << "/"
-                << iters << "\n";
+      {
+        std::ostringstream oss;
+        oss << "[SVOIntegratorCL] RefineGeometry iter " << (iter + 1) << "/"
+            << iters;
+        foundation::LogInfo("dense", oss.str());
+      }
     }
   }
 
@@ -1294,7 +1350,11 @@ void SVOIntegratorCL::BakeColors(const std::vector<Vec3f>& points,
   cl_cameras_array_ = cl::Buffer();
   refine_prepared_ = false;
 
-  std::cerr << "[SVOIntegratorCL] BakeColors: " << M << " points colored\n";
+  {
+    std::ostringstream oss;
+    oss << "[SVOIntegratorCL] BakeColors: " << M << " points colored";
+    foundation::LogInfo("dense", oss.str());
+  }
 }
 
 // =====================================================================

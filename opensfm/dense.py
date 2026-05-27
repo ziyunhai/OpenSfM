@@ -1484,9 +1484,14 @@ def _dsm_median_filter(grid: NDArray, radius: int) -> NDArray:
     if not valid.any():
         return grid
     # Use a sentinel below all data for NaN cells
-    sentinel = float(np.nanmin(grid)) - 9999.0
+    data_min = float(np.nanmin(grid))
+    sentinel = data_min - 9999.0
     work = np.where(valid, grid, sentinel)
     filtered = median_filter(work, size=kernel_size).astype(np.float32)
+    # Reject sentinel-contaminated results: if the median fell below the
+    # data minimum, the window was majority-hole → restore original value.
+    contaminated = filtered < data_min - 1.0
+    filtered = np.where(contaminated, grid, filtered)
     # Only keep filtered values where originally valid
     return np.where(valid, filtered, np.nan).astype(np.float32)
 
