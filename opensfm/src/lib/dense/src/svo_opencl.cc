@@ -1551,7 +1551,7 @@ void SVOIntegratorCL::ClearVotes() {
 void SVOIntegratorCL::RenderDSMOrtho(float origin_x, float origin_y, float gsd,
                                      int width, int height, float z_min,
                                      float z_max, float voxel_size,
-                                     float min_weight,
+                                     float min_weight, float trunc_dist,
                                      std::vector<float>* dsm_out,
                                      std::vector<uint8_t>* ortho_out,
                                      std::vector<float>* normals_out) {
@@ -1582,6 +1582,7 @@ void SVOIntegratorCL::RenderDSMOrtho(float origin_x, float origin_y, float gsd,
   k.setArg(11, z_min);
   k.setArg(12, voxel_size);
   k.setArg(13, min_weight);
+  k.setArg(14, trunc_dist);
 
   const size_t gx = ((static_cast<size_t>(width) + 15) / 16) * 16;
   const size_t gy = ((static_cast<size_t>(height) + 15) / 16) * 16;

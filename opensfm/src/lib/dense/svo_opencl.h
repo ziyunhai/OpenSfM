@@ -189,7 +189,8 @@ class SVOIntegratorCL {
   // normals_out: (height × width × 3) float, surface normal per cell.
   void RenderDSMOrtho(float origin_x, float origin_y, float gsd, int width,
                       int height, float z_min, float z_max, float voxel_size,
-                      float min_weight, std::vector<float>* dsm_out,
+                      float min_weight, float trunc_dist,
+                      std::vector<float>* dsm_out,
                       std::vector<uint8_t>* ortho_out,
                       std::vector<float>* normals_out);
 

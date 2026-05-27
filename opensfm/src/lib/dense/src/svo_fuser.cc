@@ -662,8 +662,9 @@ void SVOFuser::RenderDSMOrtho(float origin_x, float origin_y, float gsd,
         "SVOFuser::RenderDSMOrtho: must call Fuse() first");
   }
   integrator_->RenderDSMOrtho(origin_x, origin_y, gsd, width, height, z_min,
-                              z_max, voxel_size_, min_weight_, dsm_out,
-                              ortho_out, normals_out);
+                              z_max, voxel_size_, min_weight_,
+                              voxel_size_ * trunc_factor_, dsm_out, ortho_out,
+                              normals_out);
 }
 
 }  // namespace dense

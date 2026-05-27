@@ -1880,10 +1880,15 @@ __kernel void svo_clear_votes(
 //
 // 2D dispatch: one work-item per DSM grid cell.
 // Fires a vertical ray downward (z_max -> z_min) through the hash table,
-// detects the FIRST zero-crossing (highest surface), writes Z and color.
+// detects the FIRST zero-crossing (highest surface), writes Z and normal.
+//
+// Acceleration: hash-miss skip only.  If a voxel is not in the table,
+// no surface exists within trunc_dist of that location, so we can safely
+// advance by trunc_dist.  When we DO find a voxel, we step by voxel_size
+// (linear march) since TSDF values are not distances along the ray axis.
 //
 // DSM: Float32 grid -- NaN where no surface.
-// Ortho: RGBA8 (4 bytes packed as uint).
+// Ortho: unused (zeroed) — color comes from BakeColors in Python.
 // Normals: float3 per cell (nx, ny, nz); (0,0,0) where no surface.
 // =====================================================================
 __kernel void svo_render_dsm_ortho(
@@ -1900,7 +1905,8 @@ __kernel void svo_render_dsm_ortho(
     const float               z_max,
     const float               z_min,
     const float               voxel_size,
-    const float               min_weight)
+    const float               min_weight,
+    const float               trunc_dist)
 {
     const int gx = get_global_id(0);
     const int gy = get_global_id(1);
@@ -1928,50 +1934,54 @@ __kernel void svo_render_dsm_ortho(
         return;
     }
 
-    // March from top (z_max) downward to z_min in voxel_size steps.
-    // Detect zero-crossing: prev_tsdf > 0, current <= 0 means we hit
-    // the surface from above (exterior is positive).
-    float prev_tsdf = 2.0f;  // sentinel (invalid)
+    // Linear march from top (z_max) downward to z_min with hash-miss skip.
+    // Detect zero-crossing: prev_tsdf > 0, current <= 0.
+    float prev_tsdf = 2.0f;  // sentinel (no valid sample yet)
     float prev_z = z_max;
     int   prev_vz = (int)floor(z_max * inv_vs) + 1;  // impossible value
 
-    for (float z = z_max; z >= z_min; z -= voxel_size) {
+    for (float z = z_max; z >= z_min; ) {
         const int vz = (int)floor(z * inv_vs);
 
-        // Skip if same voxel as previous step (can happen due to float precision).
+        // Skip if same voxel as previous step.
         if (vz == prev_vz && prev_tsdf < 2.0f) {
             prev_z = z;
+            z -= voxel_size;
             continue;
         }
 
         uint slot_idx = hash_lookup(table, capacity_mask, vx, vy, vz);
         if (slot_idx > capacity_mask) {
+            // Hash miss: no voxel → no surface within trunc_dist.
             prev_tsdf = 2.0f;
             prev_z = z;
             prev_vz = vz;
+            z -= trunc_dist;
             continue;
         }
 
         int sw = table[slot_idx].sum_weight;
         if (sw < min_weight_fp) {
+            // Low-weight: unreliable, treat as empty but step conservatively.
             prev_tsdf = 2.0f;
             prev_z = z;
             prev_vz = vz;
+            z -= voxel_size;
             continue;
         }
 
         float tsdf = (float)table[slot_idx].sum_tsdf
                    / ((float)sw * (float)FP_SCALE);
 
-        // Zero-crossing: positive -> negative/zero (entering surface from above).
+        // Zero-crossing: positive -> negative/zero (entering surface).
         if (prev_tsdf > 0.0f && prev_tsdf <= 1.0f && tsdf <= 0.0f) {
-            // Interpolate exact Z.
+            // Interpolate exact Z of crossing.
             float t_frac = prev_tsdf / (prev_tsdf - tsdf + 1e-8f);
             float hit_z = prev_z - t_frac * (prev_z - z);
 
             dsm_out[cell] = hit_z;
 
-            // Normal = (sum_nx, sum_ny, sum_nz) / sum_weight * (1/FP_SCALE)
+            // Extract and normalize surface normal.
             float inv_sw = 1.0f / (float)sw;
             float nx = (float)table[slot_idx].sum_nx * inv_sw / (float)FP_SCALE;
             float ny = (float)table[slot_idx].sum_ny * inv_sw / (float)FP_SCALE;
@@ -1980,25 +1990,51 @@ __kernel void svo_render_dsm_ortho(
             if (len > 0.001f) { nx /= len; ny /= len; nz /= len; }
             else { nx = 0.0f; ny = 0.0f; nz = 1.0f; }
 
-            // Store surface normal.
             normals_out[cell * 3 + 0] = nx;
             normals_out[cell * 3 + 1] = ny;
             normals_out[cell * 3 + 2] = nz;
 
-            // Simple Lambert shading: light from (0.3, 0.3, 0.9) normalized.
-            float shade = fmax(0.0f, 0.3f*nx + 0.3f*ny + 0.9f*nz);
-            // Normalize to [0.2, 1.0] range to avoid pure black.
-            shade = 0.2f + 0.8f * shade;
-            uint gray = (uint)(shade * 255.0f);
-            gray = min(gray, 255u);
-            // Pack as RGBA (R=G=B=gray, A=255).
-            ortho_out[cell] = gray | (gray << 8) | (gray << 16) | (255u << 24);
+            ortho_out[cell] = 0;
             return;
+        }
+
+        // Oblique-entry fix: When cameras view a surface obliquely, the
+        // TSDF positive band is laterally offset from the negative band.
+        // A vertical ray can miss the positive voxels entirely and enter
+        // the band directly into negative territory — creating thin holes
+        // (streaks) aligned with the camera direction.
+        //
+        // Fix: if we arrive from empty space (sentinel prev_tsdf) directly
+        // into shallow-negative TSDF with an upward-facing normal, this is
+        // a valid surface.  Estimate hit_z by correcting for TSDF depth.
+        // Use tight thresholds to avoid wobble at roof/ground edges.
+        if (prev_tsdf >= 2.0f && tsdf < 0.0f && tsdf > -0.3f) {
+            float inv_sw2 = 1.0f / (float)sw;
+            float nx = (float)table[slot_idx].sum_nx * inv_sw2 / (float)FP_SCALE;
+            float ny = (float)table[slot_idx].sum_ny * inv_sw2 / (float)FP_SCALE;
+            float nz = (float)table[slot_idx].sum_nz * inv_sw2 / (float)FP_SCALE;
+            float len2 = sqrt(nx*nx + ny*ny + nz*nz);
+            if (len2 > 0.001f) { nx /= len2; ny /= len2; nz /= len2; }
+            else { nz = 0.0f; }  // reject if no normal
+
+            // Accept only if normal is strongly upward (not edges/walls).
+            if (nz > 0.5f) {
+                // Surface is |tsdf| * trunc_dist above current z.
+                float hit_z = z + (-tsdf) * trunc_dist;
+
+                dsm_out[cell] = hit_z;
+                normals_out[cell * 3 + 0] = nx;
+                normals_out[cell * 3 + 1] = ny;
+                normals_out[cell * 3 + 2] = nz;
+                ortho_out[cell] = 0;
+                return;
+            }
         }
 
         prev_tsdf = tsdf;
         prev_z = z;
         prev_vz = vz;
+        z -= voxel_size;
     }
 
     // No surface found.

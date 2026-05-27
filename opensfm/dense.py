@@ -1690,63 +1690,38 @@ def _ortho_diffuse_holes(
 ) -> NDArray:
     """Diffuse ortho colors into cells that have a valid DSM but no color.
 
-    Uses iterative nearest-neighbor averaging: for each colorless cell
-    with a valid DSM value, average colors from valid neighbors.
+    Uses cv2.inpaint (Telea algorithm) for fast C++-backed hole filling.
+    The inpaint radius is derived from iterations (clamped to a reasonable
+    range) to control how far colors spread into holes.
     """
     if iterations <= 0:
         return ortho_grid
 
     h, w, _ = ortho_grid.shape
     has_dsm = ~np.isnan(dsm_grid)
-    # "Has color" = at least one channel > 0 AND has DSM
     has_color = has_dsm & (ortho_grid.sum(axis=2) > 0)
     needs_color = has_dsm & ~has_color
 
     if not needs_color.any():
         return ortho_grid
 
-    result = ortho_grid.astype(np.float32)
+    # Inpaint mask: cells that have DSM surface but no color yet.
+    inpaint_mask = needs_color.astype(np.uint8) * 255
 
-    for _ in range(iterations):
-        filled = has_color.copy()
-        # Average from 4-neighbors that have color
-        for ch in range(3):
-            channel = result[:, :, ch]
-            # Sum of neighbor values
-            neighbor_sum = np.zeros((h, w), dtype=np.float32)
-            neighbor_cnt = np.zeros((h, w), dtype=np.float32)
+    # Inpaint radius controls diffusion reach; clamp to avoid excessive cost.
+    radius = min(max(iterations // 10, 3), 10)
 
-            # Up
-            neighbor_sum[1:, :] += np.where(filled[:-1, :], channel[:-1, :], 0)
-            neighbor_cnt[1:, :] += filled[:-1, :].astype(np.float32)
-            # Down
-            neighbor_sum[:-1, :] += np.where(filled[1:, :], channel[1:, :], 0)
-            neighbor_cnt[:-1, :] += filled[1:, :].astype(np.float32)
-            # Left
-            neighbor_sum[:, 1:] += np.where(filled[:, :-1], channel[:, :-1], 0)
-            neighbor_cnt[:, 1:] += filled[:, :-1].astype(np.float32)
-            # Right
-            neighbor_sum[:, :-1] += np.where(filled[:, 1:], channel[:, 1:], 0)
-            neighbor_cnt[:, :-1] += filled[:, 1:].astype(np.float32)
+    result = cv2.inpaint(
+        ortho_grid, inpaint_mask, radius, cv2.INPAINT_TELEA
+    )
 
-            # Fill cells that need color and have at least one colored neighbor
-            can_fill = needs_color & (neighbor_cnt > 0)
-            avg = np.where(
-                neighbor_cnt > 0,
-                neighbor_sum / neighbor_cnt,
-                0.0,
-            )
-            result[:, :, ch] = np.where(can_fill, avg, channel)
+    # Only apply inpainted values where we actually need color AND have DSM.
+    # Keep original colors untouched everywhere else.
+    result = np.where(
+        needs_color[:, :, np.newaxis], result, ortho_grid
+    )
 
-        # Update masks
-        newly_filled = needs_color & (neighbor_cnt > 0)
-        has_color |= newly_filled
-        needs_color &= ~newly_filled
-
-        if not needs_color.any():
-            break
-
-    return np.clip(result, 0, 255).astype(np.uint8)
+    return result
 
 
 def _render_dsm_patch_from_sv(
@@ -2274,12 +2249,8 @@ def _fuse_per_cluster(
 
             # --- Step 3.5: Median filter ortho (remove boundary speckle) ---
             if ortho_grid is not None and median_radius > 0:
-                from scipy.ndimage import median_filter as _mf
                 ks = 2 * median_radius + 1
-                for ch in range(3):
-                    ortho_grid[:, :, ch] = _mf(
-                        ortho_grid[:, :, ch], size=ks
-                    )
+                ortho_grid = cv2.medianBlur(ortho_grid, ks)
                 logger.info(
                     f"  Applied {ks}x{ks} median to ortho"
                 )
