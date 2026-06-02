@@ -715,9 +715,18 @@ PYBIND11_MODULE(pymap, m) {
       .def("get_valid_observations", &map::Map::GetValidObservations)
       .def("to_tracks_manager", &map::Map::ToTracksManager);
   // ── GCP I/O functions ──────────────────────────────────────────────────
-  m.def("read_gcp_json", &map::ReadGcpJson, py::arg("content"),
-        "Read ground control points from a JSON string.");
+  m.def(
+      "read_gcp_json",
+      [](const std::string& content) {
+        std::string crsName;
+        auto gcps = map::ReadGcpJson(content, &crsName);
+        return py::make_tuple(gcps, crsName);
+      },
+      py::arg("content"),
+      "Read ground control points from a JSON string.\n"
+      "Returns a tuple (points_list, crs_string).");
   m.def("write_gcp_json", &map::WriteGcpJson, py::arg("gcps"),
+        py::arg("crs_name") = "",
         "Write ground control points to a JSON string.");
   m.def(
       "read_gcp_list",

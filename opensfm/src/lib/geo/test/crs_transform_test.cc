@@ -65,11 +65,12 @@ TEST(CrsTransform, IdentityFromEmptyString) {
 
 TEST(CrsTransform, IdentityTransformPassesThrough) {
   geo::CrsTransform ct("");
-  double lat = 0, lon = 0;
-  ASSERT_TRUE(ct.transform(13.4, 52.5, lat, lon));
-  // Identity: easting→lon, northing→lat.
+  double lat = 0, lon = 0, alt = 0;
+  ASSERT_TRUE(ct.transform(13.4, 52.5, 10.0, lat, lon, alt));
+  // Identity: easting→lon, northing→lat, alt→alt.
   EXPECT_DOUBLE_EQ(lon, 13.4);
   EXPECT_DOUBLE_EQ(lat, 52.5);
+  EXPECT_DOUBLE_EQ(alt, 10.0);
 }
 
 // ── CrsTransform with PROJ ──────────────────────────────────────────────────
@@ -82,10 +83,11 @@ TEST(CrsTransform, UtmZone33NForward) {
   EXPECT_TRUE(ct.isValid());
 
   // UTM33N easting=389262, northing=5819838 → lat≈52.5174, lon≈13.3680
-  double lat = 0, lon = 0;
-  ASSERT_TRUE(ct.transform(389262, 5819838, lat, lon));
+  double lat = 0, lon = 0, alt = 0;
+  ASSERT_TRUE(ct.transform(389262, 5819838, 5.0, lat, lon, alt));
   EXPECT_NEAR(lat, 52.5174, 0.001);
   EXPECT_NEAR(lon, 13.3680, 0.001);
+  EXPECT_NEAR(alt, 5.0, 0.001);
 }
 
 TEST(CrsTransform, EpsgUtmEquivalence) {
@@ -93,12 +95,13 @@ TEST(CrsTransform, EpsgUtmEquivalence) {
   geo::CrsTransform ctUtm(geo::ParseGcpProjectionString("WGS84 UTM 33N"));
   geo::CrsTransform ctEpsg(geo::ParseGcpProjectionString("EPSG:32633"));
 
-  double lat1 = 0, lon1 = 0, lat2 = 0, lon2 = 0;
-  ASSERT_TRUE(ctUtm.transform(389262, 5819838, lat1, lon1));
-  ASSERT_TRUE(ctEpsg.transform(389262, 5819838, lat2, lon2));
+  double lat1 = 0, lon1 = 0, alt1 = 0, lat2 = 0, lon2 = 0, alt2 = 0;
+  ASSERT_TRUE(ctUtm.transform(389262, 5819838, 5.0, lat1, lon1, alt1));
+  ASSERT_TRUE(ctEpsg.transform(389262, 5819838, 5.0, lat2, lon2, alt2));
 
   EXPECT_NEAR(lat1, lat2, 1e-6);
   EXPECT_NEAR(lon1, lon2, 1e-6);
+  EXPECT_NEAR(alt1, alt2, 1e-6);
 }
 
 TEST(CrsTransform, InvalidProjStringNotValid) {
@@ -107,8 +110,8 @@ TEST(CrsTransform, InvalidProjStringNotValid) {
   EXPECT_FALSE(ct.isIdentity());
   EXPECT_FALSE(ct.isValid());
 
-  double lat = 0, lon = 0;
-  EXPECT_FALSE(ct.transform(0, 0, lat, lon));
+  double lat = 0, lon = 0, alt = 0;
+  EXPECT_FALSE(ct.transform(0, 0, 0, lat, lon, alt));
 }
 
 TEST(CrsTransform, MoveSemantics) {
@@ -118,8 +121,8 @@ TEST(CrsTransform, MoveSemantics) {
   geo::CrsTransform ct2(std::move(ct1));
   EXPECT_TRUE(ct2.isValid());
 
-  double lat = 0, lon = 0;
-  ASSERT_TRUE(ct2.transform(389262, 5819838, lat, lon));
+  double lat = 0, lon = 0, alt = 0;
+  ASSERT_TRUE(ct2.transform(389262, 5819838, 5.0, lat, lon, alt));
   EXPECT_NEAR(lat, 52.52, 0.01);
 }
 

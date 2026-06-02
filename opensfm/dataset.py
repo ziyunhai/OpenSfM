@@ -635,28 +635,40 @@ class DataSet(DataSetBase):
         pcs = []
         if self.io_handler.isfile(self._ground_control_points_file()):
             with self.io_handler.open_rt(self._ground_control_points_file()) as fin:
-                pcs = io.read_ground_control_points(fin)
+                pcs, _ = io.read_ground_control_points(fin)
 
         return gcp + pcs
 
     def load_gcp_coordinate_system(self) -> Optional[str]:
-        """Return the CRS string from the first line of gcp_list.txt.
+        """Return the CRS string from ground_control_points.json or gcp_list.txt."""
+        crs = None
+        has_gcp_json = self.io_handler.isfile(
+            self._ground_control_points_file())
+        if has_gcp_json:
+            with self.io_handler.open_rt(self._ground_control_points_file()) as fin:
+                _, crs = io.read_ground_control_points(fin)
 
-        Returns "WGS84" when no projection is specified, None if no gcp_list.txt exists.
-        """
-        if not self.io_handler.isfile(self._gcp_list_file()):
+        has_gcp_txt = self.io_handler.isfile(self._gcp_list_file())
+        if not crs and has_gcp_txt:
+            with self.io_handler.open_rt(self._gcp_list_file()) as fin:
+                proj = io.read_gcp_projection_string(fin)
+                crs = proj
+
+        if not has_gcp_json and not has_gcp_txt:
             return None
-        with self.io_handler.open_rt(self._gcp_list_file()) as fin:
-            proj = io.read_gcp_projection_string(fin)
+
         # None means identity / WGS84
-        return proj if proj is not None else "WGS84"
+        result = crs if crs is not None else "WGS84"
+        geo.log_vertical_datum(result)
+        return result
 
     def save_ground_control_points(
         self,
         points: List[pymap.GroundControlPoint],
     ) -> None:
+        crs = self.load_gcp_coordinate_system() or "WGS84"
         with self.io_handler.open_wt(self._ground_control_points_file()) as fout:
-            io.write_ground_control_points(points, fout)
+            io.write_ground_control_points(points, fout, crs)
 
     def _stats_file(self) -> str:
         return os.path.join(self.data_path, "stats", "stats.json")

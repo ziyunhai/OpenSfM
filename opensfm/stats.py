@@ -17,6 +17,8 @@ import scipy.spatial as spatial
 from matplotlib.path import Path as MplPath
 from matplotlib.patches import Patch
 
+plt.set_loglevel('info')
+
 import numpy as np
 from numpy.typing import NDArray
 from opensfm import feature_loader, geo, geometry, report, io, multiview, pygeometry, pymap, types
@@ -24,10 +26,14 @@ from opensfm.dataset import DataSet, DataSetBase
 
 RESIDUAL_PIXEL_CUTOFF = 4
 
-_CLR_ACCENT = (0.02, 0.80, 0.39)                            # #05CB63 — Mapillary green
-_CLR_BAD = np.array(report.COLOR_GRADE_BAD) / 255.0         # #E05252 — muted red
-_CLR_AVG = np.array(report.COLOR_GRADE_AVG) / 255.0         # #D4A843 — warm amber
-_CLR_GOOD = np.array(report.COLOR_GRADE_GOOD) / 255.0       # #3CB371 — medium sea-green
+# #05CB63 — Mapillary green
+_CLR_ACCENT = (0.02, 0.80, 0.39)
+_CLR_BAD = np.array(report.COLOR_GRADE_BAD) / \
+    255.0         # #E05252 — muted red
+_CLR_AVG = np.array(report.COLOR_GRADE_AVG) / \
+    255.0         # #D4A843 — warm amber
+_CLR_GOOD = np.array(report.COLOR_GRADE_GOOD) / \
+    255.0       # #3CB371 — medium sea-green
 
 _REPORT_SEQ_CMAP = colors.LinearSegmentedColormap.from_list(
     "opensfm_seq",
@@ -80,8 +86,7 @@ def _gps_gcp_opk_errors_stats(errors: Optional[NDArray], names: List[str]) -> Di
     average = np.average(np.linalg.norm(errors, axis=1))
 
     stats["mean"] = {names[0]: mean[0], names[1]: mean[1], names[2]: mean[2]}
-    stats["std"] = {names[0]: std_dev[0], names[1]
-        : std_dev[1], names[2]: std_dev[2]}
+    stats["std"] = {names[0]: std_dev[0], names[1]: std_dev[1], names[2]: std_dev[2]}
     stats["error"] = {
         names[0]: math.sqrt(m_squared[0]),
         names[1]: math.sqrt(m_squared[1]),
@@ -99,7 +104,8 @@ def gps_errors(reconstructions: List[types.Reconstruction]) -> Dict[str, Any]:
         for shot in rec.shots.values():
             if shot.metadata.gps_position.has_value:
                 if shot.metadata.gps_accuracy.has_value:
-                    all_gps_std.append(np.array(shot.metadata.gps_accuracy.value))
+                    all_gps_std.append(
+                        np.array(shot.metadata.gps_accuracy.value))
                 else:
                     all_gps_std.append(geo.DEFAULT_GPS_STD)
     stats = _gps_gcp_opk_errors_stats(np.array(all_errors), ["x", "y", "z"])
@@ -167,9 +173,11 @@ def gcp_errors(
         # Determine the std dev for this point
         if gcp.std_dev is not None:
             sd = gcp.std_dev
-            sigma_xyz = {"x": float(sd[0]), "y": float(sd[1]), "z": float(sd[2])}
+            sigma_xyz = {"x": float(sd[0]), "y": float(
+                sd[1]), "z": float(sd[2])}
         else:
-            sigma_xyz = {"x": gcp_horizontal_sd, "y": gcp_horizontal_sd, "z": gcp_vertical_sd}
+            sigma_xyz = {"x": gcp_horizontal_sd,
+                         "y": gcp_horizontal_sd, "z": gcp_vertical_sd}
 
         # Determine role string
         role_str = "Ground Control Point" if gcp.role == pymap.GroundControlPointRole.GCP else "Checkpoint"
@@ -212,15 +220,18 @@ def gcp_errors(
         if d["role"] == "Checkpoint"
     ]
 
-    stats = _gps_gcp_opk_errors_stats(np.array(all_errors) if all_errors else np.array([]), ["x", "y", "z"])
+    stats = _gps_gcp_opk_errors_stats(
+        np.array(all_errors) if all_errors else np.array([]), ["x", "y", "z"])
     stats["details"] = gcp_details
 
     # Add separate stats for GCP and CP
     stats["gcp_only"] = _gps_gcp_opk_errors_stats(
-        np.array(gcp_only_errors) if gcp_only_errors else np.array([]), ["x", "y", "z"]
+        np.array(gcp_only_errors) if gcp_only_errors else np.array(
+            []), ["x", "y", "z"]
     )
     stats["cp_only"] = _gps_gcp_opk_errors_stats(
-        np.array(cp_only_errors) if cp_only_errors else np.array([]), ["x", "y", "z"]
+        np.array(cp_only_errors) if cp_only_errors else np.array(
+            []), ["x", "y", "z"]
     )
 
     crs = data.load_gcp_coordinate_system()
@@ -392,6 +403,8 @@ def _compute_gsd(
         return -1.0
 
     return float(np.mean(all_ratios))
+
+
 def reconstruction_statistics(
     data: DataSetBase,
     tracks_manager: pymap.TracksManager,
@@ -615,7 +628,8 @@ def cameras_statistics(
             rel_diff = {}
             for param, init_val in initial.items():
                 if abs(init_val) > 1e-12:
-                    rel_diff[param] = abs(optimized[param] - init_val) / abs(init_val) * 100.0
+                    rel_diff[param] = abs(
+                        optimized[param] - init_val) / abs(init_val) * 100.0
                 else:
                     rel_diff[param] = 0.0
             stats[camera_id]["relative_difference"] = rel_diff
@@ -982,7 +996,6 @@ def save_topview(
                 plt.plot(
                     [x, nx], [y, ny], linestyle="-", color=c_camera, linewidth=linewidth
                 )
-                
 
             # display GPS error
             if not shot.metadata.gps_position.has_value:
@@ -1408,7 +1421,8 @@ def _compute_front_overlap(
 
         # Build list of valid consecutive pairs (both have footprints)
         n = len(sorted_shots)
-        footprints = [_compute_shot_footprint(s, ground_z) for s in sorted_shots]
+        footprints = [_compute_shot_footprint(
+            s, ground_z) for s in sorted_shots]
 
         valid_pairs: List[Tuple[int, int]] = []
         for i in range(n - 1):
@@ -1420,7 +1434,8 @@ def _compute_front_overlap(
             valid_pairs = random.sample(valid_pairs, max_samples)
 
         for i, j in valid_pairs:
-            overlaps.append(_rasterized_overlap_ratio(footprints[i], footprints[j]))
+            overlaps.append(_rasterized_overlap_ratio(
+                footprints[i], footprints[j]))
     return overlaps
 
 
@@ -1469,7 +1484,8 @@ def _compute_side_overlap(
             continue
 
         # Camera positions for flight direction (use camera XY, not ground)
-        positions = np.array([sorted_shots[i].pose.get_origin()[:2] for i in range(n)])
+        positions = np.array(
+            [sorted_shots[i].pose.get_origin()[:2] for i in range(n)])
 
         # Compute local flight direction for each shot (central difference)
         flight_dirs = np.zeros((n, 2))
@@ -1518,12 +1534,14 @@ def _compute_side_overlap(
                     continue
                 # Direction from current centroid to neighbor centroid
                 to_neighbor = centroids[n_idx] - centroid
-                to_neighbor_norm = math.sqrt(to_neighbor[0]**2 + to_neighbor[1]**2)
+                to_neighbor_norm = math.sqrt(
+                    to_neighbor[0]**2 + to_neighbor[1]**2)
                 if to_neighbor_norm < 1e-9:
                     continue
                 to_neighbor = to_neighbor / to_neighbor_norm
                 # Check alignment: low |dot| means perpendicular to flight path
-                alignment = abs(fd[0] * to_neighbor[0] + fd[1] * to_neighbor[1])
+                alignment = abs(fd[0] * to_neighbor[0] +
+                                fd[1] * to_neighbor[1])
                 if alignment < alignment_threshold:
                     overlap = _rasterized_overlap_ratio(
                         footprints[idx], footprints[n_idx]
@@ -1634,7 +1652,8 @@ def save_overlap_map(
 
     # Create figure with legend
     fig, ax = plt.subplots(1, 1, figsize=(10, 10 * ny / nx))
-    ax.imshow(rgba, origin="lower", extent=[min_x, max_x, min_y, max_y], aspect="equal")
+    ax.imshow(rgba, origin="lower", extent=[
+              min_x, max_x, min_y, max_y], aspect="equal")
     ax.set_xlabel("X (meters)")
     ax.set_ylabel("Y (meters)")
     ax.set_title("Overlap Map")

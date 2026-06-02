@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import PIL
 import numpy as np
 from fpdf import FPDF
-from opensfm import io
+from opensfm import geo, io
 from opensfm.dataset import DataSet
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -20,25 +20,39 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 # Colors (RGB tuples)
 COLOR_BACKGROUND: Tuple[int, int, int] = (255, 255, 255)        # White page
-COLOR_PANEL: Tuple[int, int, int] = (37, 37, 38)                # #252526 — titles
-COLOR_EDITOR: Tuple[int, int, int] = (30, 30, 30)               # #1E1E1E — headings
-COLOR_SPLIT: Tuple[int, int, int] = (62, 62, 62)                # #3E3E3E — borders/rules
-COLOR_TEXT: Tuple[int, int, int] = (44, 44, 46)                  # Near-black body text
-COLOR_TEXT_SECONDARY: Tuple[int, int, int] = (108, 117, 125)    # Muted secondary
-COLOR_ACCENT: Tuple[int, int, int] = (5, 203, 99)               # #05CB63 — Mapillary Green
-COLOR_ACCENT_FAINT: Tuple[int, int, int] = (232, 250, 240)      # Very subtle green tint
-COLOR_TABLE_HEADER: Tuple[int, int, int] = (42, 45, 52)         # Slate-dark header
-COLOR_TABLE_HEADER_TEXT: Tuple[int, int, int] = (255, 255, 255)  # White on dark
-COLOR_TABLE_ROW_EVEN: Tuple[int, int, int] = (250, 251, 253)    # Almost-white zebra
+COLOR_PANEL: Tuple[int, int, int] = (
+    37, 37, 38)                # #252526 — titles
+COLOR_EDITOR: Tuple[int, int, int] = (
+    30, 30, 30)               # #1E1E1E — headings
+COLOR_SPLIT: Tuple[int, int, int] = (
+    62, 62, 62)                # #3E3E3E — borders/rules
+COLOR_TEXT: Tuple[int, int, int] = (
+    44, 44, 46)                  # Near-black body text
+COLOR_TEXT_SECONDARY: Tuple[int, int, int] = (
+    108, 117, 125)    # Muted secondary
+COLOR_ACCENT: Tuple[int, int, int] = (
+    5, 203, 99)               # #05CB63 — Mapillary Green
+COLOR_ACCENT_FAINT: Tuple[int, int, int] = (
+    232, 250, 240)      # Very subtle green tint
+COLOR_TABLE_HEADER: Tuple[int, int, int] = (
+    42, 45, 52)         # Slate-dark header
+COLOR_TABLE_HEADER_TEXT: Tuple[int, int, int] = (
+    255, 255, 255)  # White on dark
+COLOR_TABLE_ROW_EVEN: Tuple[int, int, int] = (
+    250, 251, 253)    # Almost-white zebra
 COLOR_TABLE_ROW_ODD: Tuple[int, int, int] = (255, 255, 255)     # Pure white
-COLOR_TABLE_LABEL: Tuple[int, int, int] = (242, 244, 247)       # Neutral light grey for row labels
+COLOR_TABLE_LABEL: Tuple[int, int, int] = (
+    242, 244, 247)       # Neutral light grey for row labels
 COLOR_TABLE_BORDER: Tuple[int, int, int] = (228, 231, 236)      # Subtle border
 COLOR_FOOTER: Tuple[int, int, int] = (51, 51, 51)               # #333333
 
 # Quality grading colors — matching the application QML palette
-COLOR_GRADE_GOOD: Tuple[int, int, int] = (60, 179, 113)         # #3CB371 — medium sea-green
-COLOR_GRADE_AVG: Tuple[int, int, int] = (212, 168, 67)          # #D4A843 — warm amber
-COLOR_GRADE_BAD: Tuple[int, int, int] = (224, 82, 82)           # #E05252 — muted red
+COLOR_GRADE_GOOD: Tuple[int, int, int] = (
+    60, 179, 113)         # #3CB371 — medium sea-green
+COLOR_GRADE_AVG: Tuple[int, int, int] = (
+    212, 168, 67)          # #D4A843 — warm amber
+COLOR_GRADE_BAD: Tuple[int, int, int] = (
+    224, 82, 82)           # #E05252 — muted red
 
 # Typography sizes (pt)
 FONT_TITLE: int = 22
@@ -56,7 +70,8 @@ TABLE_GAP: float = 4.0
 CONTENT_WIDTH: int = 186   # A4 (210) - 2*MARGIN
 
 # Logo
-LOGO_PATH: str = os.path.join(os.path.dirname(__file__), "..", "doc", "images", "logo.png")
+LOGO_PATH: str = os.path.join(os.path.dirname(
+    __file__), "..", "doc", "images", "logo.png")
 
 
 def _quality_indicator(value: float, thresholds: Tuple[float, float, float]) -> str:
@@ -108,7 +123,8 @@ class Report:
         self.io_handler: io.IoFilesystemBase = data.io_handler
         self.data_path: str = data.data_path
         self.custom_title: Optional[str] = title
-        self.accent_color: Tuple[int, int, int] = accent_color if accent_color is not None else COLOR_ACCENT
+        self.accent_color: Tuple[int, int,
+                                 int] = accent_color if accent_color is not None else COLOR_ACCENT
 
         self.pdf = FPDF("P", "mm", "A4")
         self.pdf.set_auto_page_break(auto=True, margin=MARGIN)
@@ -242,13 +258,15 @@ class Report:
         self.pdf.set_font("Helvetica", "B", FONT_BODY)
         self.pdf.set_draw_color(*COLOR_TABLE_BORDER)
         self.pdf.set_line_width(0.15)
-        self.pdf.rect(self.pdf.get_x(), self.pdf.get_y(), columns_sizes[0], CELL_HEIGHT, style="FD")
+        self.pdf.rect(self.pdf.get_x(), self.pdf.get_y(),
+                      columns_sizes[0], CELL_HEIGHT, style="FD")
         self.pdf.cell(columns_sizes[0], CELL_HEIGHT, "  " + label, align="L")
 
         # Value cell with colored indicator
         self.pdf.set_fill_color(*COLOR_TABLE_ROW_EVEN)
         self.pdf.set_draw_color(*COLOR_TABLE_BORDER)
-        self.pdf.rect(self.pdf.get_x(), self.pdf.get_y(), columns_sizes[1], CELL_HEIGHT, style="FD")
+        self.pdf.rect(self.pdf.get_x(), self.pdf.get_y(),
+                      columns_sizes[1], CELL_HEIGHT, style="FD")
 
         # Draw the dot in grade color
         dot_x = self.pdf.get_x() + 4
@@ -259,7 +277,8 @@ class Report:
         # Draw the text
         self.pdf.set_text_color(*COLOR_TEXT)
         self.pdf.set_font("Helvetica", "", FONT_BODY)
-        self.pdf.cell(columns_sizes[1], CELL_HEIGHT, "       " + text, align="L")
+        self.pdf.cell(columns_sizes[1], CELL_HEIGHT,
+                      "       " + text, align="L")
 
         self.pdf.set_xy(MARGIN, self.pdf.get_y() + CELL_HEIGHT)
 
@@ -276,13 +295,15 @@ class Report:
         self.pdf.set_font("Helvetica", "B", FONT_BODY)
         self.pdf.set_draw_color(*COLOR_TABLE_BORDER)
         self.pdf.set_line_width(0.15)
-        self.pdf.rect(self.pdf.get_x(), self.pdf.get_y(), columns_sizes[0], CELL_HEIGHT, style="FD")
+        self.pdf.rect(self.pdf.get_x(), self.pdf.get_y(),
+                      columns_sizes[0], CELL_HEIGHT, style="FD")
         self.pdf.cell(columns_sizes[0], CELL_HEIGHT, "  " + label, align="L")
 
         # Value cell with colored indicator
         self.pdf.set_fill_color(*COLOR_TABLE_ROW_EVEN)
         self.pdf.set_draw_color(*COLOR_TABLE_BORDER)
-        self.pdf.rect(self.pdf.get_x(), self.pdf.get_y(), columns_sizes[1], CELL_HEIGHT, style="FD")
+        self.pdf.rect(self.pdf.get_x(), self.pdf.get_y(),
+                      columns_sizes[1], CELL_HEIGHT, style="FD")
 
         # Draw the dot in grade color
         dot_x = self.pdf.get_x() + 4
@@ -293,7 +314,8 @@ class Report:
         # Draw the text
         self.pdf.set_text_color(*COLOR_TEXT)
         self.pdf.set_font("Helvetica", "", FONT_BODY)
-        self.pdf.cell(columns_sizes[1], CELL_HEIGHT, "       " + text, align="L")
+        self.pdf.cell(columns_sizes[1], CELL_HEIGHT,
+                      "       " + text, align="L")
 
         self.pdf.set_xy(MARGIN, self.pdf.get_y() + CELL_HEIGHT)
 
@@ -306,7 +328,8 @@ class Report:
         self.pdf.set_fill_color(*row_bg)
         self.pdf.set_draw_color(*COLOR_TABLE_BORDER)
         self.pdf.set_line_width(0.15)
-        self.pdf.rect(self.pdf.get_x(), self.pdf.get_y(), size, CELL_HEIGHT, style="FD")
+        self.pdf.rect(self.pdf.get_x(), self.pdf.get_y(),
+                      size, CELL_HEIGHT, style="FD")
         dot_x = self.pdf.get_x() + 4
         dot_y = self.pdf.get_y() + CELL_HEIGHT / 2
         self.pdf.set_fill_color(*color)
@@ -324,7 +347,8 @@ class Report:
         self.pdf.set_fill_color(*row_bg)
         self.pdf.set_draw_color(*COLOR_TABLE_BORDER)
         self.pdf.set_line_width(0.15)
-        self.pdf.rect(self.pdf.get_x(), self.pdf.get_y(), size, CELL_HEIGHT, style="FD")
+        self.pdf.rect(self.pdf.get_x(), self.pdf.get_y(),
+                      size, CELL_HEIGHT, style="FD")
         dot_x = self.pdf.get_x() + 4
         dot_y = self.pdf.get_y() + CELL_HEIGHT / 2
         self.pdf.set_fill_color(*color)
@@ -456,7 +480,8 @@ class Report:
         track_thresholds = (2.5, 2.75, 3.0)
         calibration_thresholds = (70.0, 85.0, 95.0)
 
-        col_sizes = [int(CONTENT_WIDTH * 0.42), CONTENT_WIDTH - int(CONTENT_WIDTH * 0.42)]
+        col_sizes = [int(CONTENT_WIDTH * 0.42),
+                     CONTENT_WIDTH - int(CONTENT_WIDTH * 0.42)]
 
         # Graded rows
         self._make_graded_row(
@@ -527,16 +552,19 @@ class Report:
                 "Reconstructed Components",
                 f"{self.stats['reconstruction_statistics']['components']}",
             ],
-            ["Geographic Referencing", " + ".join(geo_string) if geo_string else "None"],
+            ["Geographic Referencing",
+                " + ".join(geo_string) if geo_string else "None"],
         ]
 
-        gcp_crs = self.stats.get("gcp_errors", {}).get("coordinate_system")
+        horiz_crs, vert_crs = geo.nicify_crs(self.stats.get(
+            "gcp_errors", {}).get("coordinate_system", ""))
+
+        gcp_crs = f"{horiz_crs} | {vert_crs}"
         if gcp_crs:
             rows.append(["GCP Coordinate System", gcp_crs])
 
         self._make_table(None, rows, True)
         self.pdf.set_xy(MARGIN, self.pdf.get_y() + TABLE_GAP)
-
 
         # GPS error graded row (based on multiples of input std dev)
         if self.stats["reconstruction_statistics"]["has_gps"] and "average_error" in self.stats.get("gps_errors", {}):
@@ -544,10 +572,12 @@ class Report:
             avg_gps_std = self.stats["gps_errors"].get("average_gps_std")
             if avg_gps_std:
                 # Use the average of XYZ std as reference
-                ref_std = (avg_gps_std["x"] + avg_gps_std["y"] + avg_gps_std["z"]) / 3.0
+                ref_std = (avg_gps_std["x"] +
+                           avg_gps_std["y"] + avg_gps_std["z"]) / 3.0
                 if ref_std > 1e-9:
                     # Thresholds: good <= 2*std, avg <= 3*std, bad > 4*std (lower is better)
-                    gps_thresholds = (2.0 * ref_std, 3.0 * ref_std, 4.0 * ref_std)
+                    gps_thresholds = (2.0 * ref_std, 3.0 *
+                                      ref_std, 4.0 * ref_std)
                     self._make_graded_row_lower(
                         "GPS Error",
                         gps_avg_error,
@@ -558,7 +588,8 @@ class Report:
         # GCP error graded row (based on GSD, same Z thresholds: good <= 3*GSD, avg <= 4*GSD, bad > 5*GSD)
         if self._has_meaningful_gcp() and gsd > 0:
             gcp_only = self.stats["gcp_errors"].get("gcp_only", {})
-            gcp_avg_error = gcp_only.get("average_error", self.stats["gcp_errors"]["average_error"])
+            gcp_avg_error = gcp_only.get(
+                "average_error", self.stats["gcp_errors"]["average_error"])
             gcp_thresholds = (3.0 * gsd, 4.0 * gsd, 5.0 * gsd)
             self._make_graded_row_lower(
                 "Ground Control Point Error",
@@ -588,7 +619,8 @@ class Report:
         ]
         if topview_grids:
             self._make_centered_image(
-                os.path.join(self.output_path, topview_grids[0]), topview_height
+                os.path.join(self.output_path,
+                             topview_grids[0]), topview_height
             )
 
         self.pdf.set_xy(MARGIN, self.pdf.get_y() + TABLE_GAP)
@@ -606,7 +638,8 @@ class Report:
         self.pdf.set_xy(MARGIN, self.pdf.get_y() + SECTION_GAP)
 
     def make_gps_details(self) -> None:
-        self._make_section("GPS/Ground Control Point/Checkpoint Errors Details")
+        self._make_section(
+            "GPS/Ground Control Point/Checkpoint Errors Details")
 
         # GPS table
         if "average_error" in self.stats.get("gps_errors", {}):
@@ -645,11 +678,13 @@ class Report:
         gcp_only = gcp_errors.get("gcp_only", {})
         if "average_error" in gcp_only:
             rows = []
-            columns_names = ["Ground Control Point", "Mean", "Sigma", "RMS Error", "Input Sigma"]
+            columns_names = ["Ground Control Point",
+                             "Mean", "Sigma", "RMS Error", "Input Sigma"]
 
             # Compute per-axis average sigma from GCP details
             gcp_details = gcp_errors.get("details", [])
-            gcp_sigmas = [d["sigma"] for d in gcp_details if d["role"] == "Ground Control Point"]
+            gcp_sigmas = [d["sigma"]
+                          for d in gcp_details if d["role"] == "Ground Control Point"]
 
             for comp in ["x", "y", "z"]:
                 row = [comp.upper() + " Error (meters)"]
@@ -746,7 +781,8 @@ class Report:
         # Inlier ratio quality thresholds (as percentages: bad < 90, avg 90-95, good >= 95)
         inlier_thresholds = (90.0, 95.0, 100.0)
 
-        columns_names = ["ID", "Role", "X Error (m)", "Y Error (m)", "Z Error (m)", "Inliers / Total", "Avg Sigma (m)"]
+        columns_names = [
+            "ID", "Role", "X Error (m)", "Y Error (m)", "Z Error (m)", "Inliers / Total", "Avg Sigma (m)"]
         n_cols = len(columns_names)
         col_sizes = [int(CONTENT_WIDTH / n_cols)] * n_cols
         col_sizes[-1] = CONTENT_WIDTH - sum(col_sizes[:-1])
@@ -758,12 +794,14 @@ class Report:
         self.pdf.set_draw_color(*COLOR_TABLE_BORDER)
         self.pdf.set_line_width(0.15)
         for col, size in zip(columns_names, col_sizes):
-            self.pdf.rect(self.pdf.get_x(), self.pdf.get_y(), size, CELL_HEIGHT, style="FD")
+            self.pdf.rect(self.pdf.get_x(), self.pdf.get_y(),
+                          size, CELL_HEIGHT, style="FD")
             self.pdf.cell(size, CELL_HEIGHT, "  " + col, align="L")
         self.pdf.set_xy(MARGIN, self.pdf.get_y() + CELL_HEIGHT)
 
         # Sort: Check Points first, then Ground Control Points
-        sorted_details = sorted(details, key=lambda d: (0 if d.get("role") == "Checkpoint" else 1, d["id"]))
+        sorted_details = sorted(details, key=lambda d: (
+            0 if d.get("role") == "Checkpoint" else 1, d["id"]))
 
         # Data rows
         for row_idx, entry in enumerate(sorted_details):
@@ -781,7 +819,8 @@ class Report:
             self.pdf.set_text_color(*COLOR_PANEL)
             self.pdf.set_font("Helvetica", "B", FONT_BODY)
             self.pdf.set_draw_color(*COLOR_TABLE_BORDER)
-            self.pdf.rect(self.pdf.get_x(), self.pdf.get_y(), col_sizes[0], CELL_HEIGHT, style="FD")
+            self.pdf.rect(self.pdf.get_x(), self.pdf.get_y(),
+                          col_sizes[0], CELL_HEIGHT, style="FD")
             self.pdf.cell(col_sizes[0], CELL_HEIGHT, "  " + gcp_id, align="L")
 
             # Role cell
@@ -789,8 +828,10 @@ class Report:
             self.pdf.set_text_color(*COLOR_TEXT)
             self.pdf.set_font("Helvetica", "", FONT_BODY)
             self.pdf.set_draw_color(*COLOR_TABLE_BORDER)
-            self.pdf.rect(self.pdf.get_x(), self.pdf.get_y(), col_sizes[1], CELL_HEIGHT, style="FD")
-            self.pdf.cell(col_sizes[1], CELL_HEIGHT, "  " + role_short, align="L")
+            self.pdf.rect(self.pdf.get_x(), self.pdf.get_y(),
+                          col_sizes[1], CELL_HEIGHT, style="FD")
+            self.pdf.cell(col_sizes[1], CELL_HEIGHT,
+                          "  " + role_short, align="L")
 
             # X, Y, Z error cells with GSD-based quality dots
             for col_idx, axis in enumerate(["x", "y", "z"], start=2):
@@ -806,13 +847,16 @@ class Report:
                     self.pdf.set_text_color(*COLOR_TEXT)
                     self.pdf.set_font("Helvetica", "", FONT_BODY)
                     self.pdf.set_draw_color(*COLOR_TABLE_BORDER)
-                    self.pdf.rect(self.pdf.get_x(), self.pdf.get_y(), col_sizes[col_idx], CELL_HEIGHT, style="FD")
-                    self.pdf.cell(col_sizes[col_idx], CELL_HEIGHT, "  " + cell_text, align="L")
+                    self.pdf.rect(self.pdf.get_x(), self.pdf.get_y(
+                    ), col_sizes[col_idx], CELL_HEIGHT, style="FD")
+                    self.pdf.cell(
+                        col_sizes[col_idx], CELL_HEIGHT, "  " + cell_text, align="L")
 
             # Inliers/Total cell with quality dot
             inlier_pct = (n_inliers / n_total * 100.0) if n_total > 0 else 0.0
             inlier_text = f"{n_inliers} / {n_total}"
-            self._draw_graded_cell(inlier_text, col_sizes[5], inlier_pct, inlier_thresholds, row_bg)
+            self._draw_graded_cell(
+                inlier_text, col_sizes[5], inlier_pct, inlier_thresholds, row_bg)
 
             # Avg sigma cell
             if sigma is not None and role == "Ground Control Point":
@@ -824,8 +868,10 @@ class Report:
             self.pdf.set_text_color(*COLOR_TEXT)
             self.pdf.set_font("Helvetica", "", FONT_BODY)
             self.pdf.set_draw_color(*COLOR_TABLE_BORDER)
-            self.pdf.rect(self.pdf.get_x(), self.pdf.get_y(), col_sizes[6], CELL_HEIGHT, style="FD")
-            self.pdf.cell(col_sizes[6], CELL_HEIGHT, "  " + sigma_text, align="L")
+            self.pdf.rect(self.pdf.get_x(), self.pdf.get_y(),
+                          col_sizes[6], CELL_HEIGHT, style="FD")
+            self.pdf.cell(col_sizes[6], CELL_HEIGHT,
+                          "  " + sigma_text, align="L")
 
             self.pdf.set_xy(MARGIN, self.pdf.get_y() + CELL_HEIGHT)
 
@@ -1017,7 +1063,8 @@ class Report:
         ]
         if matchgraph:
             self._make_centered_image(
-                os.path.join(self.output_path, matchgraph[0]), matchgraph_height
+                os.path.join(self.output_path,
+                             matchgraph[0]), matchgraph_height
             )
 
         histogram = self.stats["reconstruction_statistics"]["histogram_track_length"]

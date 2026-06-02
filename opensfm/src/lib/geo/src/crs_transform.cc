@@ -113,9 +113,9 @@ CrsTransform::CrsTransform(const std::string& projString)
     return;
   }
 
-  // Create a transformation pipeline: source CRS → WGS-84 (lat/lon).
+  // Create a transformation pipeline: source CRS → WGS-84 (lat/lon/alt).
   m_impl->transform = proj_create_crs_to_crs(m_impl->ctx, projString.c_str(),
-                                             "EPSG:4326", nullptr);
+                                             "EPSG:4979", nullptr);
   if (!m_impl->transform) {
     return;
   }
@@ -139,12 +139,13 @@ bool CrsTransform::isValid() const {
   return m_impl->identity || m_impl->transform != nullptr;
 }
 
-bool CrsTransform::transform(double easting, double northing, double& lat,
-                             double& lon) const {
+bool CrsTransform::transform(double easting, double northing, double alt,
+                             double& lat, double& lon, double& out_alt) const {
   if (m_impl->identity) {
     // WGS-84 input: easting = longitude, northing = latitude.
     lon = easting;
     lat = northing;
+    out_alt = alt;
     return true;
   }
 
@@ -152,7 +153,7 @@ bool CrsTransform::transform(double easting, double northing, double& lat,
     return false;
   }
 
-  PJ_COORD input = proj_coord(easting, northing, 0, 0);
+  PJ_COORD input = proj_coord(easting, northing, alt, 0);
   PJ_COORD output = proj_trans(m_impl->transform, PJ_FWD, input);
 
   if (output.xyzt.x == HUGE_VAL) {
@@ -162,15 +163,18 @@ bool CrsTransform::transform(double easting, double northing, double& lat,
   // After normalize_for_visualization: x=lon, y=lat.
   lon = output.xy.x;
   lat = output.xy.y;
+  out_alt = output.xyz.z;
   return true;
 }
 
-bool CrsTransform::inverseTransform(double lat, double lon, double& easting,
-                                    double& northing) const {
+bool CrsTransform::inverseTransform(double lat, double lon, double alt,
+                                    double& easting, double& northing,
+                                    double& out_alt) const {
   if (m_impl->identity) {
     // WGS-84: easting = longitude, northing = latitude.
     easting = lon;
     northing = lat;
+    out_alt = alt;
     return true;
   }
 
@@ -179,16 +183,17 @@ bool CrsTransform::inverseTransform(double lat, double lon, double& easting,
   }
 
   // After normalize_for_visualization the forward direction uses
-  // x=lon, y=lat ordering, so the inverse input is (lon, lat).
-  PJ_COORD input = proj_coord(lon, lat, 0, 0);
+  // x=lon, y=lat ordering, so the inverse input is (lon, lat, alt).
+  PJ_COORD input = proj_coord(lon, lat, alt, 0);
   PJ_COORD output = proj_trans(m_impl->transform, PJ_INV, input);
 
   if (output.xyzt.x == HUGE_VAL) {
     return false;
   }
 
-  easting = output.xy.x;
-  northing = output.xy.y;
+  easting = output.xyz.x;
+  northing = output.xyz.y;
+  out_alt = output.xyz.z;
   return true;
 }
 

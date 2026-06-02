@@ -42,15 +42,15 @@ class CrsTransform {
   /// Returns true if the transform was successfully created.
   bool isValid() const;
 
-  /// Transform (easting, northing) → (latitude, longitude).
+  /// Transform (easting, northing, altitude) → (latitude, longitude, altitude).
   /// Returns false on failure.
-  bool transform(double easting, double northing, double& lat,
-                 double& lon) const;
+  bool transform(double easting, double northing, double alt, double& lat,
+                 double& lon, double& out_alt) const;
 
-  /// Inverse transform: (latitude, longitude) → (easting, northing).
-  /// Returns false on failure.
-  bool inverseTransform(double lat, double lon, double& easting,
-                        double& northing) const;
+  /// Inverse transform: (latitude, longitude, altitude) → (easting, northing,
+  /// altitude). Returns false on failure.
+  bool inverseTransform(double lat, double lon, double alt, double& easting,
+                        double& northing, double& out_alt) const;
 
  private:
   struct Impl;
