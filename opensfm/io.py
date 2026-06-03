@@ -885,6 +885,24 @@ def read_gcp_list(
     return pymap.read_gcp_list(content, image_widths, cdn_enabled, grid_cache_dir)
 
 
+def write_gcp_list(
+    gcp: List[pymap.GroundControlPoint],
+    fileobj: IO[str],
+    crs: str,
+    exif: Dict[str, Any],
+    cdn_enabled: bool = False,
+    grid_cache_dir: str = "",
+) -> None:
+    """Write ground control points to a gcp_list.txt file."""
+    image_widths: Dict[str, Tuple[int, int]] = {}
+    for shot_id, exif_data in exif.items():
+        image_widths[shot_id] = (exif_data["width"], exif_data["height"])
+
+    content = pymap.write_gcp_list(
+        gcp, crs, image_widths, cdn_enabled, grid_cache_dir)
+    fileobj.write(content)
+
+
 def read_ground_control_points(
     fileobj: IO[str], cdn_enabled: bool = False, grid_cache_dir: str = ""
 ) -> Tuple[List[pymap.GroundControlPoint], str]:
