@@ -3,8 +3,11 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
+#include <iostream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace geo {
 
@@ -100,7 +103,8 @@ struct CrsTransform::Impl {
   }
 };
 
-CrsTransform::CrsTransform(const std::string& projString)
+CrsTransform::CrsTransform(const std::string& projString, bool cdnEnabled,
+                           const std::string& gridCacheDir)
     : m_impl(std::make_unique<Impl>()) {
   if (projString.empty()) {
     m_impl->identity = true;
@@ -113,9 +117,40 @@ CrsTransform::CrsTransform(const std::string& projString)
     return;
   }
 
+  if (cdnEnabled) {
+    proj_context_set_enable_network(m_impl->ctx, 1);
+  } else {
+    proj_context_set_enable_network(m_impl->ctx, 0);
+  }
+
+  if (!gridCacheDir.empty()) {
+    // Set search paths:
+    std::vector<std::string> searchPaths;
+    searchPaths.push_back(gridCacheDir);
+    const char* proj_data = std::getenv("PROJ_DATA");
+    if (!proj_data) {
+      proj_data = std::getenv("PROJ_LIB");
+    }
+    if (proj_data) {
+      searchPaths.push_back(proj_data);
+    }
+    std::vector<const char*> c_paths;
+    for (const auto& p : searchPaths) {
+      c_paths.push_back(p.c_str());
+    }
+    proj_context_set_search_paths(m_impl->ctx, static_cast<int>(c_paths.size()),
+                                  c_paths.data());
+
+    // Also set grid cache filename to be in this directory
+    std::string cacheDbPath = gridCacheDir + "/cache.db";
+    proj_grid_cache_set_enable(m_impl->ctx, 1);
+    proj_grid_cache_set_filename(m_impl->ctx, cacheDbPath.c_str());
+  }
+
   // Create a transformation pipeline: source CRS → WGS-84 (lat/lon/alt).
   m_impl->transform = proj_create_crs_to_crs(m_impl->ctx, projString.c_str(),
                                              "EPSG:4979", nullptr);
+
   if (!m_impl->transform) {
     return;
   }

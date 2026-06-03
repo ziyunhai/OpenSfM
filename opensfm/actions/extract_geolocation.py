@@ -32,8 +32,13 @@ def run_dataset(data: DataSetBase, geotag_file: str, crs: str = "WGS84") -> None
         content = f.read()
 
     images = data.images()
+
     # Call the C++ parser
-    parsed_items = pymap.parse_geolocation_file(content, images, crs)
+    proj_cdn_enabled = data.config["proj_cdn_enabled"]
+    proj_grid_cache_dir = data.config["proj_grid_cache_dir"]
+    parsed_items = pymap.parse_geolocation_file(
+        content, images, crs, proj_cdn_enabled, proj_grid_cache_dir
+    )
     if not parsed_items:
         logger.warning("No matches or geolocations found in the geotag file.")
         return
@@ -46,17 +51,19 @@ def run_dataset(data: DataSetBase, geotag_file: str, crs: str = "WGS84") -> None
     for item in parsed_items:
         image = item.filename
         if image not in exif_overrides:
-            exif_overrides[image] = {}
+            exif_overrides[image] = {"gps": {}}
+        elif "gps" not in exif_overrides[image]:
+            exif_overrides[image]["gps"] = {}
 
         if item.has_lla:
-            exif_overrides[image]["latitude"] = item.lat
-            exif_overrides[image]["longitude"] = item.lon
-            exif_overrides[image]["altitude"] = item.alt
+            exif_overrides[image]["gps"]["latitude"] = item.lat
+            exif_overrides[image]["gps"]["longitude"] = item.lon
+            exif_overrides[image]["gps"]["altitude"] = item.alt
 
         if item.has_std:
-            exif_overrides[image]["latitude_std"] = item.lat_std
-            exif_overrides[image]["longitude_std"] = item.lon_std
-            exif_overrides[image]["altitude_std"] = item.alt_std
+            exif_overrides[image]["gps"]["latitude_std"] = item.lat_std
+            exif_overrides[image]["gps"]["longitude_std"] = item.lon_std
+            exif_overrides[image]["gps"]["altitude_std"] = item.alt_std
 
         if item.has_ypr and item.has_lla:
             opk = opk_from_ypr(

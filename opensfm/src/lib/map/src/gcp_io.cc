@@ -70,7 +70,9 @@ static std::string jsonEscape(const std::string& s) {
 // ── ReadGcpJson ──────────────────────────────────────────────────────────────
 
 std::vector<GroundControlPoint> ReadGcpJson(const std::string& content,
-                                            std::string* crsName) {
+                                            std::string* crsName,
+                                            bool cdnEnabled,
+                                            const std::string& gridCacheDir) {
   simdjson::ondemand::parser parser;
   simdjson::padded_string padded(content);
   simdjson::ondemand::document doc;
@@ -88,7 +90,7 @@ std::vector<GroundControlPoint> ReadGcpJson(const std::string& content,
   }
 
   std::string projString = geo::ParseGcpProjectionString(crsStr);
-  geo::CrsTransform ct(projString);
+  geo::CrsTransform ct(projString, cdnEnabled, gridCacheDir);
 
   simdjson::ondemand::array points;
   if (doc["points"].get_array().get(points) != simdjson::SUCCESS) {
@@ -220,7 +222,8 @@ std::vector<GroundControlPoint> ReadGcpJson(const std::string& content,
 // ── WriteGcpJson ─────────────────────────────────────────────────────────────
 
 std::string WriteGcpJson(const std::vector<GroundControlPoint>& gcps,
-                         const std::string& crsName) {
+                         const std::string& crsName, bool cdnEnabled,
+                         const std::string& gridCacheDir) {
   std::ostringstream out;
   out << std::setprecision(kPrecision);
   out << "{\n";
@@ -229,7 +232,8 @@ std::string WriteGcpJson(const std::vector<GroundControlPoint>& gcps,
   }
   out << "  \"points\": [\n";
 
-  geo::CrsTransform ct(geo::ParseGcpProjectionString(crsName));
+  geo::CrsTransform ct(geo::ParseGcpProjectionString(crsName), cdnEnabled,
+                       gridCacheDir);
 
   for (size_t i = 0; i < gcps.size(); ++i) {
     const auto& gcp = gcps[i];
@@ -305,7 +309,7 @@ std::string WriteGcpJson(const std::vector<GroundControlPoint>& gcps,
 std::vector<GroundControlPoint> ReadGcpList(
     const std::string& content,
     const std::unordered_map<std::string, std::pair<int, int>>& imageWidths,
-    std::string* crsName) {
+    std::string* crsName, bool cdnEnabled, const std::string& gridCacheDir) {
   // Split content into lines and filter valid ones.
   std::vector<std::string> validLines;
   {
@@ -330,7 +334,7 @@ std::vector<GroundControlPoint> ReadGcpList(
 
   // Build CRS transform (identity for WGS-84, PROJ-based otherwise).
   std::string projString = geo::ParseGcpProjectionString(crs);
-  geo::CrsTransform ct(projString);
+  geo::CrsTransform ct(projString, cdnEnabled, gridCacheDir);
 
   // Parse data lines (starting from index 1).
   // Key: GCP name when provided, otherwise encoded coordinates.
@@ -428,11 +432,12 @@ std::vector<GroundControlPoint> ReadGcpList(
 
 std::string WriteGcpList(
     const std::vector<GroundControlPoint>& gcps, const std::string& crs,
-    const std::unordered_map<std::string, std::pair<int, int>>& imageWidths) {
+    const std::unordered_map<std::string, std::pair<int, int>>& imageWidths,
+    bool cdnEnabled, const std::string& gridCacheDir) {
   std::ostringstream out;
   out << std::setprecision(kPrecision);
 
-  geo::CrsTransform ct(crs);
+  geo::CrsTransform ct(crs, cdnEnabled, gridCacheDir);
 
   // Header line: CRS
   out << (crs.empty() ? "WGS84" : crs) << "\n";

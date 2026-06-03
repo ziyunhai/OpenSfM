@@ -35,6 +35,21 @@ struct NumberToken {
   size_t original_index;
 };
 
+struct StdCandidate {
+  size_t start_idx;
+  size_t len;
+  double lat_std;
+  double lon_std;
+  double alt_std;
+};
+
+struct YprCandidate {
+  size_t start_idx;
+  double yaw;
+  double pitch;
+  double roll;
+};
+
 static bool parseDouble(const std::string& token, double& val) {
   try {
     size_t pos;
@@ -108,14 +123,14 @@ static bool tryXyz(const std::vector<NumberToken>& list, size_t start_idx,
 
 std::vector<GeolocationData> ParseGeolocationFile(
     const std::string& content, const std::vector<std::string>& dataset_images,
-    const std::string& crs) {
+    const std::string& crs, bool cdnEnabled, const std::string& gridCacheDir) {
   std::vector<GeolocationData> parsed_data;
 
   std::unordered_set<std::string> valid_images(dataset_images.begin(),
                                                dataset_images.end());
 
   std::string proj = geo::ParseGcpProjectionString(crs);
-  geo::CrsTransform transform(proj);
+  geo::CrsTransform transform(proj, cdnEnabled, gridCacheDir);
 
   char chosen_delim = '\0';
   for (char delim : {',', '\t', ' '}) {
@@ -232,11 +247,7 @@ std::vector<GeolocationData> ParseGeolocationFile(
       remaining.push_back(num_tokens[i]);
     }
 
-    // 1. Look for std (pair or triplet smaller than 0.5)
-    bool std_found = false;
-    size_t std_start_idx = std::string::npos;
-    size_t std_len = 0;
-
+    std::vector<StdCandidate> std_candidates;
     // Try triplet first
     if (remaining.size() >= 3) {
       for (size_t i = 0; i + 2 < remaining.size(); ++i) {
@@ -244,56 +255,81 @@ std::vector<GeolocationData> ParseGeolocationFile(
           if (std::abs(remaining[i].value) < 0.5 &&
               std::abs(remaining[i + 1].value) < 0.5 &&
               std::abs(remaining[i + 2].value) < 0.5) {
-            data.lat_std = std::abs(remaining[i].value);
-            data.lon_std = std::abs(remaining[i + 1].value);
-            data.alt_std = std::abs(remaining[i + 2].value);
-            data.has_std = true;
-            std_found = true;
-            std_start_idx = i;
-            std_len = 3;
-            break;
+            std_candidates.push_back({i, 3, std::abs(remaining[i].value),
+                                      std::abs(remaining[i + 1].value),
+                                      std::abs(remaining[i + 2].value)});
           }
         }
       }
     }
 
     // Try pair next
-    if (!std_found && remaining.size() >= 2) {
+    if (remaining.size() >= 2) {
       for (size_t i = 0; i + 1 < remaining.size(); ++i) {
         if (areConsecutive(remaining, i, 2, filename_idx)) {
           if (std::abs(remaining[i].value) < 0.5 &&
               std::abs(remaining[i + 1].value) < 0.5) {
-            data.lat_std = std::abs(remaining[i].value);
-            data.lon_std = std::abs(remaining[i].value);
-            data.alt_std = std::abs(remaining[i + 1].value);
-            data.has_std = true;
-            std_found = true;
-            std_start_idx = i;
-            std_len = 2;
-            break;
+            std_candidates.push_back({i, 2, std::abs(remaining[i].value),
+                                      std::abs(remaining[i].value),
+                                      std::abs(remaining[i + 1].value)});
           }
         }
       }
     }
 
-    std::vector<NumberToken> final_remaining;
-    for (size_t i = 0; i < remaining.size(); ++i) {
-      if (std_found && i >= std_start_idx && i < std_start_idx + std_len) {
-        continue;
+    std::vector<YprCandidate> ypr_candidates;
+    if (remaining.size() >= 3) {
+      for (size_t i = 0; i + 2 < remaining.size(); ++i) {
+        if (areConsecutive(remaining, i, 3, filename_idx)) {
+          ypr_candidates.push_back({i, remaining[i].value,
+                                    remaining[i + 1].value,
+                                    remaining[i + 2].value});
+        }
       }
-      final_remaining.push_back(remaining[i]);
     }
 
-    // 2. Look for YPR triplet
-    if (final_remaining.size() >= 3) {
-      for (size_t i = 0; i + 2 < final_remaining.size(); ++i) {
-        if (areConsecutive(final_remaining, i, 3, filename_idx)) {
-          data.yaw = final_remaining[i].value;
-          data.pitch = final_remaining[i + 1].value;
-          data.roll = final_remaining[i + 2].value;
-          data.has_ypr = true;
+    bool pair_found = false;
+    StdCandidate best_std;
+    YprCandidate best_ypr;
+
+    for (const auto& sc : std_candidates) {
+      for (const auto& yc : ypr_candidates) {
+        if (sc.start_idx + sc.len <= yc.start_idx ||
+            yc.start_idx + 3 <= sc.start_idx) {
+          best_std = sc;
+          best_ypr = yc;
+          pair_found = true;
           break;
         }
+      }
+      if (pair_found) {
+        break;
+      }
+    }
+
+    if (pair_found) {
+      data.lat_std = best_std.lat_std;
+      data.lon_std = best_std.lon_std;
+      data.alt_std = best_std.alt_std;
+      data.has_std = true;
+
+      data.yaw = best_ypr.yaw;
+      data.pitch = best_ypr.pitch;
+      data.roll = best_ypr.roll;
+      data.has_ypr = true;
+    } else {
+      if (!std_candidates.empty()) {
+        const auto& sc = std_candidates.front();
+        data.lat_std = sc.lat_std;
+        data.lon_std = sc.lon_std;
+        data.alt_std = sc.alt_std;
+        data.has_std = true;
+      } else if (!ypr_candidates.empty()) {
+        const auto& yc = ypr_candidates.front();
+        data.yaw = yc.yaw;
+        data.pitch = yc.pitch;
+        data.roll = yc.roll;
+        data.has_ypr = true;
       }
     }
 

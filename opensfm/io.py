@@ -869,7 +869,7 @@ def _valid_gcp_line(line: str) -> bool:
 
 
 def read_gcp_list(
-    fileobj: IO[str], exif: Dict[str, Any]
+    fileobj: IO[str], exif: Dict[str, Any], cdn_enabled: bool = False, grid_cache_dir: str = ""
 ) -> List[pymap.GroundControlPoint]:
     """Read ground control points from a gcp_list.txt file.
 
@@ -882,22 +882,26 @@ def read_gcp_list(
     for shot_id, exif_data in exif.items():
         image_widths[shot_id] = (exif_data["width"], exif_data["height"])
 
-    return pymap.read_gcp_list(content, image_widths)
+    return pymap.read_gcp_list(content, image_widths, cdn_enabled, grid_cache_dir)
 
 
-def read_ground_control_points(fileobj: IO[str]) -> Tuple[List[pymap.GroundControlPoint], str]:
+def read_ground_control_points(
+    fileobj: IO[str], cdn_enabled: bool = False, grid_cache_dir: str = ""
+) -> Tuple[List[pymap.GroundControlPoint], str]:
     """Read ground control points from json file"""
     content = fileobj.read()
-    return pymap.read_gcp_json(content)
+    return pymap.read_gcp_json(content, cdn_enabled, grid_cache_dir)
 
 
 def write_ground_control_points(
     gcp: List[pymap.GroundControlPoint],
     fileobj: IO[str],
     crs: str = "",
+    cdn_enabled: bool = False,
+    grid_cache_dir: str = "",
 ) -> None:
     """Write ground control points to json file."""
-    content = pymap.write_gcp_json(gcp, crs)
+    content = pymap.write_gcp_json(gcp, crs, cdn_enabled, grid_cache_dir)
     fileobj.write(content)
 
 

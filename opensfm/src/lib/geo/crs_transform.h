@@ -28,7 +28,8 @@ class CrsTransform {
  public:
   /// Create a transform from the given CRS definition to WGS-84.
   /// If projString is empty, creates an identity (no-op) transform.
-  explicit CrsTransform(const std::string& projString);
+  explicit CrsTransform(const std::string& projString, bool cdnEnabled = false,
+                        const std::string& gridCacheDir = "");
   ~CrsTransform();
 
   CrsTransform(const CrsTransform&) = delete;

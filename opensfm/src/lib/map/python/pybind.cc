@@ -718,26 +718,37 @@ PYBIND11_MODULE(pymap, m) {
   // ── GCP I/O functions ──────────────────────────────────────────────────
   m.def(
       "read_gcp_json",
-      [](const std::string& content) {
+      [](const std::string& content, bool cdnEnabled,
+         const std::string& gridCacheDir) {
         std::string crsName;
-        auto gcps = map::ReadGcpJson(content, &crsName);
+        auto gcps =
+            map::ReadGcpJson(content, &crsName, cdnEnabled, gridCacheDir);
         return py::make_tuple(gcps, crsName);
       },
-      py::arg("content"),
+      py::arg("content"), py::arg("cdn_enabled") = false,
+      py::arg("grid_cache_dir") = "",
       "Read ground control points from a JSON string.\n"
       "Returns a tuple (points_list, crs_string).");
   m.def("write_gcp_json", &map::WriteGcpJson, py::arg("gcps"),
-        py::arg("crs_name") = "",
+        py::arg("crs_name") = "", py::arg("cdn_enabled") = false,
+        py::arg("grid_cache_dir") = "",
         "Write ground control points to a JSON string.");
   m.def(
       "read_gcp_list",
       [](const std::string& content,
          const std::unordered_map<std::string, std::pair<int, int>>&
-             imageWidths) {
-        return map::ReadGcpList(content, imageWidths, nullptr);
+             imageWidths,
+         bool cdnEnabled, const std::string& gridCacheDir) {
+        return map::ReadGcpList(content, imageWidths, nullptr, cdnEnabled,
+                                gridCacheDir);
       },
       py::arg("content"), py::arg("image_widths"),
+      py::arg("cdn_enabled") = false, py::arg("grid_cache_dir") = "",
       "Read ground control points from a gcp_list.txt string.");
+  m.def("write_gcp_list", &map::WriteGcpList, py::arg("gcps"), py::arg("crs"),
+        py::arg("image_widths"), py::arg("cdn_enabled") = false,
+        py::arg("grid_cache_dir") = "",
+        "Write ground control points to a gcp_list.txt string.");
 
   py::class_<map::GeolocationData>(m, "GeolocationData")
       .def(py::init<>())
@@ -756,11 +767,9 @@ PYBIND11_MODULE(pymap, m) {
       .def_readwrite("roll", &map::GeolocationData::roll);
 
   m.def("parse_geolocation_file", &map::ParseGeolocationFile,
-        py::arg("content"), py::arg("dataset_images"), py::arg("crs"));
+        py::arg("content"), py::arg("dataset_images"), py::arg("crs"),
+        py::arg("cdn_enabled") = false, py::arg("grid_cache_dir") = "");
 
-  m.def("write_gcp_list", &map::WriteGcpList, py::arg("gcps"), py::arg("crs"),
-        py::arg("image_widths"),
-        "Write ground control points to a gcp_list.txt string.");
   m.def(
       "parse_gcp_projection_string",
       [](const std::string& line) -> std::optional<std::string> {

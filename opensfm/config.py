@@ -21,6 +21,10 @@ class OpenSfMConfig:
     default_projection_type: str = "perspective"
     # Default focal length to sensor size ratio to use when it cannot be inferred from EXIF metadata
     default_focal_prior: float = 0.85
+    # Enable downloading missing datum grids from the PROJ CDN
+    proj_cdn_enabled: bool = True
+    # Additional specific folder to load/store the geoid files and grids
+    proj_grid_cache_dir: str = ""
 
     ##################################
     # Params for features
