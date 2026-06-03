@@ -112,7 +112,6 @@ def nicify_crs(crs_string: str) -> Tuple[str, str]:
                 return str(horiz), str(vert)
 
         horiz = pyproj_crs.name if pyproj_crs.name != "unknown" else crs_string
-        vert = "WGS 84 Ellipsoid"
 
         if pyproj_crs.is_compound:
             horiz = pyproj_crs.sub_crs_list[0].name
