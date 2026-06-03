@@ -109,7 +109,7 @@ TEST(BundleAdjusterAPI, ReturnsExpectedCountsAndGeometry) {
       ba.GetPoint("gcp0").GetValue().isApprox(scene.gcp_point, kTolerance));
 
   auto* shot = ba.GetShotRaw("shot0");
-  ASSERT_NE(shot, nullptr);
+  ASSERT_TRUE(shot != nullptr) << "GetShotRaw('shot0') returned null pointer";
   EXPECT_EQ(shot->GetCamera()->GetID(), "cam0");
   EXPECT_EQ(shot->GetRigCamera()->GetID(), "RC0");
   EXPECT_EQ(shot->GetRigInstance()->GetID(), "rig0");
@@ -131,7 +131,7 @@ TEST(BundleAdjusterAPI, ReconstructionScaleSharingMatchesOwnershipMode) {
   EXPECT_DOUBLE_EQ(shared.GetScale("rig1"), 2.0);
 
   auto* shared_scale = shared.GetScalePtr("rig0");
-  ASSERT_NE(shared_scale, nullptr);
+  ASSERT_TRUE(shared_scale != nullptr) << "GetScalePtr('rig0') returned null pointer";
   *shared_scale = 4.0;
   EXPECT_DOUBLE_EQ(shared.GetScale("rig0"), 4.0);
   EXPECT_DOUBLE_EQ(shared.GetScale("rig1"), 4.0);
@@ -225,7 +225,7 @@ TEST(BundleAdjusterAPI, HasPointAndGetPointRaw) {
   EXPECT_FALSE(ba.HasPoint("nonexistent"));
 
   auto* raw = ba.GetPointRaw("pt0");
-  ASSERT_NE(raw, nullptr);
+  ASSERT_TRUE(raw != nullptr) << "GetPointRaw('pt0') returned null pointer";
   EXPECT_TRUE(raw->GetValue().isApprox(Vec3d(0, 0, 5), kTolerance));
 }
 
