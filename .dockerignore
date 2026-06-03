@@ -13,6 +13,7 @@
 !opensfm
 !pyproject.toml
 !conda.yml
+!conda-*.lock
 !README.md
 !setup.cfg
 !setup.py
