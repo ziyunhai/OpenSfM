@@ -1,6 +1,6 @@
 # pyre-strict
 import logging
-from typing import Any, Dict, List, overload, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, overload, Sequence, Tuple, Union
 
 import numpy as np
 import pyproj
@@ -419,6 +419,70 @@ class TopocentricConverter:
 
     def __eq__(self, o: "TopocentricConverter") -> bool:
         return np.allclose([self.lat, self.lon, self.alt], (o.lat, o.lon, o.alt))
+
+
+def opk_from_ypr(
+    lat: float,
+    lon: float,
+    alt: float,
+    yaw: float,
+    pitch: float,
+    roll: float,
+    apply_pitch_offset: bool = False,
+    tc: Optional[TopocentricConverter] = None,
+) -> Optional[Dict[str, float]]:
+    """Convert Yaw, Pitch, Roll to Omega, Phi, Kappa."""
+    if tc is None:
+        tc = TopocentricConverter(lat, lon, alt)
+    y, p, r = np.radians([yaw, pitch, roll])
+
+    # YPR rotation matrix
+    cnb = np.array(
+        [
+            [
+                np.cos(y) * np.cos(p),
+                np.cos(y) * np.sin(p) * np.sin(r) - np.sin(y) * np.cos(r),
+                np.cos(y) * np.sin(p) * np.cos(r) + np.sin(y) * np.sin(r),
+            ],
+            [
+                np.sin(y) * np.cos(p),
+                np.sin(y) * np.sin(p) * np.sin(r) + np.cos(y) * np.cos(r),
+                np.sin(y) * np.sin(p) * np.cos(r) - np.cos(y) * np.sin(r),
+            ],
+            [-np.sin(p), np.cos(p) * np.sin(r), np.cos(p) * np.cos(r)],
+        ]
+    )
+
+    if apply_pitch_offset:
+        cnb = cnb.dot(np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]]))
+
+    # Convert between image and body coordinates
+    cbb = np.array([[0, 1, 0], [1, 0, 0], [0, 0, -1]])
+
+    delta = 1e-10
+    p1 = np.array(tc.to_topocentric(lat + delta, lon, alt))
+    p2 = np.array(tc.to_topocentric(lat - delta, lon, alt))
+    xnp = p1 - p2
+    m = np.linalg.norm(xnp)
+
+    if m == 0:
+        return None
+
+    # Unit vector pointing north
+    xnp /= m
+
+    znp = np.array([0, 0, -1]).T
+    ynp = np.cross(znp, xnp)
+    cen = np.array([xnp, ynp, znp]).T
+
+    # OPK rotation matrix
+    ceb = cen.dot(cnb).dot(cbb)
+
+    return {
+        "omega": float(np.degrees(np.arctan2(-ceb[1][2], ceb[2][2]))),
+        "phi": float(np.degrees(np.arcsin(ceb[0][2]))),
+        "kappa": float(np.degrees(np.arctan2(-ceb[0][1], ceb[0][0]))),
+    }
 
 
 def construct_proj_transformer(proj_str: str, inverse: bool = False) -> pyproj.Transformer:

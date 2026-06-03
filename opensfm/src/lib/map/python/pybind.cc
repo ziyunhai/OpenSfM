@@ -7,6 +7,7 @@
 #include <map/dataviews.h>
 #include <map/defines.h>
 #include <map/gcp_io.h>
+#include <map/geo_io.h>
 #include <map/ground_control_points.h>
 #include <map/landmark.h>
 #include <map/map.h>
@@ -737,6 +738,26 @@ PYBIND11_MODULE(pymap, m) {
       },
       py::arg("content"), py::arg("image_widths"),
       "Read ground control points from a gcp_list.txt string.");
+
+  py::class_<map::GeolocationData>(m, "GeolocationData")
+      .def(py::init<>())
+      .def_readwrite("filename", &map::GeolocationData::filename)
+      .def_readwrite("has_lla", &map::GeolocationData::has_lla)
+      .def_readwrite("lat", &map::GeolocationData::lat)
+      .def_readwrite("lon", &map::GeolocationData::lon)
+      .def_readwrite("alt", &map::GeolocationData::alt)
+      .def_readwrite("has_std", &map::GeolocationData::has_std)
+      .def_readwrite("lat_std", &map::GeolocationData::lat_std)
+      .def_readwrite("lon_std", &map::GeolocationData::lon_std)
+      .def_readwrite("alt_std", &map::GeolocationData::alt_std)
+      .def_readwrite("has_ypr", &map::GeolocationData::has_ypr)
+      .def_readwrite("yaw", &map::GeolocationData::yaw)
+      .def_readwrite("pitch", &map::GeolocationData::pitch)
+      .def_readwrite("roll", &map::GeolocationData::roll);
+
+  m.def("parse_geolocation_file", &map::ParseGeolocationFile,
+        py::arg("content"), py::arg("dataset_images"), py::arg("crs"));
+
   m.def("write_gcp_list", &map::WriteGcpList, py::arg("gcps"), py::arg("crs"),
         py::arg("image_widths"),
         "Write ground control points to a gcp_list.txt string.");

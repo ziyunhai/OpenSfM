@@ -5,6 +5,7 @@ set(MAP_FILES
   map.h
   ground_control_points.h
   gcp_io.h
+  geo_io.h
   defines.h
   dataviews.h
   observation.h
@@ -17,6 +18,7 @@ set(MAP_FILES
   src/observation.cc
   src/tracks_manager.cc
   src/gcp_io.cc
+  src/geo_io.cc
 )
 
 add_library(map ${MAP_FILES})
@@ -54,6 +56,7 @@ if (OPENSFM_BUILD_TESTS)
         test/rig_test.cc
         test/tracks_manager_test.cc
         test/gcp_io_test.cc
+        test/geo_io_test.cc
     )
 
     add_executable(map_test ${MAP_TEST_FILES})

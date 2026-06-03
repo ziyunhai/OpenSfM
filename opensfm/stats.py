@@ -86,7 +86,8 @@ def _gps_gcp_opk_errors_stats(errors: Optional[NDArray], names: List[str]) -> Di
     average = np.average(np.linalg.norm(errors, axis=1))
 
     stats["mean"] = {names[0]: mean[0], names[1]: mean[1], names[2]: mean[2]}
-    stats["std"] = {names[0]: std_dev[0], names[1]: std_dev[1], names[2]: std_dev[2]}
+    stats["std"] = {names[0]: std_dev[0], names[1]
+        : std_dev[1], names[2]: std_dev[2]}
     stats["error"] = {
         names[0]: math.sqrt(m_squared[0]),
         names[1]: math.sqrt(m_squared[1]),
@@ -1597,8 +1598,13 @@ def save_overlap_map(
 
     # Compute world extent
     all_pts = np.vstack(footprints)
-    min_x, min_y = all_pts[:, 0].min(), all_pts[:, 1].min()
-    max_x, max_y = all_pts[:, 0].max(), all_pts[:, 1].max()
+    all_x = all_pts[:, 0]
+    all_y = all_pts[:, 1]
+    ratio_robust = 0.02
+    min_x, min_y = np.percentile(
+        all_x, ratio_robust * 100), np.percentile(all_y, ratio_robust * 100)
+    max_x, max_y = np.percentile(
+        all_x, (1 - ratio_robust) * 100), np.percentile(all_y, (1 - ratio_robust) * 100)
     extent_x = max_x - min_x
     extent_y = max_y - min_y
     if extent_x < 1e-6 or extent_y < 1e-6:
