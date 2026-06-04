@@ -1,9 +1,13 @@
 #include <gtest/gtest.h>
 #include <pointcloud/tile_io.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <random>
 #include <string>
+#include <system_error>
+#include <iostream>
 
 namespace {
 
@@ -12,14 +16,38 @@ namespace fs = std::filesystem;
 class TileIOFixture : public ::testing::Test {
  protected:
   void SetUp() override {
-    // Create a unique temp directory.
-    tmp_dir = fs::temp_directory_path() / "pointcloud_test_XXXXXX";
-    tmp_dir = fs::path(mkdtemp(const_cast<char*>(tmp_dir.string().c_str())));
+    for (int i = 0; i < 3; ++i) {
+      tmp_dir = CreateUniqueTempDir();
+      if (!tmp_dir.empty()) {
+        return; // Success, exit SetUp
+      }
+      std::cerr << "[ WARNING  ] Attempt " << (i + 1) << " to create temp dir failed.\n";
+    }
+    FAIL() << "Failed to create temp directory after 3 attempts.";
   }
 
-  void TearDown() override { fs::remove_all(tmp_dir); }
+  void TearDown() override { 
+    std::error_code ec; 
+    // NOTE: providing error prevents remove_all to throw exceptions.
+    fs::remove_all(tmp_dir, ec); 
+    if (ec) {
+      std::cerr << "[ WARNING  ] Failed to clean up temp dir: " << ec.message() << '\n';
+    }
+  }
 
   fs::path tmp_dir;
+
+ private:
+  fs::path CreateUniqueTempDir() {
+    std::random_device rd;
+    // Use 64-bit engine for massive collision space
+    std::mt19937_64 gen(rd() ^ std::chrono::system_clock::now().time_since_epoch().count());
+    
+    std::string dir_name = "pointcloud_test_" + std::to_string(gen());
+    fs::path dir = fs::temp_directory_path() / dir_name;
+    
+    return fs::create_directory(dir) ? dir : fs::path{};
+  }
 };
 
 // ============================================================================
