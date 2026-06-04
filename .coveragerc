@@ -1,0 +1,18 @@
+[run]
+data_file = coverage_data/.coverage
+branch = True
+relative_files = True
+source =
+    opensfm
+omit =
+    opensfm/test/*
+
+[report]
+omit =
+    opensfm/test/*
+
+[xml]
+output = coverage_data/coverage-python.xml
+
+[html]
+directory = coverage_data/htmlcov

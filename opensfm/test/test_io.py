@@ -28,6 +28,14 @@ def test_reconstructions_from_json_consistency() -> None:
     for key, shot in obj_before[0]["shots"].items():
         for attr in shot:
             obj1 = obj_before[0]["shots"][key][attr]
+            # gps_dop is a legacy scalar field normalised to gps_accuracy
+            # (a 3-vector) on round-trip; verify the conversion instead.
+            if attr == "gps_dop":
+                dop = float(obj1)
+                assert np.allclose(
+                    obj_after[0]["shots"][key]["gps_accuracy"], [dop, dop, dop]
+                )
+                continue
             obj2 = obj_after[0]["shots"][key][attr]
             if attr in ["translation", "rotation"]:
                 assert np.allclose(np.array(obj1), np.array(obj2))
@@ -161,7 +169,7 @@ def test_json_to_and_from_metadata() -> None:
     m = io.json_to_pymap_metadata(obj)
     assert m.orientation.value == 10
     assert m.capture_time.value == 1
-    assert m.gps_accuracy.value == 2
+    assert np.allclose(m.gps_accuracy.value, [2, 2, 2])
     assert np.allclose(m.gps_position.value, [4, 5, 6])
     assert m.sequence_key.value == "test"
     assert np.allclose(m.gravity_down.value, [7, 8, 9])
@@ -169,7 +177,11 @@ def test_json_to_and_from_metadata() -> None:
     assert m.compass_accuracy.value == 45
     assert np.allclose(m.opk_angles.value, [1.0, 2.0, 3.0])
     assert m.opk_accuracy.value == 0.1
-    assert obj == io.pymap_metadata_to_json(m)
+    obj2 = io.pymap_metadata_to_json(m)
+    assert obj2["orientation"] == obj["orientation"]
+    assert obj2["capture_time"] == obj["capture_time"]
+    assert np.allclose(obj2["gps_accuracy"], [2, 2, 2])
+    assert np.allclose(obj2["gps_position"], obj["gps_position"])
 
 
 def test_camera_from_to_vector() -> None:

@@ -18,9 +18,12 @@ dependencies = [
     "exifread>=2.1.2",
     "flask>=2.3.2",
     "fpdf2>=2.4.6",
+    "igraph>=1.0.0",
     "joblib>=1.0.0",
+    "lz4>=4.4.5",
     "matplotlib",
     "networkx>=2.5",
+    "leidenalg>=0.11.0",
     "numpy>=1.19",
     "Pillow>=8.1.1",
     "pyproj>=1.9.5.1",
@@ -37,12 +40,10 @@ dev = [
     "pytest>=7.0.0",
     "wheel",
 ]
-docs = [
-    "Sphinx>=4.2.0",
-    "sphinx_rtd_theme>=1.0.0",
-]
 test = [
+    "gcovr>=8.0",
     "pytest>=7.0.0",
+    "pytest-cov>=5.0.0",
 ]
 
 # Note: The original bin/opensfm and bin/opensfm_run_all are bash scripts
@@ -62,8 +63,13 @@ Documentation = "https://docs.opensfm.org/"
 cmake.source-dir = "opensfm/src"
 cmake.build-type = "Release"
 
-# Use a fixed build directory (useful for running C++ tests)
-build-dir = "cmake_build"
+# Build directory for pip / scikit-build-core (cmake + compiled .so extensions).
+# C++ test-only builds stay in cmake_build (via standalone cmake).
+build-dir = "build"
+
+# Editable installs: use redirect mode so .so files stay in build/
+# instead of being copied into the opensfm/ source tree.
+editable.mode = "redirect"
 
 # Minimum CMake version
 cmake.version = ">=3.15"
@@ -94,6 +100,8 @@ sdist.exclude = [
     ".git/**",
     ".github/**",
     "cmake_build/**",
+    "build/**",
+    "coverage_data/**",
     "**/__pycache__/**",
     "**/*.pyc",
 ]

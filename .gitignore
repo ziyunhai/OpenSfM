@@ -1,5 +1,6 @@
 *.pyc
 *.so
+*.pyd
 *.prof
 xcode
 .DS_Store
@@ -12,12 +13,15 @@ uv.lock
 # Ignore generated files
 /build
 /cmake_build
+/coverage_data
 /doc/build
 /dist
 /OpenSfM.egg-info
 .cache
 .pytest_cache
+/.benchmark-worktrees
 eval
+/benchmark_runs
 
 # Viewer
 node_modules

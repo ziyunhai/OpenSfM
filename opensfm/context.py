@@ -47,9 +47,13 @@ R = TypeVar("R")
 
 
 def parallel_map(
-    func: Callable[[T], R], args: List[T], num_proc: int, max_batch_size: int = 1
+    func: Callable[[T], R],
+    args: List[T],
+    num_proc: int,
+    max_batch_size: int = 1,
+    backend: str = "threading",
 ) -> List[R]:
-    """Run function for all arguments using multiple processes."""
+    """Run function for all arguments using a joblib backend."""
     # De-activate/Restore any inner OpenCV threading
     threads_used = cv2.getNumThreads()
     cv2.setNumThreads(0)
@@ -58,7 +62,7 @@ def parallel_map(
     if num_proc <= 1:
         res = list(map(func, args))
     else:
-        with parallel_backend("threading", n_jobs=num_proc):
+        with parallel_backend(backend, n_jobs=num_proc):
             batch_size = max(1, int(len(args) / (num_proc * 2)))
             batch_size = (
                 min(batch_size, max_batch_size) if max_batch_size else batch_size
@@ -126,15 +130,18 @@ else:
         return available_mem
 
     def current_memory_usage() -> int:
-        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * rusage_unit
+        """Log memory usage in MB."""
+        mem_bytes = resource.getrusage(
+            resource.RUSAGE_SELF).ru_maxrss * rusage_unit
+        return float(mem_bytes) / 1024 / 1024
 
 
 def log_memory(stage: str) -> int:
-    """Log memory usage at a given stage and return usage in KB."""
-    mem_kb = current_memory_usage()
-    mem_gb = mem_kb / 1024 / 1024 / 1024
+    """Log memory usage at a given stage and return usage in MB."""
+    mem_mb = current_memory_usage()
+    mem_gb = mem_mb / 1024
     logger.info(f"[Memory] {stage}: {mem_gb:.1f} GB")
-    return mem_kb
+    return mem_mb
 
 
 def processes_that_fit_in_memory(desired: int, per_process: int) -> int:

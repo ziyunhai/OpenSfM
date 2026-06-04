@@ -5,7 +5,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set
 
 import numpy as np
 from numpy.typing import NDArray
-from opensfm import exif as oexif, geometry, multiview, pygeometry, pymap, rig, types
+from opensfm import exif as oexif, geo, geometry, multiview, pygeometry, pymap, pysfm, rig, types
 from opensfm.dataset_base import DataSetBase
 
 
@@ -156,10 +156,9 @@ def reconstruction_from_metadata(
                 average_translation += rig_instance.pose.get_origin()
                 rotations.append(rig_instance.pose.rotation)
 
-
         if len(rotations) > 0:
             rig_instance.pose.rotation = geometry.average_rotation(rotations)
-            rig_instance.pose.set_origin(average_translation / len(rotations))            
+            rig_instance.pose.set_origin(average_translation / len(rotations))
 
     return reconstruction
 
@@ -168,50 +167,14 @@ def exif_to_metadata(
     exif: Dict[str, Any], use_altitude: bool, reference: types.TopocentricConverter
 ) -> pymap.ShotMeasurements:
     """Construct a metadata object from raw EXIF tags (as a dict)."""
-    metadata = pymap.ShotMeasurements()
-
-    gps = exif.get("gps")
-    if gps and "latitude" in gps and "longitude" in gps:
-        lat, lon = gps["latitude"], gps["longitude"]
-        if use_altitude:
-            alt = min([oexif.maximum_altitude, gps.get("altitude", 2.0)])
-        else:
-            alt = 2.0  # Arbitrary value used to align the reconstruction
-        x, y, z = reference.to_topocentric(lat, lon, alt)
-        metadata.gps_position.value = np.array([x, y, z])
-        metadata.gps_accuracy.value = gps.get("dop", 15.0)
-        if metadata.gps_accuracy.value == 0.0:
-            metadata.gps_accuracy.value = 15.0
-
-    opk = exif.get("opk")
-    if opk and "omega" in opk and "phi" in opk and "kappa" in opk:
-        omega, phi, kappa = opk["omega"], opk["phi"], opk["kappa"]
-        metadata.opk_angles.value = np.array([omega, phi, kappa])
-        metadata.opk_accuracy.value = opk.get("accuracy", 1.0)
-
-    metadata.orientation.value = exif.get("orientation", 1)
-
     if "accelerometer" in exif:
         logger.warning(
             "'accelerometer' EXIF tag is deprecated in favor of 'gravity_down', which expresses "
             "the gravity down direction in the image coordinate frame."
         )
-
-    if "gravity_down" in exif:
-        metadata.gravity_down.value = exif["gravity_down"]
-
-    if "compass" in exif:
-        metadata.compass_angle.value = exif["compass"]["angle"]
-        if exif["compass"].get("accuracy") is not None:
-            metadata.compass_accuracy.value = exif["compass"]["accuracy"]
-
-    if "capture_time" in exif:
-        metadata.capture_time.value = exif["capture_time"]
-
-    if "skey" in exif:
-        metadata.sequence_key.value = exif["skey"]
-
-    return metadata
+    return pysfm.ReconstructionGrower.parse_exif_dict(
+        exif, use_altitude, reference.lat, reference.lon, reference.alt
+    )
 
 
 def get_image_metadata(data: DataSetBase, image: str) -> pymap.ShotMeasurements:

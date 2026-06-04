@@ -21,8 +21,8 @@ FROM continuumio/miniconda3
 COPY . /source/OpenSfM
 WORKDIR /source/OpenSfM
 
-# Create conda environment from conda.yml
-RUN conda env create --file conda.yml --yes
+# Create conda environment from conda lock file (same as native Linux setup)
+RUN conda create --name opensfm --file conda-linux-64.lock --yes
 
 # Override default shell and use bash in the conda environment
 SHELL ["conda", "run", "-n", "opensfm", "/bin/bash", "-c"]

@@ -29,7 +29,7 @@ def assert_metadata_equal(
 
     assert m1.gps_accuracy.has_value == m2.gps_accuracy.has_value
     if m1.gps_accuracy.has_value:
-        assert m1.gps_accuracy.value == m2.gps_accuracy.value
+        assert np.allclose(m1.gps_accuracy.value, m2.gps_accuracy.value)
 
     assert m1.orientation.has_value == m2.orientation.has_value
     if m1.orientation.has_value:
@@ -132,9 +132,11 @@ def assert_maps_equal(
 
         # Observations are different objects of same value
         for shot, obs in obs.items():
-            obs1 = shot.get_observation(obs.id)
+            lm = map1.get_landmarks()[pt.id]
+            obs1 = shot.get_landmark_observation(lm)
             shot_cpy = map2.get_shots()[shot.id]
-            obs_cpy = shot_cpy.get_observation(obs.id)
+            lm_cpy = map2.get_landmarks()[pt.id]
+            obs_cpy = shot_cpy.get_landmark_observation(lm_cpy)
             assert obs1 is not obs_cpy
 
     # Topocentric reference are different objects of same value

@@ -3,7 +3,6 @@
 import datetime
 import logging
 from codecs import decode, encode
-import math
 from typing import Any, BinaryIO, Callable, Dict, List, Optional, Tuple, Union
 
 import exifread
@@ -20,7 +19,6 @@ logger: logging.Logger = logging.getLogger(__name__)
 inch_in_mm: float = 25.4
 cm_in_mm: float = 10
 um_in_mm: float = 0.001
-default_projection: str = "perspective"
 maximum_altitude: float = 1e4
 
 
@@ -62,43 +60,14 @@ def get_tag_as_float(tags: Dict[str, Any], key: str, index: int = 0) -> Optional
         return None
 
 
-def focal35_to_focal_ratio(
-    focal35_or_ratio: float, width: int, height: int, inverse=False
-) -> float:
-    """
-    Convert focal length in 35mm film equivalent to focal ratio (and vice versa).
-    We follow https://en.wikipedia.org/wiki/35_mm_equivalent_focal_length
-    """
-    image_ratio = float(max(width, height)) / min(width, height)
-    is_32 = math.fabs(image_ratio - 3.0 / 2.0)
-    is_43 = math.fabs(image_ratio - 4.0 / 3.0)
-    if is_32 < is_43:
-        # 3:2 aspect ratio : use 36mm for 35mm film
-        film_width = 36.0
-        if inverse:
-            return focal35_or_ratio * film_width
-        else:
-            return focal35_or_ratio / film_width
-    else:
-        # 4:3 aspect ratio : use 34mm for 35mm film
-        film_width = 34
-        if inverse:
-            return focal35_or_ratio * film_width
-        else:
-            return focal35_or_ratio / film_width
-
-
 def compute_focal(
-    pixel_width: int,
-    pixel_height: int,
     focal_35: Optional[float],
     focal: Optional[float],
     sensor_width: Optional[float],
     sensor_string: Optional[str],
 ) -> Tuple[float, float]:
     if focal_35 is not None and focal_35 > 0:
-        focal_ratio = focal35_to_focal_ratio(
-            focal_35, pixel_width, pixel_height)
+        focal_ratio = focal_35 / 36.0
     else:
         if not sensor_width:
             sensor_width = (
@@ -106,9 +75,7 @@ def compute_focal(
             )
         if sensor_width and focal:
             focal_ratio = focal / sensor_width
-            focal_35 = focal35_to_focal_ratio(
-                focal, pixel_width, pixel_height, inverse=True
-            )
+            focal_35 = 36.0 * focal_ratio
         else:
             focal_35 = 0.0
             focal_ratio = 0.0
@@ -156,9 +123,16 @@ def extract_exif_from_file(
     fileobj: BinaryIO,
     image_size_loader: Callable[[], Tuple[int, int]],
     use_exif_size: bool,
+    default_projection_type: str,
     name: Optional[str] = None,
 ) -> Dict[str, Any]:
-    exif_data = EXIF(fileobj, image_size_loader, use_exif_size, name=name)
+    exif_data = EXIF(
+        fileobj,
+        image_size_loader,
+        default_projection_type,
+        use_exif_size,
+        name=name,
+    )
     d = exif_data.extract_exif()
     return d
 
@@ -211,12 +185,14 @@ class EXIF:
         self,
         fileobj: BinaryIO,
         image_size_loader: Callable[[], Tuple[int, int]],
+        default_projection_type: str,
         use_exif_size: bool = True,
         name: Optional[str] = None,
     ) -> None:
         self.image_size_loader: Callable[[],
                                          Tuple[int, int]] = image_size_loader
         self.use_exif_size: bool = use_exif_size
+        self.default_projection_type: str = default_projection_type
         self.fileobj: BinaryIO = fileobj
         self.tags: Dict[str, Any] = exifread.process_file(
             fileobj, details=False)
@@ -260,7 +236,7 @@ class EXIF:
 
     def extract_make(self) -> str:
         # Camera make and model
-        if "EXIF LensMake" in self.tags:
+        if "EXIF LensMake" in self.tags and self.tags["EXIF LensMake"].values:
             make = self.tags["EXIF LensMake"].values
         elif "Image Make" in self.tags:
             make = self.tags["Image Make"].values
@@ -269,7 +245,7 @@ class EXIF:
         return self._decode_make_model(make)
 
     def extract_model(self) -> str:
-        if "EXIF LensModel" in self.tags:
+        if "EXIF LensModel" in self.tags and self.tags["EXIF LensModel"].values:
             model = self.tags["EXIF LensModel"].values
         elif "Image Model" in self.tags:
             model = self.tags["Image Model"].values
@@ -279,14 +255,19 @@ class EXIF:
 
     def extract_projection_type(self) -> str:
         gpano = get_gpano_from_xmp(self.xmp)
-        return gpano.get("GPano:ProjectionType", "perspective")
+        return gpano.get("GPano:ProjectionType", self.default_projection_type)
 
     def extract_focal(self) -> Tuple[float, float]:
+        # DJI CalibratedFocalLength is focal length in pixels — use it if available
+        calibrated_focal_px = self.extract_dji_calibrated_focal_length()
+        if calibrated_focal_px is not None and calibrated_focal_px > 0:
+            width, _ = self.extract_image_size()
+            focal_ratio = calibrated_focal_px / width
+            focal_35 = 36.0 * focal_ratio
+            return focal_35, focal_ratio
+
         make, model = self.extract_make(), self.extract_model()
-        width, height = self.extract_image_size()
         focal_35, focal_ratio = compute_focal(
-            width,
-            height,
             get_tag_as_float(self.tags, "EXIF FocalLengthIn35mmFilm"),
             get_tag_as_float(self.tags, "EXIF FocalLength"),
             self.extract_sensor_width(),
@@ -393,6 +374,15 @@ class EXIF:
     def extract_dji_relative_altitude(self) -> float:
         return float(self.xmp[0]["@drone-dji:RelativeAltitude"])
 
+    def extract_dji_calibrated_focal_length(self) -> Optional[float]:
+        """Extract DJI CalibratedFocalLength (focal length in pixels) from XMP."""
+        if self.has_xmp() and "@drone-dji:CalibratedFocalLength" in self.xmp[0]:
+            try:
+                return float(self.xmp[0]["@drone-dji:CalibratedFocalLength"])
+            except (ValueError, TypeError):
+                return None
+        return None
+
     def extract_relative_altitude(self) -> Optional[float]:
         if self.has_dji_relative_altitude():
             return self.extract_dji_relative_altitude()
@@ -437,11 +427,58 @@ class EXIF:
             return eval_frac(self.tags["GPS GPSDOP"].values[0])
         return None
 
+    def has_dji_rtk_std(self) -> bool:
+        return (
+            self.has_xmp()
+            and "@drone-dji:RtkStdLat" in self.xmp[0]
+            and "@drone-dji:RtkStdLon" in self.xmp[0]
+            and "@drone-dji:RtkStdHgt" in self.xmp[0]
+        )
+
+    def extract_dji_rtk_std(self) -> Optional[Dict[str, float]]:
+        """Extract DJI RTK standard deviation tags (in meters)."""
+        if not self.has_dji_rtk_std():
+            return None
+        try:
+            return {
+                "latitude_std": float(self.xmp[0]["@drone-dji:RtkStdLat"]),
+                "longitude_std": float(self.xmp[0]["@drone-dji:RtkStdLon"]),
+                "altitude_std": float(self.xmp[0]["@drone-dji:RtkStdHgt"]),
+            }
+        except (ValueError, TypeError):
+            return None
+
+    def has_ebee_rtk_std(self) -> bool:
+        return (
+            self.has_xmp()
+            and "@Camera:GPSXYAccuracy" in self.xmp[0]
+            and "@Camera:GPSZAccuracy" in self.xmp[0]
+        )
+
+    def extract_ebee_rtk_std(self) -> Optional[Dict[str, float]]:
+        """Extract Ebee GPS accuracy tags (in meters). XY is used for both lat and lon."""
+        if not self.has_ebee_rtk_std():
+            return None
+        try:
+            xy = float(self.xmp[0]["@Camera:GPSXYAccuracy"])
+            z = float(self.xmp[0]["@Camera:GPSZAccuracy"])
+            return {
+                "latitude_std": xy,
+                "longitude_std": xy,
+                "altitude_std": z,
+            }
+        except (ValueError, TypeError):
+            return None
+
+    def extract_rtk_std(self) -> Optional[Dict[str, float]]:
+        """Extract per-axis GPS std dev from DJI RTK or Ebee tags."""
+        return self.extract_dji_rtk_std() or self.extract_ebee_rtk_std()
+
     def extract_geo(self) -> Dict[str, Any]:
         altitude = self.extract_altitude()
         dop = self.extract_dop()
         lon, lat = self.extract_lon_lat()
-        d = {}
+        d: Dict[str, Any] = {}
 
         if lon is not None and lat is not None:
             d["latitude"] = lat
@@ -450,6 +487,9 @@ class EXIF:
             d["altitude"] = min([maximum_altitude, altitude])
         if dop is not None:
             d["dop"] = dop
+        rtk_std = self.extract_rtk_std()
+        if rtk_std is not None:
+            d.update(rtk_std)
         return d
 
     def extract_capture_time(self) -> float:
@@ -727,13 +767,7 @@ class EXIF:
 
 def hard_coded_calibration(exif: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     focal = exif["focal_ratio"]
-    fmm35 = int(
-        round(
-            focal35_to_focal_ratio(
-                focal, int(exif["width"]), int(exif["height"]), inverse=True
-            )
-        )
-    )
+    fmm35 = int(round(focal * 36.0))
     make = exif["make"].strip().lower()
     model = exif["model"].strip().lower()
     raw_calibrations = camera_calibration()[0]
@@ -811,10 +845,10 @@ def default_calibration(data: DataSetBase) -> Dict[str, Any]:
 
 
 def calibration_from_metadata(
-    metadata: Dict[str, Any], data: DataSetBase
+    metadata: Dict[str, Any], data: DataSetBase, default_projection_type: str,
 ) -> Dict[str, Any]:
     """Finds the best calibration in one of the calibration sources."""
-    pt = metadata.get("projection_type", default_projection).lower()
+    pt = metadata.get("projection_type", default_projection_type).lower()
     if (
         pt == "brown"
         or pt == "fisheye_opencv"
@@ -843,7 +877,7 @@ def camera_from_exif_metadata(
     metadata: Dict[str, Any],
     data: DataSetBase,
     calibration_func: Callable[
-        [Dict[str, Any], DataSetBase], Dict[str, Any]
+        [Dict[str, Any], DataSetBase, str], Dict[str, Any],
     ] = calibration_from_metadata,
 ) -> pygeometry.Camera:
     """
@@ -851,8 +885,9 @@ def camera_from_exif_metadata(
     function that turns metadata into usable calibration parameters.
     """
 
-    calib = calibration_func(metadata, data)
-    calib_pt = calib.get("projection_type", default_projection).lower()
+    calib = calibration_func(
+        metadata, data, data.config["default_projection_type"])
+    calib_pt = calib["projection_type"].lower()
 
     camera = None
     if calib_pt == "perspective":
