@@ -255,7 +255,9 @@ void ReconstructionGrower::ResectionCandidates::Remove(
     auto it = candidates_.find(shot_id);
     if (it != candidates_.end()) {
       it->second.erase(track_id);
-      if (it->second.empty()) candidates_.erase(it);
+      if (it->second.empty()) {
+        candidates_.erase(it);
+      }
     }
   }
   // Remove fully removed tracks
@@ -335,7 +337,9 @@ std::unordered_set<map::TrackId> ReconstructionGrower::TriangulateNewTracks(
         track_obs.emplace_back(&map.GetShot(sid), obs_idx);
       }
     }
-    if (track_obs.size() < 2) continue;
+    if (track_obs.size() < 2) {
+      continue;
+    }
 
     const size_t n = track_obs.size();
     origins.resize(n, 3);
@@ -355,7 +359,9 @@ std::unordered_set<map::TrackId> ReconstructionGrower::TriangulateNewTracks(
     auto [success, point] = geometry::TriangulateBearingsMidpoint(
         origins, bearings, thresholds, min_angle, min_depth);
 
-    if (!success) continue;
+    if (!success) {
+      continue;
+    }
 
     // Refine
     Vec3d refined = geometry::PointRefinement(origins, bearings, point, 10);
@@ -696,6 +702,28 @@ py::dict ReconstructionGrower::Grow(
           auto metadata = ParseExifDict(exif, use_altitude, reference.lat_,
                                         reference.long_, reference.alt_);
           map.GetShot(ns).SetShotMeasurements(metadata);
+        }
+      }
+
+      {
+        double average_gps_error = 0.0;
+        int gps_count = 0;
+        // Log GPS error for all new shots
+        for (const auto& new_shot_id : resection.new_shots) {
+          const auto& new_shot = map.GetShot(new_shot_id);
+          const auto& meta = new_shot.GetShotMeasurements();
+          if (meta.gps_position_.HasValue()) {
+            const Vec3d computed_pos = new_shot.GetPose()->GetOrigin();
+            const Vec3d gps_pos = meta.gps_position_.Value();
+            const double gps_error = (computed_pos - gps_pos).norm();
+            average_gps_error += gps_error;
+            ++gps_count;
+          }
+        }
+        if (gps_count > 0) {
+          average_gps_error /= gps_count;
+          LogInfo("Average GPS error for resected shots: " +
+                  std::to_string(average_gps_error) + " m");
         }
       }
 

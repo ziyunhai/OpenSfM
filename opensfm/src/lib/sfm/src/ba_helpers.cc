@@ -1300,13 +1300,13 @@ BAHelpers::OutlierRemovalResult BAHelpers::RemoveOutliers(
     map::Map& map, const py::dict& config,
     const std::vector<map::LandmarkId>& point_ids) {
   OutlierRemovalResult result;
-  const auto& all_landmarks = map.GetLandmarks();
+  auto& all_landmarks = map.GetLandmarks();
 
   // Generic iteration: avoid building a temporary vector of pointers.
   // for_each_point calls fn(const Landmark&) on the relevant set.
   auto for_each_point = [&](auto&& fn) {
     if (point_ids.empty()) {
-      for (const auto& [id, lm] : all_landmarks) {
+      for (auto& [id, lm] : all_landmarks) {
         fn(lm);
       }
     } else {
@@ -1382,7 +1382,7 @@ BAHelpers::OutlierRemovalResult BAHelpers::RemoveOutliers(
           : 0.5;
 
   // Collect outliers
-  for_each_point([&](const map::Landmark& lm) {
+  for_each_point([&](map::Landmark& lm) {
     for (const auto& [shot_id, error] : lm.GetReprojectionErrors()) {
       double err_sqr = error[0] * error[0] + error[1] * error[1];
       if (err_sqr > threshold_sqr) {
@@ -1420,12 +1420,6 @@ BAHelpers::OutlierRemovalResult BAHelpers::RemoveOutliers(
         result.removed_tracks.push_back(track_id);
       }
     }
-  }
-
-  // Clear reproj errors and weights on ALL landmarks to free memory
-  for (auto& [id, lm] : map.GetLandmarks()) {
-    lm.SetReprojectionErrors({});
-    lm.SetReprojectionWeights({});
   }
 
   return result;
