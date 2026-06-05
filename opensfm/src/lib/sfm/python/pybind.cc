@@ -31,9 +31,10 @@ PYBIND11_MODULE(pysfm, m) {
   py::class_<sfm::BAHelpers>(m, "BAHelpers")
       .def_static("bundle", &sfm::BAHelpers::Bundle)
       .def_static("bundle_local", &sfm::BAHelpers::BundleLocalPython)
+      .def_static("bundle_local_stochastic",
+                  &sfm::BAHelpers::BundleLocalStochasticPython)
       .def_static("bundle_shot_poses", &sfm::BAHelpers::BundleShotPoses)
       .def_static("bundle_to_map", &sfm::BAHelpers::BundleToMap)
-      .def_static("shot_neighborhood_ids", &sfm::BAHelpers::ShotNeighborhoodIds)
       .def_static("detect_alignment_constraints",
                   &sfm::BAHelpers::DetectAlignmentConstraints)
       .def_static("add_gcp_to_bundle", &sfm::BAHelpers::AddGCPToBundle)
@@ -76,7 +77,7 @@ PYBIND11_MODULE(pysfm, m) {
         py::arg("tracks_manager"), py::arg("config"),
         py::arg("use_robust") = false,
         py::call_guard<py::gil_scoped_release>());
-  
+
   // ── dense_helpers: super-point covisibility & neighbor selection ────
 
   py::class_<sfm::dense_helpers::SuperPoint>(m, "SuperPoint")

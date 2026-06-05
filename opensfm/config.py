@@ -336,6 +336,18 @@ class OpenSfMConfig:
     local_bundle_grid: int = 12
     # Number of grid division for selecting tracks in final bundle adjustment
     final_bundle_grid: int = 32
+    # Min number of shots above which global bundle switches to the stochastic solver
+    stochastic_bundle_shot_count: int = 4000
+    # Max interior cameras optimized per stochastic round (N)
+    stochastic_bundle_max_shots: int = 500
+    # Number of seed shots fed to each stochastic round
+    stochastic_bundle_random_shots: int = 20
+    # How much of stochastic_bundle_max_shots, do we reserve for GCP-anchored shots
+    stochastic_bundle_gcp_seeds_ratio: float = 0.5
+    # Graph-hop radius for stochastic rounds (large so seeds can reach the N budget)
+    stochastic_bundle_radius: int = 100
+    # Upper bound on the number of stochastic rounds K (K is derived from scene size)
+    stochastic_bundle_max_rounds: int = 100
     # For debugging purpose of large datasets: limit the maximum number of shots in incremental reconstruction
     incremental_max_shots_count: int = 0
     # Number of different pairs to try for incremental reconstruction bootstrap
