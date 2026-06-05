@@ -338,6 +338,10 @@ class OpenSfMConfig:
     final_bundle_grid: int = 32
     # For debugging purpose of large datasets: limit the maximum number of shots in incremental reconstruction
     incremental_max_shots_count: int = 0
+    # Number of different pairs to try for incremental reconstruction bootstrap
+    incremental_bootstrap_tries: int = 10
+    # Average inlier ratio on resected shots to accept a bootstrap pair and grow it
+    incremental_bootstrap_min_inliers_ratio: float = 0.80
 
     # Remove uncertain and isolated points from the final point cloud
     filter_final_point_cloud: bool = False

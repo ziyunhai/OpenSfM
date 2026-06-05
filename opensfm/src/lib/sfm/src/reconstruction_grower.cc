@@ -619,7 +619,7 @@ py::dict ReconstructionGrower::Grow(
   int total_resected = 0;
   int total_triangulated = 0;
   int iterations = 0;
-  std::unordered_set<map::ShotId> resected_shots;
+  std::vector<ResectedShotInfo> resected_shots;
 
   // Redundancy fallback state (Fix 5)
   std::unordered_set<map::ShotId> redundant_shots;
@@ -687,7 +687,10 @@ py::dict ReconstructionGrower::Grow(
 
       for (const auto& ns : resection.new_shots) {
         images.erase(ns);
-        resected_shots.insert(ns);
+        resected_shots.push_back({ns,
+                                  (double)resection.num_inliers /
+                                      std::max(1, resection.num_common_points),
+                                  resection.num_inliers});
         redundant_shots.erase(ns);
       }
 
@@ -852,7 +855,11 @@ py::dict ReconstructionGrower::Grow(
   report["num_iterations"] = iterations;
   py::list resected_list;
   for (const auto& s : resected_shots) {
-    resected_list.append(s);
+    py::dict s_dict;
+    s_dict["shot_id"] = s.shot_id;
+    s_dict["inliers_ratio"] = s.inliers_ratio;
+    s_dict["num_inliers"] = s.num_inliers;
+    resected_list.append(s_dict);
   }
   report["resected_shots"] = resected_list;
   return report;

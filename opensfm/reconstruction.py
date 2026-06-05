@@ -824,6 +824,7 @@ def grow_reconstruction(
     reconstruction: types.Reconstruction,
     images: Set[str],
     gcp: List[pymap.GroundControlPoint],
+    bootstrap_mode: bool = False,
 ) -> Tuple[types.Reconstruction, Dict[str, Any]]:
     """Incrementally add shots to an initial reconstruction."""
     config = data.config
@@ -882,12 +883,18 @@ def grow_reconstruction(
     report["grow"] = grow_report
 
     # Remove resected shots from the caller's image set
-    images -= set(grow_report["resected_shots"])
+    images -= {s["shot_id"] for s in grow_report["resected_shots"]}
 
     # Post-loop finalization
     final_bundle_grid = config["final_bundle_grid"]
 
     logger.info("-------------------------------------------------------")
+
+    if bootstrap_mode:
+        logger.info(
+            "Bootstrap reconstruction - skipping final GCP alignment and bundle adjustment"
+        )
+        return reconstruction, report
 
     align_gcp_result = align_reconstruction(
         reconstruction, gcp, config, bias_override=True)
@@ -1103,34 +1110,99 @@ def incremental_reconstruction(
     chrono.lap("compute_image_pairs")
     report["num_candidate_image_pairs"] = len(pairs)
     report["reconstructions"] = []
-    for im1, im2 in pairs:
-        if im1 in remaining_images and im2 in remaining_images:
-            rec_report = {}
-            report["reconstructions"].append(rec_report)
-            p1, p2 = _get_common_feature_arrays(tracks_manager, im1, im2)
-            reconstruction, rec_report["bootstrap"] = bootstrap_reconstruction(
-                data, tracks_manager, im1, im2, p1, p2
+
+    pair_idx = 0
+    original_max_shots = data.config.get("incremental_max_shots_count", 0)
+
+    while pair_idx < len(pairs):
+        num_tries = data.config.get("incremental_bootstrap_tries", 10)
+        min_inliers_ratio = data.config.get(
+            "incremental_bootstrap_min_inliers_ratio", 0.8)
+
+        ratio = -1.0
+        reconstruction = None
+        rec_report = None
+
+        search_idx = pair_idx
+        tries_count = 0
+
+        while search_idx < len(pairs) and tries_count < num_tries:
+            sim1, sim2 = pairs[search_idx]
+            search_idx += 1
+
+            if sim1 not in remaining_images or sim2 not in remaining_images:
+                continue
+
+            tries_count += 1
+            try_rec_report = {}
+            p1, p2 = _get_common_feature_arrays(tracks_manager, sim1, sim2)
+            try_reconstruction, try_rec_report["bootstrap"] = bootstrap_reconstruction(
+                data, tracks_manager, sim1, sim2, p1, p2
             )
 
-            if reconstruction:
-                remaining_images -= set(reconstruction.shots)
-                reconstruction, rec_report["grow"] = grow_reconstruction(
-                    data,
-                    tracks_manager,
-                    reconstruction,
-                    remaining_images,
-                    gcp,
-                )
-                reconstructions.append(reconstruction)
-                reconstructions = sorted(
-                    reconstructions, key=lambda x: -len(x.shots))
+            if try_reconstruction:
+                data.config["incremental_max_shots_count"] = 5
+                try:
+                    temp_remaining_images = remaining_images - \
+                        set(try_reconstruction.shots)
+                    try_reconstruction, try_rec_report["grow"] = grow_reconstruction(
+                        data,
+                        tracks_manager,
+                        try_reconstruction,
+                        temp_remaining_images,
+                        gcp,
+                        True,
+                    )
+                finally:
+                    data.config["incremental_max_shots_count"] = original_max_shots
 
-            if data.config["incremental_max_shots_count"] > 0 and sum(
+                resected_shots = try_rec_report["grow"].get(
+                    "grow", {}).get("resected_shots", [])
+
+                avg_ratio = 0.0
+                if resected_shots:
+                    avg_ratio = sum(s["inliers_ratio"]
+                                    for s in resected_shots) / len(resected_shots)
+
+                if avg_ratio >= min_inliers_ratio:
+                    logger.info(
+                        f"Starting with pair ({sim1}, {sim2}) with average inliers ratio {avg_ratio:.2f} over {len(resected_shots)} resected shots."
+                    )
+                    ratio = avg_ratio
+                    reconstruction = try_reconstruction
+                    rec_report = try_rec_report
+                    break
+                elif avg_ratio > ratio:
+                    logger.info(
+                        f"Found better pair ({sim1}, {sim2}) with average inliers ratio {avg_ratio:.2f} over {len(resected_shots)} resected shots, but below the threshold."
+                    )
+                    ratio = avg_ratio
+                    reconstruction = try_reconstruction
+                    rec_report = try_rec_report
+
+        if reconstruction:
+            remaining_images -= set(reconstruction.shots)
+            reconstruction, rec_report["grow"] = grow_reconstruction(
+                data,
+                tracks_manager,
+                reconstruction,
+                remaining_images,
+                gcp,
+            )
+
+            report["reconstructions"].append(rec_report)
+            reconstructions.append(reconstruction)
+            reconstructions = sorted(
+                reconstructions, key=lambda x: -len(x.shots))
+
+            if original_max_shots > 0 and sum(
                 len(r.shots) for r in reconstructions
-            ) >= data.config["incremental_max_shots_count"]:
+            ) >= original_max_shots:
                 logger.info(
                     f"Reached the maximum number of shots")
                 break
+
+        pair_idx = search_idx
 
     for k, r in enumerate(reconstructions):
         logger.info(
