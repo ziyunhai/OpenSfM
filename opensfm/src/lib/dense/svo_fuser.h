@@ -60,11 +60,13 @@ class SVOFuser {
   // Must be called after Fuse().
   void RefineGeometry(int iters, float lambda_reg);
 
-  // Bake colors onto extracted points via top-2 view selection.
-  // Must be called after ExtractPoints() fills points/normals.
+  // Bake colors onto extracted points: robust IRLS consensus gate plus a
+  // top-n_final, resolution-weighted linear blend of the sharpest inlier
+  // views.  Must be called after ExtractPoints() fills points/normals.
   // Mutates colors in-place.
   void BakeColors(std::vector<Vec3f>& points, std::vector<Vec3f>& normals,
-                  std::vector<Vec3<uint8_t>>* colors);
+                  std::vector<Vec3<uint8_t>>* colors,
+                  int n_final = 2, int irls_iters = 3);
 
   // Visibility-based pruning of the TSDF hash table.
   // Raycasts the hash table from each integrated view, compares with its

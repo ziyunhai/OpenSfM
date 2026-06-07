@@ -1269,7 +1269,8 @@ void SVOIntegratorCL::RefineGeometry(int iters, float lambda_reg,
 
 void SVOIntegratorCL::BakeColors(const std::vector<Vec3f>& points,
                                  const std::vector<Vec3f>& normals,
-                                 std::vector<Vec3<uint8_t>>* out_colors) {
+                                 std::vector<Vec3<uint8_t>>* out_colors,
+                                 int n_final, int irls_iters) {
   if (!refine_prepared_) {
     throw std::runtime_error(
         "SVOIntegratorCL::BakeColors: PrepareRefinement() not called");
@@ -1323,6 +1324,8 @@ void SVOIntegratorCL::BakeColors(const std::vector<Vec3f>& points,
     k_bake_colors_.setArg(arg++, static_cast<cl_int>(W));
     k_bake_colors_.setArg(arg++, static_cast<cl_int>(H));
     k_bake_colors_.setArg(arg++, occlusion_margin);
+    k_bake_colors_.setArg(arg++, static_cast<cl_int>(n_final));
+    k_bake_colors_.setArg(arg++, static_cast<cl_int>(irls_iters));
 
     const size_t global = ((M + 255) / 256) * 256;
     queue.enqueueNDRangeKernel(k_bake_colors_, cl::NullRange,

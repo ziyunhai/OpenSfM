@@ -102,7 +102,6 @@ def compute_depthmaps(
         logger.info(
             f"Cluster assignments saved to {data.clusters_file()}")
 
-    clusters = clusters[1:2]
     # ── 1b. Per-cluster bounding boxes ─────────────────────────────────
     cluster_bboxes: List[Tuple[NDArray, NDArray]] = [
         _compute_cluster_bbox(cl, graph, reconstruction) for cl in clusters
@@ -1697,6 +1696,7 @@ def _render_dsm_patch_from_sv(
     grid_h: int,
     z_min: float,
     z_max: float,
+    config: Dict[str, Any],
 ) -> None:
     """Render DSM + color ortho for a sub-volume's core XY footprint.
 
@@ -1748,10 +1748,13 @@ def _render_dsm_patch_from_sv(
         nrm = normals_patch.reshape(patch_h, patch_w, 3)
         pts_normals = nrm[rows_idx, cols_idx, :]
 
-        # Bake colors from source images (IRLS + occlusion).
+        # Bake colors from source images: robust consensus gate + top-N
+        # sharpest-view linear blend (see svo_bake_colors kernel).
         colors = fuser.bake_colors(
             points.astype(np.float32, copy=False),
             pts_normals.astype(np.float32, copy=False),
+            n_final=int(config["ortho_bake_n_final_views"]),
+            irls_iters=int(config["ortho_bake_irls_iterations"]),
         )
         colors = np.asarray(colors, dtype=np.uint8)
 
@@ -2113,6 +2116,7 @@ def _fuse_per_cluster(
                     fuser, sv, dsm_grid, ortho_grid,
                     dsm_origin_x, dsm_origin_y, dsm_gsd,
                     dsm_w, dsm_h, dsm_z_min, dsm_z_max,
+                    config,
                 )
 
             # Always bake colors (voxels no longer store color).

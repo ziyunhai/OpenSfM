@@ -418,7 +418,8 @@ class SVOFuserWrapper {
 
   py::array_t<uint8_t> BakeColorsStandalone(
       const py::array_t<float, py::array::c_style>& points,
-      const py::array_t<float, py::array::c_style>& normals) {
+      const py::array_t<float, py::array::c_style>& normals,
+      int n_final, int irls_iters) {
     if (points.ndim() != 2 || points.shape(1) != 3) {
       throw std::invalid_argument("points must be (N, 3)");
     }
@@ -440,7 +441,7 @@ class SVOFuserWrapper {
 
     {
       py::gil_scoped_release release;
-      sf_.BakeColors(pts, nrm, &colors);
+      sf_.BakeColors(pts, nrm, &colors, n_final, irls_iters);
     }
 
     py::array_t<uint8_t> colors_arr({n, 3});

@@ -560,6 +560,10 @@ class OpenSfMConfig:
     # interpolation. Triangles spanning larger Z gaps are rejected
     # (avoids bridging across cliffs/building edges).
     dsm_max_interp_z_range: float = 2.0
+    # Orthophoto color baking (svo_bake_colors): number of sharpest inlier views blended for the final color
+    ortho_bake_n_final_views: int = 3
+    # Tukey-biweight reweighting iterations for the robust color consensus.
+    ortho_bake_irls_iterations: int = 5
 
     ##################################
     # Params for multi-processing/threading

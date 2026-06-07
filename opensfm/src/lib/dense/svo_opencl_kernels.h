@@ -1387,29 +1387,52 @@ __kernel void svo_refine_update(
 }
 
 // =====================================================================
-// svo_bake_colors — Robust multi-view color baking via IRLS consensus
+// Color-space helpers for photometric blending.
+// CL_UNORM_INT8 samples are sRGB-encoded; mixing colors should happen in
+// linear light.  Gamma 2.2 is an adequate approximation of the sRGB curve.
+// =====================================================================
+float3 srgb_to_linear(float3 c) {
+    return pow(fmax(c, (float3)(0.0f)), (float3)(2.2f));
+}
+float3 linear_to_srgb(float3 c) {
+    return pow(fmax(c, (float3)(0.0f)), (float3)(1.0f / 2.2f));
+}
+
+// =====================================================================
+// svo_bake_colors — Robust multi-view color baking (consensus + sharpen)
 //
-// Dispatched 1D over M extracted surface points.
-// For each point, gather ALL valid views, compute a weighted mean, then
-// apply Cauchy-kernel IRLS reweighting to suppress outlier views
-// (occluded/wrong color).  This eliminates speckle from failed occlusion.
+// Dispatched 1D over M extracted surface points.  Two stages:
+//   Phase 0 (consensus gate): gather all valid views, then estimate a
+//     robust consensus color via median initialization + MAD scale +
+//     iterated Tukey-biweight reweighting.  Gross outliers (occlusion
+//     leaks, specular highlights, moved objects) receive a hard-zero
+//     weight, so they neither bias the consensus nor pass the gate.
+//   Phase 1 (sharpening): among the inlier views, pick the top n_final
+//     by resolution (inverse ground-sample-distance) and blend them in
+//     linear color space, weighted by resolution.  Selecting a few sharp
+//     views — rather than averaging all of them — preserves texture
+//     detail that an N-view weighted mean would low-pass into blur.
 //
 // color_images: CL_RGBA CL_UNORM_INT8, slice per view.
 //   Alpha channel encodes validity mask (0 = invalid pixel).
-// tsdf_depths:  CL_R CL_FLOAT, slice per view (final TSDF render).
-// occlusion_margin: absolute world-space depth tolerance (e.g. 3*voxel_size).
+// clean_depths: CL_R CL_FLOAT, slice per view (front-most clean depth).
+// occlusion_margin: absolute world-space depth tolerance (e.g. 3*voxel).
+// n_final:     number of sharpest inlier views to blend (1 or 2).
+// irls_iters:  Tukey reweighting iterations for the consensus (e.g. 3).
 // =====================================================================
 __kernel void svo_bake_colors(
     __global const float*    points,
     __global const float*    normals,
     __global uchar*          out_colors,       // M × 3 RGB bytes
     read_only image2d_array_t color_images,    // RGBA with alpha = mask
-    read_only image2d_array_t tsdf_depths,
+    read_only image2d_array_t clean_depths,    // front-most clean depth
     __constant SVOCamera*    cameras,
     int                      n_views,
     int                      img_width,
     int                      img_height,
-    float                    occlusion_margin) // absolute depth margin
+    float                    occlusion_margin,  // absolute depth margin
+    int                      n_final,           // # sharpest views to blend
+    int                      irls_iters)        // Tukey reweight iterations
 {
     uint gid = get_global_id(0);
 
@@ -1423,12 +1446,15 @@ __kernel void svo_bake_colors(
                                CLK_ADDRESS_CLAMP_TO_EDGE |
                                CLK_FILTER_LINEAR;
 
-    // Gather phase: collect valid observations (color + weight).
-    // Use private arrays; n_views is bounded by host (typically ≤ 36).
-    float obs_r[36], obs_g[36], obs_b[36], obs_w[36];
+    // Gather phase: collect valid observations.
+    // Private arrays; n_views is bounded by host to KMAX.
+    const int KMAX = 36;
+    float obs_r[36], obs_g[36], obs_b[36];
+    float obs_w[36];    // geometric prior = cos^2(theta)
+    float obs_res[36];  // resolution score = fx * cos(theta) / z  (~1/GSD)
     int n_valid = 0;
 
-    for (int j = 0; j < n_views && j < 36; j++) {
+    for (int j = 0; j < n_views && j < KMAX; j++) {
         __constant SVOCamera* cam_j = &cameras[j];
 
         // Project point into view j.
@@ -1455,10 +1481,10 @@ __kernel void svo_bake_colors(
         if (rgba_nn.w < 0.5f) continue;  // masked pixel (alpha=0)
 
         // Occlusion check: absolute depth margin (not relative!).
-        // If TSDF rendered a surface here and our point is behind it, skip.
-        float tsdf_d = read_imagef(tsdf_depths, nn_samp,
+        // If this view's clean surface is in front of our point, skip.
+        float clean_d = read_imagef(clean_depths, nn_samp,
                            (float4)(px + 0.5f, py + 0.5f, (float)j, 0.0f)).x;
-        if (tsdf_d > 0.0f && p_j.z > tsdf_d + occlusion_margin) continue;
+        if (clean_d > 0.0f && p_j.z > clean_d + occlusion_margin) continue;
 
         // Viewing angle: cos between normal and view direction.
         float3 cam_pos_j = (float3)(cam_j->cam_pos[0], cam_j->cam_pos[1], cam_j->cam_pos[2]);
@@ -1470,13 +1496,11 @@ __kernel void svo_bake_colors(
         float4 rgba = read_imagef(color_images, lin_samp,
                           (float4)(px + 0.5f, py + 0.5f, (float)j, 0.0f));
 
-        // Weight = cos^2(theta): strongly prefer frontal views.
-        float w = cos_theta * cos_theta;
-
-        obs_r[n_valid] = rgba.x;
-        obs_g[n_valid] = rgba.y;
-        obs_b[n_valid] = rgba.z;
-        obs_w[n_valid] = w;
+        obs_r[n_valid]   = rgba.x;
+        obs_g[n_valid]   = rgba.y;
+        obs_b[n_valid]   = rgba.z;
+        obs_w[n_valid]   = cos_theta * cos_theta;        // geometric prior
+        obs_res[n_valid] = fx_j * cos_theta * inv_zj;    // ~ pixels / world unit
         n_valid++;
     }
 
@@ -1488,56 +1512,121 @@ __kernel void svo_bake_colors(
         return;
     }
 
-    // Pass 1: Weighted mean (initial estimate).
-    float sum_w = 0.0f;
-    float mu_r = 0.0f, mu_g = 0.0f, mu_b = 0.0f;
-    for (int i = 0; i < n_valid; i++) {
-        sum_w += obs_w[i];
-        mu_r  += obs_w[i] * obs_r[i];
-        mu_g  += obs_w[i] * obs_g[i];
-        mu_b  += obs_w[i] * obs_b[i];
+    // Single observation: nothing to robustify or select — emit it directly.
+    if (n_valid == 1) {
+        out_colors[gid * 3 + 0] = (uchar)clamp(obs_r[0] * 255.0f, 0.0f, 255.0f);
+        out_colors[gid * 3 + 1] = (uchar)clamp(obs_g[0] * 255.0f, 0.0f, 255.0f);
+        out_colors[gid * 3 + 2] = (uchar)clamp(obs_b[0] * 255.0f, 0.0f, 255.0f);
+        return;
     }
-    float inv_sw = 1.0f / (sum_w + 1e-10f);
-    mu_r *= inv_sw;
-    mu_g *= inv_sw;
-    mu_b *= inv_sw;
 
-    // Pass 2: Cauchy-kernel IRLS reweighting.
-    // Robust scale estimate (MAD-like via weighted variance).
-    float var_sum = 0.0f;
+    // ---- Phase 0: robust consensus (median init + MAD + Tukey IRLS) ----
+    float scratch[36];
+
+    // Component-wise median initialization (insertion sort per channel).
+    for (int i = 0; i < n_valid; i++) scratch[i] = obs_r[i];
+    for (int i = 1; i < n_valid; i++) {
+        float key = scratch[i]; int k = i - 1;
+        while (k >= 0 && scratch[k] > key) { scratch[k+1] = scratch[k]; k--; }
+        scratch[k+1] = key;
+    }
+    float mu_r = (n_valid & 1) ? scratch[n_valid/2]
+                   : 0.5f*(scratch[n_valid/2 - 1] + scratch[n_valid/2]);
+
+    for (int i = 0; i < n_valid; i++) scratch[i] = obs_g[i];
+    for (int i = 1; i < n_valid; i++) {
+        float key = scratch[i]; int k = i - 1;
+        while (k >= 0 && scratch[k] > key) { scratch[k+1] = scratch[k]; k--; }
+        scratch[k+1] = key;
+    }
+    float mu_g = (n_valid & 1) ? scratch[n_valid/2]
+                   : 0.5f*(scratch[n_valid/2 - 1] + scratch[n_valid/2]);
+
+    for (int i = 0; i < n_valid; i++) scratch[i] = obs_b[i];
+    for (int i = 1; i < n_valid; i++) {
+        float key = scratch[i]; int k = i - 1;
+        while (k >= 0 && scratch[k] > key) { scratch[k+1] = scratch[k]; k--; }
+        scratch[k+1] = key;
+    }
+    float mu_b = (n_valid & 1) ? scratch[n_valid/2]
+                   : 0.5f*(scratch[n_valid/2 - 1] + scratch[n_valid/2]);
+
+    // Robust scale: MAD of color-distance to the median.
     for (int i = 0; i < n_valid; i++) {
         float dr = obs_r[i] - mu_r;
         float dg = obs_g[i] - mu_g;
         float db = obs_b[i] - mu_b;
-        var_sum += obs_w[i] * (dr*dr + dg*dg + db*db);
+        scratch[i] = sqrt(dr*dr + dg*dg + db*db);
     }
-    // sigma^2 for Cauchy kernel — minimum prevents division issues.
-    // In [0,1] color space, 0.003 ≈ (14/255)^2 → differences ~14 grey levels.
-    float sigma2 = fmax(var_sum * inv_sw, 0.003f);
+    for (int i = 1; i < n_valid; i++) {
+        float key = scratch[i]; int k = i - 1;
+        while (k >= 0 && scratch[k] > key) { scratch[k+1] = scratch[k]; k--; }
+        scratch[k+1] = key;
+    }
+    float mad = (n_valid & 1) ? scratch[n_valid/2]
+                  : 0.5f*(scratch[n_valid/2 - 1] + scratch[n_valid/2]);
+    // sigma in color-distance units. Floor ~ per-channel 8 grey levels:
+    // sqrt(3) * 8/255 ≈ 0.054.
+    float sigma = fmax(1.4826f * mad, 0.054f);
+    const float c_tukey = 4.685f;
+    float cs = c_tukey * sigma;
 
-    // Reweighted sum.
-    float sum_w2 = 0.0f;
-    float fin_r = 0.0f, fin_g = 0.0f, fin_b = 0.0f;
+    // Iterated Tukey-biweight reweighting (re-estimate location from median).
+    for (int it = 0; it < irls_iters; it++) {
+        float sw = 0.0f, sr = 0.0f, sg = 0.0f, sb = 0.0f;
+        for (int i = 0; i < n_valid; i++) {
+            float dr = obs_r[i] - mu_r;
+            float dg = obs_g[i] - mu_g;
+            float db = obs_b[i] - mu_b;
+            float u  = sqrt(dr*dr + dg*dg + db*db) / cs;
+            float b  = (u < 1.0f) ? (1.0f - u*u) * (1.0f - u*u) : 0.0f;
+            float wgt = obs_w[i] * b;   // geometric prior × robust weight
+            sw += wgt;
+            sr += wgt * obs_r[i];
+            sg += wgt * obs_g[i];
+            sb += wgt * obs_b[i];
+        }
+        if (sw > 1e-8f) { mu_r = sr/sw; mu_g = sg/sw; mu_b = sb/sw; }
+    }
+
+    // ---- Phase 1: top n_final inliers by resolution, linear blend ----
+    int   best_i = -1, second_i = -1;
+    float best_res = -1.0f, second_res = -1.0f;
     for (int i = 0; i < n_valid; i++) {
         float dr = obs_r[i] - mu_r;
         float dg = obs_g[i] - mu_g;
         float db = obs_b[i] - mu_b;
-        float dev2 = dr*dr + dg*dg + db*db;
-        // Cauchy weight: w' = w / (1 + dev^2 / sigma^2)
-        float w2 = obs_w[i] / (1.0f + dev2 / sigma2);
-        sum_w2 += w2;
-        fin_r  += w2 * obs_r[i];
-        fin_g  += w2 * obs_g[i];
-        fin_b  += w2 * obs_b[i];
+        float u  = sqrt(dr*dr + dg*dg + db*db) / cs;
+        if (u >= 1.0f) continue;        // outlier — gated out by consensus
+        float r = obs_res[i];
+        if (r > best_res) {
+            second_res = best_res; second_i = best_i;
+            best_res   = r;        best_i   = i;
+        } else if (r > second_res) {
+            second_res = r;        second_i = i;
+        }
     }
-    float inv_sw2 = 1.0f / (sum_w2 + 1e-10f);
-    fin_r *= inv_sw2;
-    fin_g *= inv_sw2;
-    fin_b *= inv_sw2;
 
-    out_colors[gid * 3 + 0] = (uchar)clamp(fin_r * 255.0f, 0.0f, 255.0f);
-    out_colors[gid * 3 + 1] = (uchar)clamp(fin_g * 255.0f, 0.0f, 255.0f);
-    out_colors[gid * 3 + 2] = (uchar)clamp(fin_b * 255.0f, 0.0f, 255.0f);
+    float3 out_lin;
+    if (best_i < 0) {
+        // Degenerate: every view gated out — fall back to consensus color.
+        out_lin = srgb_to_linear((float3)(mu_r, mu_g, mu_b));
+    } else {
+        out_lin = srgb_to_linear((float3)(obs_r[best_i], obs_g[best_i],
+                                          obs_b[best_i])) * best_res;
+        float wsum = best_res;
+        if (n_final >= 2 && second_i >= 0) {
+            out_lin += srgb_to_linear((float3)(obs_r[second_i], obs_g[second_i],
+                                               obs_b[second_i])) * second_res;
+            wsum += second_res;
+        }
+        out_lin /= wsum;
+    }
+
+    float3 out_srgb = linear_to_srgb(out_lin) * 255.0f;
+    out_colors[gid * 3 + 0] = (uchar)clamp(out_srgb.x, 0.0f, 255.0f);
+    out_colors[gid * 3 + 1] = (uchar)clamp(out_srgb.y, 0.0f, 255.0f);
+    out_colors[gid * 3 + 2] = (uchar)clamp(out_srgb.z, 0.0f, 255.0f);
 }
 
 // =====================================================================

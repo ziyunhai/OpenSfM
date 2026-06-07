@@ -157,12 +157,17 @@ class SVOIntegratorCL {
   void RefineGeometry(int iters, float lambda_reg, float voxel_size,
                       float trunc_dist, float min_weight);
 
-  // Bake colors onto extracted surface points via top-2 view selection.
+  // Bake colors onto extracted surface points: a robust IRLS consensus
+  // gate followed by a top-n_final, resolution-weighted linear blend of
+  // the sharpest inlier views (see svo_bake_colors kernel).
   // |points| and |normals|: M×3 float arrays (on CPU).
   // |out_colors|: M×3 uint8_t RGB output.
+  // |n_final|: number of sharpest inlier views to blend (1 or 2).
+  // |irls_iters|: Tukey reweighting iterations for the consensus.
   void BakeColors(const std::vector<Vec3f>& points,
                   const std::vector<Vec3f>& normals,
-                  std::vector<Vec3<uint8_t>>* out_colors);
+                  std::vector<Vec3<uint8_t>>* out_colors,
+                  int n_final = 2, int irls_iters = 3);
 
   // --- Visibility pruning ---
   // Initialize carve/support vote buffers (same capacity as hash table).

@@ -304,7 +304,8 @@ void SVOFuser::RefineGeometry(int iters, float lambda_reg) {
 
 void SVOFuser::BakeColors(std::vector<Vec3f>& points,
                           std::vector<Vec3f>& normals,
-                          std::vector<Vec3<uint8_t>>* colors) {
+                          std::vector<Vec3<uint8_t>>* colors,
+                          int n_final, int irls_iters) {
   if (!integrator_) {
     throw std::runtime_error(
         "SVOFuser::BakeColors: Fuse() must be called first");
@@ -386,7 +387,7 @@ void SVOFuser::BakeColors(std::vector<Vec3f>& points,
 
   integrator_->PrepareRefinement(cameras, packed_colors, packed_masks,
                                  packed_depths, w0, h0, n_views);
-  integrator_->BakeColors(points, normals, colors);
+  integrator_->BakeColors(points, normals, colors, n_final, irls_iters);
 }
 
 void SVOFuser::PruneByVisibility(int iterations, float carve_margin,
