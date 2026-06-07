@@ -1021,13 +1021,18 @@ void SVOIntegratorCL::RefineGeometry(int iters, float lambda_reg,
   const float inv_voxel_size = 1.0f / voxel_size;
   const float min_weight_scaled = min_weight * kWeightScale;
   const float lr_sdf =
-      5000.0f * voxel_size;  // 1.0 for voxel=0.02: 20mm/iter max (clipped)
+      50.0f * voxel_size;  // 1.0 for voxel=0.02: ~0.1 step/iter (clipped)
   const float beta1 = 0.7f;
   const float beta2 = 0.999f;   // unused, kept for kernel API compat
   const float epsilon = 1e-8f;  // unused
   const int half_patch = 3;
   const float inv_sigma_s2 = -0.5f;    // sigma_spatial = 1 px
   const float inv_sigma_c2 = -325.0f;  // sigma_color = 10/255 ≈ 0.039
+  // Texture-confidence floor (patch-variance units, gray²).  Suppresses the
+  // photometric step in low-texture regions where the ZNCC gradient is
+  // noise-dominated; raise to suppress more speckle, lower to refine flatter
+  // areas.  Typical moderate-texture patch variance is ~0.005–0.02.
+  const float tex_floor = 0.01f;
 
   const int W = refine_img_width_;
   const int H = refine_img_height_;
@@ -1192,6 +1197,7 @@ void SVOIntegratorCL::RefineGeometry(int iters, float lambda_reg,
       k_refine_accumulate_.setArg(arg++, static_cast<cl_int>(half_patch));
       k_refine_accumulate_.setArg(arg++, inv_sigma_s2);
       k_refine_accumulate_.setArg(arg++, inv_sigma_c2);
+      k_refine_accumulate_.setArg(arg++, tex_floor);
 
       const size_t gw = static_cast<size_t>((W + 15) / 16 * 16);
       const size_t gh = static_cast<size_t>((H + 15) / 16 * 16);

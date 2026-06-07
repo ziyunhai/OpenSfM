@@ -1023,12 +1023,13 @@ float2 image_grad_array(read_only image2d_array_t images,
 // inv_sigma_s2: spatial weight exponent, e.g. -0.5 for sigma_s=1 pixel
 // inv_sigma_c2: bilateral weight exponent, e.g. -325.0 for sigma_c=10/255 in [0,1]
 //
-// Returns (ncc_score, d2ncc):
-//   ncc_score  ∈ [-1,1]
-//   d2ncc      = ∂NCC/∂I_j at center pixel (src layer center), per Pons-Keriven eq.(13)
-//              = w_center × (ref_norm_center - NCC×src_norm_center) / (σ_src × Σw)
-// Returns (-1, 0) when either patch variance < 1.5e-6 (flat/uniform region).
-float2 compute_zncc_array(
+// Returns (ncc_score, d2ncc, var_r, var_s):
+//   ncc_score   ∈ [-1,1]
+//   d2ncc       = ∂NCC/∂I_j at center pixel (src layer center), per Pons-Keriven eq.(13)
+//               = w_center × (ref_norm_center - NCC×src_norm_center) / (σ_src × Σw)
+//   var_r,var_s = windowed patch variances (texture/contrast confidence)
+// Returns (-1,0,0,0) when either patch variance < 1.5e-6 (flat/uniform region).
+float4 compute_zncc_array(
     read_only image2d_array_t images,
     int ref_layer, float ref_cx, float ref_cy,
     int src_layer, float src_cx, float src_cy,
@@ -1070,7 +1071,7 @@ float2 compute_zncc_array(
         }
     }
 
-    if (sum_w < 1e-6f) return (float2)(-1.0f, 0.0f);
+    if (sum_w < 1e-6f) return (float4)(-1.0f, 0.0f, 0.0f, 0.0f);
 
     float inv_w  = 1.0f / sum_w;
     float mean_r = sum_r * inv_w;
@@ -1078,7 +1079,7 @@ float2 compute_zncc_array(
     float var_r  = sum_rr * inv_w - mean_r * mean_r;
     float var_s  = sum_ss * inv_w - mean_s * mean_s;
 
-    if (var_r < 1.5e-6f || var_s < 1.5e-6f) return (float2)(-1.0f, 0.0f);
+    if (var_r < 1.5e-6f || var_s < 1.5e-6f) return (float4)(-1.0f, 0.0f, 0.0f, 0.0f);
 
     float sigma_r = sqrt(var_r);
     float sigma_s = sqrt(var_s);
@@ -1093,7 +1094,7 @@ float2 compute_zncc_array(
     float src_norm_c = -mean_s / sigma_s;
     float d2ncc = w_center * (ref_norm_c - ncc * src_norm_c) / (sigma_s * sum_w);
 
-    return (float2)(ncc, d2ncc);
+    return (float4)(ncc, d2ncc, var_r, var_s);
 }
 
 )CL"
@@ -1148,7 +1149,8 @@ __kernel void svo_refine_accumulate(
     float                     min_weight_scaled,
     int                       half_patch,
     float                     inv_sigma_s2,
-    float                     inv_sigma_c2)
+    float                     inv_sigma_c2,
+    float                     tex_floor)
 {
     int col = get_global_id(0);
     int row = get_global_id(1);
@@ -1207,7 +1209,7 @@ __kernel void svo_refine_accumulate(
 
     // ---- Accumulate photometric gradient from neighbor views ----
     float total_grad_d = 0.0f;
-    int n_valid_views  = 0;
+    float total_w      = 0.0f;  // sum of texture-confidence weights
 
     const int nb_offset = src_view * max_neighbors;
     for (int k = 0; k < max_neighbors; k++) {
@@ -1252,7 +1254,7 @@ __kernel void svo_refine_accumulate(
         if (cos_angle < 0.15f) continue;
 
         // ---- Bilateral ZNCC between source and target views ----
-        float2 zncc_result = compute_zncc_array(
+        float4 zncc_result = compute_zncc_array(
             color_images,
             src_view, (float)col, (float)row,
             j, px, py,
@@ -1260,16 +1262,26 @@ __kernel void svo_refine_accumulate(
 
         float ncc   = zncc_result.x;
         float d2ncc = zncc_result.y;
+        float var_r = zncc_result.z;
+        float var_s = zncc_result.w;
         if (ncc < -0.5f) continue;  // failed or flat patch
 
         // ---- SDF gradient: Pons-Keriven eq.(14) ----
         // Normal in camera j frame.
         float n_cam_x = cam_j->R[0]*normal.x + cam_j->R[1]*normal.y + cam_j->R[2]*normal.z;
         float n_cam_y = cam_j->R[3]*normal.x + cam_j->R[4]*normal.y + cam_j->R[5]*normal.z;
+        float n_cam_z = cam_j->R[6]*normal.x + cam_j->R[7]*normal.y + cam_j->R[8]*normal.z;
 
-        // Projected normal derivative: ∂(u,v)/∂d = (fx/z × n_cam_x, fy/z × n_cam_y)
-        float du_dn = fx_j * inv_zj * n_cam_x;
-        float dv_dn = fy_j * inv_zj * n_cam_y;
+        // Projected normal derivative: full perspective Jacobian of the
+        // projection (px,py) = (fx·X/z+cx, fy·Y/z+cy) w.r.t. moving the
+        // surface point along the world normal (X,Y,z) += δ·n_cam:
+        //   ∂px/∂δ = (1/z)·[fx·n_cam_x − (px−cx)·n_cam_z]
+        //   ∂py/∂δ = (1/z)·[fy·n_cam_y − (py−cy)·n_cam_z]
+        // The −(px−cx)·n_cam_z term is the dominant one for camera-facing
+        // surfaces (n_cam ≈ (0,0,−1)); dropping it leaves an essentially
+        // random gradient that destroys the surface.
+        float du_dn = inv_zj * (fx_j * n_cam_x - (px - cx_j) * n_cam_z);
+        float dv_dn = inv_zj * (fy_j * n_cam_y - (py - cy_j) * n_cam_z);
 
         // Image gradient ∇I_j at projected point.
         const sampler_t lin_samp = CLK_NORMALIZED_COORDS_FALSE |
@@ -1281,15 +1293,24 @@ __kernel void svo_refine_accumulate(
         // where E = 1 - NCC. Update kernel does φ_new = φ - lr*grad → descent.
         float proj_grad = ig.x * du_dn + ig.y * dv_dn;
         float g = d2ncc * proj_grad * cos_angle / (grad_len + 1e-6f);
-        total_grad_d -= g;  // accumulate ∂E/∂φ for gradient descent
 
-        n_valid_views++;
+        // Texture confidence: the ZNCC derivative carries a 1/σ factor that
+        // inflates low-contrast (low-texture) gradients to full magnitude even
+        // though they are noise-dominated.  Weight each view by its patch
+        // contrast (min variance over ref/src) to suppress that noise.
+        float w_tex = fmin(var_r, var_s);
+        total_grad_d += g * w_tex;  // accumulate weighted ∂E/∂φ for descent
+        total_w      += w_tex;
     }
 
-    if (n_valid_views == 0) return;
+    if (total_w <= 0.0f) return;
 
-    float inv_n = 1.0f / (float)n_valid_views;
-    total_grad_d *= inv_n;
+    // Confidence-weighted mean with a denominator floor: when the total
+    // texture confidence is small (low-texture surface point), dividing by
+    // (total_w + tex_floor) shrinks the step so the voxel keeps the smooth
+    // fused TSDF instead of speckling.  Well-textured points (total_w >>
+    // tex_floor) are essentially unaffected — a plain weighted mean.
+    total_grad_d /= (total_w + tex_floor);
 
     // Deposit gradient to nearest voxel slot.
     atomic_add_f(&grad_buf[nearest_slot], total_grad_d);
