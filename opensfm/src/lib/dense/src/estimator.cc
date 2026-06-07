@@ -664,7 +664,10 @@ void DepthmapEstimator::RunIteration(int iter, int width, int height) {
     k.setArg(arg++, params_.use_census ? 1.0f : 0.0f);
     k.setArg(arg++, color_flag);
     k.setArg(arg++, iter);
-    k.setArg(arg++, params_.smooth_weight);
+    float decay =
+        1.0f - 0.9f * static_cast<float>(iter) /
+                   static_cast<float>(std::max(params_.max_iterations - 1, 1));
+    k.setArg(arg++, params_.smooth_weight * decay);
     // Geometric consistency arguments.
     k.setArg(arg++, cl_prev_depths_);
     k.setArg(arg++, cl_prev_depth_mask_);

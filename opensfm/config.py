@@ -433,7 +433,7 @@ class OpenSfMConfig:
     # Save per-shot raw/clean PLYs and per-cluster debug PLYs (slow, for debugging only).
     depthmap_save_debug_ply: bool = True
     # Spatial sigma for bilateral NCC weighting
-    depthmap_sigma_spatial: float = 3.0
+    depthmap_sigma_spatial: float = 1.5
     # Color sigma for bilateral NCC weighting, in normalized [0,1] intensity units.
     depthmap_sigma_color: float = 25.0 / 255.0
     # Use Census transform as fallback when bilateral NCC fails (low-texture regions).
@@ -447,7 +447,7 @@ class OpenSfMConfig:
     # Maximum gap size in pixels for linear depth interpolation (0 = disabled)
     depthmap_gap_max_size: int = 0
     # Depth/normal smoothness weight for PatchMatch
-    depthmap_smooth_weight: float = 0
+    depthmap_smooth_weight: float = 0.2
     # Edge-stopping propagation gate weight (Perona-Malik). Penalizes adopting
     # a neighbor hypothesis across a strong image gradient.  0 = disabled.
     depthmap_propagation_edge_weight: float = 0
@@ -481,10 +481,11 @@ class OpenSfMConfig:
     depthmap_slic_grid_step: int = 15
     # SLIC compactness: balances spatial vs color proximity.
     # Higher values produce more regular (square-like) segments.
-    depthmap_slic_compactness: float = 60.0    # Mahalanobis distance threshold for per-segment outlier rejection
+    # Mahalanobis distance threshold for per-segment outlier rejection
+    depthmap_slic_compactness: float = 60.0
     # during cleaning.  Points exceeding this in the segment's robust
     # covariance are zeroed.  Lower = more aggressive filtering.
-    depthmap_slic_mahal_threshold: float = 3.0    
+    depthmap_slic_mahal_threshold: float = 3.0
     # Weight for geometric consistency cost (0 = disabled). Applied per source view.
     depthmap_geom_consistency_weight: float = 0.05
     # Maximum number of reference views per cluster for geometric consistency.
