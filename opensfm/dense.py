@@ -102,6 +102,7 @@ def compute_depthmaps(
         logger.info(
             f"Cluster assignments saved to {data.clusters_file()}")
 
+    clusters = clusters[1:2]
     # ── 1b. Per-cluster bounding boxes ─────────────────────────────────
     cluster_bboxes: List[Tuple[NDArray, NDArray]] = [
         _compute_cluster_bbox(cl, graph, reconstruction) for cl in clusters
@@ -625,17 +626,7 @@ def _setup_cluster_params(
     cluster.set_use_census(config["depthmap_use_census"])
     cluster.set_hierarchy_levels(config["depthmap_hierarchy_levels"])
     cluster.set_smooth_weight(config["depthmap_smooth_weight"])
-    cluster.set_edge_weight(config["depthmap_propagation_edge_weight"])
-    cluster.set_escape_depth_ratio(config["depthmap_escape_depth_ratio"])
-    cluster.set_center_color_weight(config["depthmap_center_color_weight"])
-    cluster.set_variance_gate(config["depthmap_variance_gate"])
     cluster.set_anchor_views(config["depthmap_anchor_views"])
-    cluster.set_far_gradient_threshold(config["depthmap_far_gradient_threshold"])
-    cluster.set_segmentation_enabled(config["depthmap_segmentation_enabled"])
-    cluster.set_slic_grid_step(config["depthmap_slic_grid_step"])
-    cluster.set_slic_compactness(config["depthmap_slic_compactness"])
-    if debug_dir:
-        cluster.set_debug_dir(debug_dir)
     cluster.set_checkerboard_filter(config["depthmap_checkerboard_filter"])
     cluster.set_speckle_min_size(config["depthmap_speckle_min_size"])
     cluster.set_gap_max_size(config["depthmap_gap_max_size"])
@@ -944,35 +935,6 @@ def _clean_views_batched_gpu(
             cleaned_depth = cleaner.clean(shot_to_idx[sid], nbr_indices)
             cleaned_arr = np.asarray(cleaned_depth, dtype=np.float32)
 
-            # Per-segment robust Mahalanobis outlier rejection.
-            if use_segment_filter:
-                shot = reconstruction.shots[sid]
-                h_d, w_d = cleaned_arr.shape[:2]
-                K_mat = shot.camera.get_K_in_pixel_coordinates(w_d, h_d)
-                gray = cv2.cvtColor(
-                    data.load_undistorted_image(sid), cv2.COLOR_RGB2GRAY
-                )
-                # Resize gray to match depthmap dimensions.
-                if gray.shape[0] != h_d or gray.shape[1] != w_d:
-                    gray = cv2.resize(
-                        gray, (w_d, h_d), interpolation=cv2.INTER_AREA
-                    )
-                gray_f = gray.astype(np.float32) / 255.0
-                cleaner.compute_slic(
-                    gray_f,
-                    config["depthmap_slic_grid_step"],
-                    config["depthmap_slic_compactness"],
-                )
-                cleaned_arr = np.asarray(
-                    cleaner.filter_mahalanobis(
-                        cleaned_arr,
-                        K_mat,
-                        config["depthmap_mahalanobis_threshold"],
-                        config["depthmap_mahalanobis_window_radius"],
-                    ),
-                    dtype=np.float32,
-                )
-
             pass1_depths[sid] = cleaned_arr
 
         if not two_pass:
@@ -1101,9 +1063,6 @@ def _clean_views_batched_gpu(
         )
         cleaner.set_grazing_cos_threshold(
             config["depthmap_grazing_cos_threshold"]
-        )
-        cleaner.set_edge_depth_ratio(
-            config["depthmap_edge_depth_ratio"]
         )
         cleaner.set_device(device_idx)
         try:
@@ -1540,8 +1499,10 @@ def _dsm_delaunay_fill(
         int_cols = int_cols[subsample]
 
     # Combine boundary + subsampled interior
-    all_rows = np.concatenate([bnd_rows, int_rows]) if len(int_rows) > 0 else bnd_rows
-    all_cols = np.concatenate([bnd_cols, int_cols]) if len(int_cols) > 0 else bnd_cols
+    all_rows = np.concatenate([bnd_rows, int_rows]) if len(
+        int_rows) > 0 else bnd_rows
+    all_cols = np.concatenate([bnd_cols, int_cols]) if len(
+        int_cols) > 0 else bnd_cols
     n_pts = len(all_rows)
     if n_pts < 3:
         return 0
@@ -1926,7 +1887,6 @@ def _fuse_per_cluster(
 
             return result
 
-
         # ── SVO fusion with sub-volume splitting ─────────────────
         voxel_size = config["depthmap_fusion_svo_voxel_size"]
         trunc_factor_cfg = config["depthmap_fusion_svo_trunc_factor"]
@@ -2133,26 +2093,8 @@ def _fuse_per_cluster(
             refine_enabled = config[
                 "depthmap_fusion_svo_refine_enabled"
             ]
-            prune_enabled = config[
-                "depthmap_fusion_svo_prune_enabled"
-            ]
-            if refine_enabled or prune_enabled:
+            if refine_enabled:
                 fuser.fuse_only()
-                if prune_enabled:
-                    fuser.prune_by_visibility(
-                        iterations=config[
-                            "depthmap_fusion_svo_prune_iterations"
-                        ],
-                        carve_margin=config[
-                            "depthmap_fusion_svo_prune_carve_margin"
-                        ],
-                        carve_threshold=config[
-                            "depthmap_fusion_svo_prune_carve_threshold"
-                        ],
-                        support_min=config[
-                            "depthmap_fusion_svo_prune_support_min"
-                        ],
-                    )
                 if refine_enabled:
                     fuser.refine_geometry(
                         iters=config[
@@ -2217,8 +2159,8 @@ def _fuse_per_cluster(
             if median_radius > 0:
                 dsm_grid = _dsm_median_filter(dsm_grid, median_radius)
                 logger.info(
-                    f"  Applied {2*median_radius+1}x"
-                    f"{2*median_radius+1} median filter"
+                    f"  Applied {2 * median_radius + 1}x"
+                    f"{2 * median_radius + 1} median filter"
                 )
 
             # --- Step 2: Delaunay triangulation hole fill ---
@@ -2644,127 +2586,6 @@ def scale_down_image(
     width = min(width, image.shape[1])
     height = min(height, image.shape[0])
     return scale_image(image, width, height, interpolation)
-
-
-def _segment_mahalanobis_filter(
-    depth: NDArray,
-    normal: NDArray,
-    image_gray: NDArray,
-    K: NDArray,
-    config: Dict[str, Any],
-) -> NDArray:
-    """Filter outlier depths per SLIC segment using robust Mahalanobis distance.
-
-    For each superpixel segment:
-      1. Backproject all valid depth pixels to 3D (camera frame).
-      2. Compute a robust covariance (trimmed to central 70% by depth).
-      3. Reject points with Mahalanobis distance > threshold.
-
-    This naturally rejects foreground smear: if a segment is mostly a
-    background plane, leaked foreground points will have high Mahalanobis
-    distance and get zeroed.
-
-    Args:
-        depth: (H, W) float32 depthmap.
-        normal: (H, W, 3) float32 normals (unused for now, kept for API).
-        image_gray: (H, W) uint8 grayscale reference image.
-        K: (3, 3) intrinsic matrix.
-        config: Configuration dict with SLIC parameters.
-
-    Returns:
-        Filtered depth (H, W) float32 with outliers zeroed.
-    """
-    h, w = depth.shape[:2]
-    grid_step: int = config.get("depthmap_slic_grid_step", 25)
-    compactness: float = config.get("depthmap_slic_compactness", 20.0)
-    mahal_threshold: float = config.get("depthmap_slic_mahal_threshold", 3.0)
-    min_segment_pts: int = max(16, grid_step * grid_step // 4)
-
-    # Run SLIC on the grayscale image (convert to LAB-like for cv2).
-    # cv2.ximgproc.createSuperpixelSLIC needs a color image.
-    img_color = cv2.cvtColor(image_gray, cv2.COLOR_GRAY2BGR)
-    slic = cv2.ximgproc.createSuperpixelSLIC(
-        img_color, cv2.ximgproc.SLIC, grid_step, compactness
-    )
-    slic.iterate(5)
-    slic.enforceLabelConnectivity(min_segment_pts)
-    labels = slic.getLabels()  # (H, W) int32
-    n_segments = slic.getNumberOfSuperpixels()
-
-    # Precompute pixel → 3D (camera frame).
-    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
-    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
-    valid = depth > 0
-    Z = depth.copy()
-    X = Z * (xx - cx) / fx
-    Y = Z * (yy - cy) / fy
-
-    # Stack into (H, W, 3) for easy indexing.
-    pts_3d = np.stack([X, Y, Z], axis=-1)  # (H, W, 3)
-
-    # Process each segment.
-    filtered = depth.copy()
-    n_rejected = 0
-
-    for seg_id in range(n_segments):
-        mask = (labels == seg_id) & valid
-        n_pts = int(np.count_nonzero(mask))
-        if n_pts < min_segment_pts:
-            continue
-
-        # Extract 3D points for this segment.
-        pts = pts_3d[mask]  # (N, 3)
-
-        # Robust covariance: trim to central 70% by depth (Z coord)
-        # to exclude outliers from the covariance estimate.
-        z_vals = pts[:, 2]
-        z_lo = np.percentile(z_vals, 15)
-        z_hi = np.percentile(z_vals, 85)
-        inlier_mask = (z_vals >= z_lo) & (z_vals <= z_hi)
-        n_inliers = int(np.count_nonzero(inlier_mask))
-        if n_inliers < 4:
-            continue
-
-        pts_trimmed = pts[inlier_mask]
-        mean = np.mean(pts_trimmed, axis=0)
-        centered = pts_trimmed - mean
-
-        # Compute covariance matrix.
-        cov = (centered.T @ centered) / (n_inliers - 1)
-
-        # Regularize to avoid singular matrix.
-        cov += np.eye(3, dtype=np.float32) * 1e-8
-
-        # Invert covariance.
-        try:
-            cov_inv = np.linalg.inv(cov)
-        except np.linalg.LinAlgError:
-            continue
-
-        # Mahalanobis distance for ALL points in segment (not just trimmed).
-        diff = pts - mean  # (N, 3)
-        # mahal² = diff @ cov_inv @ diff.T, computed row-wise.
-        mahal_sq = np.sum(diff @ cov_inv * diff, axis=1)  # (N,)
-
-        # Reject points exceeding threshold.
-        outliers = mahal_sq > (mahal_threshold * mahal_threshold)
-        n_out = int(np.count_nonzero(outliers))
-        if n_out > 0:
-            # Map back to image coordinates.
-            seg_indices = np.where(mask)
-            out_y = seg_indices[0][outliers]
-            out_x = seg_indices[1][outliers]
-            filtered[out_y, out_x] = 0.0
-            n_rejected += n_out
-
-    if n_rejected > 0:
-        logger.debug(
-            f"Segment Mahalanobis filter: rejected {n_rejected} pixels "
-            f"({100.0 * n_rejected / max(1, int(np.count_nonzero(valid))):.1f}%) "
-            f"across {n_segments} segments"
-        )
-
-    return filtered
 
 
 def _save_depthmap_as_ply(

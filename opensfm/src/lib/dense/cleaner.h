@@ -50,25 +50,6 @@ class GPUDepthmapCleaner {
 
   cv::Mat Clean(int ref_idx, const std::vector<int>& neighbor_ids);
 
-  /// Run SLIC segmentation on a grayscale image (uint8).
-  /// Returns label map (CV_32S, same size as input).
-  /// Also stores labels internally for use by FilterMahalanobis.
-  cv::Mat ComputeSLIC(const cv::Mat& gray, int grid_step = 25,
-                      float compactness = 20.0f);
-
-  /// Mahalanobis-based segment-aware depth filtering (GPU).
-  /// For each pixel, gathers same-segment neighbors in a window,
-  /// backprojects to 3D, fits robust covariance, and rejects outliers.
-  /// Must call ComputeSLIC first (or pass labels explicitly).
-  /// \param depth Input depth map (CV_32F).
-  /// \param K 3x3 intrinsics.
-  /// \param mahal_threshold Mahalanobis distance threshold (default 3.0).
-  /// \param window_radius Half-size of the NxN gather window (default 12).
-  /// \return Filtered depth map (CV_32F, outliers zeroed).
-  cv::Mat FilterMahalanobis(const cv::Mat& depth, const Mat3d& K,
-                            float mahal_threshold = 3.0f,
-                            int window_radius = 12);
-
   /// Remove all views and release GPU buffers.
   void Clear();
 
@@ -95,24 +76,10 @@ class GPUDepthmapCleaner {
 
   // Edge-aware parameters.
   float grazing_cos_threshold_ = 0.2f;
-  float edge_depth_ratio_ = 1.10f;
 
   bool kernel_built_ = false;
   cl::Program program_;
   cl::Kernel k_clean_;
-
-  // SLIC segmentation state.
-  bool slic_built_ = false;
-  cl::Program slic_program_;
-  cl::Kernel k_slic_init_;
-  cl::Kernel k_slic_assign_;
-  cl::Kernel k_slic_update_;
-  cv::Mat slic_labels_;  // CV_32S — last computed label map.
-
-  // Mahalanobis filter state.
-  bool mahal_built_ = false;
-  cl::Program mahal_program_;
-  cl::Kernel k_mahal_filter_;
 
   // Persistent GPU resources — reused across Clean() calls.
   cl::Buffer cl_cameras_;

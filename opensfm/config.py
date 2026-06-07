@@ -428,8 +428,6 @@ class OpenSfMConfig:
     depthmap_carving_two_pass: bool = True
     # Cosine threshold for grazing-angle detection (below → pixel is grazing, stricter filtering).
     depthmap_grazing_cos_threshold: float = 0.2
-    # Depth ratio threshold for 3×3 edge detection (e.g. 1.10 → 10% discontinuity = edge pixel).
-    depthmap_edge_depth_ratio: float = 100.0
     # Save per-shot raw/clean PLYs and per-cluster debug PLYs (slow, for debugging only).
     depthmap_save_debug_ply: bool = True
     # Spatial sigma for bilateral NCC weighting
@@ -448,44 +446,10 @@ class OpenSfMConfig:
     depthmap_gap_max_size: int = 0
     # Depth/normal smoothness weight for PatchMatch
     depthmap_smooth_weight: float = 0.2
-    # Edge-stopping propagation gate weight (Perona-Malik). Penalizes adopting
-    # a neighbor hypothesis across a strong image gradient.  0 = disabled.
-    depthmap_propagation_edge_weight: float = 0
-    # Depth-discontinuity escape ratio for PatchMatch refinement.
-    # If a neighbor's depth exceeds current_depth × this ratio, an escape
-    # hypothesis is tried using the deeper neighbor's plane.  0 or ≤1 = disabled.
-    depthmap_escape_depth_ratio: float = 0
-    # Center-pixel color consensus weight.  Penalizes hypotheses where the
-    # projected center pixel in source views has different intensity than the
-    # reference.  Catches wrong-surface assignments.  0 = disabled.
-    depthmap_center_color_weight: float = 0
-    # Variance gate for propagation.  If the 3×3 local intensity variance
-    # (std-dev) is below this threshold, neighbor propagation is blocked
-    # (random refinement still works).  Prevents foreground leaking into
-    # textureless background.  0 = disabled.
-    depthmap_variance_gate: float = 0
     # Number of views from previous iteration that are forcibly kept in the
     # view selection (anchoring).  Prevents CDF from narrowing to only views
     # that validate a potentially wrong hypothesis.  0 = disabled.
     depthmap_anchor_views: int = 2
-    # Far-propagation gradient gate threshold.  If the max intensity step
-    # between current pixel and a far candidate (sampled at 4 points along
-    # the line) exceeds this, the far candidate is discarded.  Prevents
-    # propagation across object boundaries.  0 = disabled.
-    # Intensity is in [0, 1] so 0.1 = 10% step.
-    depthmap_far_gradient_threshold: float = 0
-    # SLIC segmentation-gated propagation: block PatchMatch propagation
-    # across superpixel boundaries to prevent foreground-background smear.
-    depthmap_segmentation_enabled: bool = False
-    # Grid step for SLIC superpixels (at half resolution). Larger = bigger segments.
-    depthmap_slic_grid_step: int = 15
-    # SLIC compactness: balances spatial vs color proximity.
-    # Higher values produce more regular (square-like) segments.
-    # Mahalanobis distance threshold for per-segment outlier rejection
-    depthmap_slic_compactness: float = 60.0
-    # during cleaning.  Points exceeding this in the segment's robust
-    # covariance are zeroed.  Lower = more aggressive filtering.
-    depthmap_slic_mahal_threshold: float = 3.0
     # Weight for geometric consistency cost (0 = disabled). Applied per source view.
     depthmap_geom_consistency_weight: float = 0.05
     # Maximum number of reference views per cluster for geometric consistency.
@@ -538,17 +502,6 @@ class OpenSfMConfig:
     depthmap_fusion_svo_refine_iters: int = 20
     # Laplacian regularization weight (0 = disabled).
     depthmap_fusion_svo_refine_lambda_reg: float = 0.0
-    # Visibility-based pruning of TSDF voxels (removes foreground smear).
-    # Enable raycast-vote-prune passes after SVO fusion.
-    depthmap_fusion_svo_prune_enabled: bool = False
-    # Number of raycast-vote-prune iterations (typically 1-2).
-    depthmap_fusion_svo_prune_iterations: int = 3
-    # Relative depth margin for carve votes (e.g. 0.05 = 5% further = carve).
-    depthmap_fusion_svo_prune_carve_margin: float = 0.05
-    # Min carve votes to trigger pruning of a voxel.
-    depthmap_fusion_svo_prune_carve_threshold: int = 1
-    # Min support votes to protect a voxel from pruning.
-    depthmap_fusion_svo_prune_support_min: int = 2
 
     ##################################
     # Params for octree point cloud tiling (viewer streaming)

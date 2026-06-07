@@ -27,17 +27,9 @@ struct DepthmapParams {
   float depth_max = 1.0f;
   int hierarchy_levels = 1;
   float smooth_weight = 0.0f;
-  float edge_weight = 0.0f;
-  float escape_depth_ratio = 0.0f;   // >1 to enable (e.g. 1.5)
-  float center_color_weight = 0.0f;  // penalty for center-pixel color mismatch
-  float variance_gate = 0.0f;        // block propagation below this variance
-  int anchor_views = 0;              // fixed view anchors from prev iteration
-  float far_gradient_threshold = 0.0f;  // block far propagation across edges
-  bool segmentation_enabled = false;    // SLIC segmentation-gated propagation
-  int slic_grid_step = 25;              // grid step at half-res (pixels)
-  float slic_compactness = 20.0f;       // spatial vs color balance
-  std::string debug_dir;                // if non-empty, save debug images here
-  std::string debug_shot_id;            // shot ID for debug filenames
+  int anchor_views = 0;       // fixed view anchors from prev iteration
+  std::string debug_dir;      // if non-empty, save debug images here
+  std::string debug_shot_id;  // shot ID for debug filenames
   bool checkerboard_filter = false;
   int speckle_min_size = 100;  // Remove connected components smaller than this
   int gap_max_size = 7;        // Interpolate gaps up to this many pixels
@@ -90,7 +82,6 @@ class DepthmapEstimator {
   void UploadPreviousDepths(int width, int height);
   void ReadBackResults(DepthmapResult* result, int width, int height,
                        bool apply_median = true);
-  void RunSLIC(int width, int height);
   static void RemoveSmallSegments(ImageF& depth, PixelData3f& normal, int width,
                                   int height, int min_segment_size,
                                   float depth_diff_threshold);
@@ -145,15 +136,7 @@ class DepthmapEstimator {
   cl::Buffer cl_plane_masks_;
   cl::Buffer cl_prev_depths_;
   cl_uint cl_prev_depth_mask_ = 0u;
-  cl::Buffer cl_angle_weights_;   // per-source-view angle weight (kMaxSources)
-  cl::Buffer cl_segment_labels_;  // per-pixel SLIC segment label (full-res)
-
-  // SLIC segmentation kernels
-  cl::Program slic_program_;
-  cl::Kernel k_slic_init_;
-  cl::Kernel k_slic_assign_;
-  cl::Kernel k_slic_update_;
-  bool slic_enabled_ = false;
+  cl::Buffer cl_angle_weights_;  // per-source-view angle weight (kMaxSources)
 
   // Image-from-buffer zero-copy aliasing (cl_khr_image2d_from_buffer).
   // When supported, planes_img_ and costs_img_ alias the buffer memory

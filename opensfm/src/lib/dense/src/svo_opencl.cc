@@ -60,15 +60,6 @@ void SVOIntegratorCL::BuildKernels() {
   k_raycast_ = cl::Kernel(program_, "svo_raycast", &err);
   opencl::CheckCL(err, "kernel svo_raycast");
 
-  k_carve_vote_ = cl::Kernel(program_, "svo_carve_vote", &err);
-  opencl::CheckCL(err, "kernel svo_carve_vote");
-
-  k_prune_ = cl::Kernel(program_, "svo_prune", &err);
-  opencl::CheckCL(err, "kernel svo_prune");
-
-  k_clear_votes_ = cl::Kernel(program_, "svo_clear_votes", &err);
-  opencl::CheckCL(err, "kernel svo_clear_votes");
-
   // 1-byte dummy buffer used as placeholder when normal/color/mask is absent.
   cl_dummy_ =
       cl::Buffer(dev.context(), static_cast<cl_mem_flags>(CL_MEM_READ_ONLY),

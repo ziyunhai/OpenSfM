@@ -39,8 +39,6 @@ void GPUDepthmapCleaner::SetGrazingCosThreshold(float t) {
   grazing_cos_threshold_ = t;
 }
 
-void GPUDepthmapCleaner::SetEdgeDepthRatio(float r) { edge_depth_ratio_ = r; }
-
 int GPUDepthmapCleaner::AddView(const Mat3d& K, const Mat3d& R, const Vec3d& t,
                                 const ImageF& depth) {
   ViewEntry v;
@@ -218,7 +216,6 @@ cv::Mat GPUDepthmapCleaner::Clean(int ref_idx,
   k_clean_.setArg(arg++, carving_threshold_);
   k_clean_.setArg(arg++, max_carved_views_);
   k_clean_.setArg(arg++, grazing_cos_threshold_);
-  k_clean_.setArg(arg++, edge_depth_ratio_);
   k_clean_.setArg(arg++, has_normal_int);
 
   cl::NDRange global(static_cast<size_t>((w + 15) / 16 * 16),
@@ -234,205 +231,6 @@ cv::Mat GPUDepthmapCleaner::Clean(int ref_idx,
   return cleaned;
 }
 
-// =====================================================================
-// SLIC segmentation on GPU — reuses kSLICKernelSource from
-// opencl_kernels.h.  Returns label map and stores it internally.
-// =====================================================================
-cv::Mat GPUDepthmapCleaner::ComputeSLIC(const cv::Mat& gray, int grid_step,
-                                        float compactness) {
-  auto& dev = opencl::CLContext::Instance().Device(device_idx_);
-  cl::Context& cl_ctx = dev.context();
-  cl::CommandQueue& queue = dev.queue();
-  cl_int err;
-
-  // Build SLIC kernels once.
-  if (!slic_built_) {
-    slic_program_ = dev.GetOrBuildProgram("slic", kSLICKernelSource);
-    k_slic_init_ = cl::Kernel(slic_program_, "slic_init_centers", &err);
-    opencl::CheckCL(err, "slic_init_centers");
-    k_slic_assign_ = cl::Kernel(slic_program_, "slic_assign_pixels", &err);
-    opencl::CheckCL(err, "slic_assign_pixels");
-    k_slic_update_ = cl::Kernel(slic_program_, "slic_update_centers", &err);
-    opencl::CheckCL(err, "slic_update_centers");
-    slic_built_ = true;
-  }
-
-  const int w = gray.cols;
-  const int h = gray.rows;
-  const int npix = w * h;
-
-  // Convert to float [0,1].
-  cv::Mat float_img;
-  gray.convertTo(float_img, CV_32F, 1.0 / 255.0);
-
-  // Upload as Image2D.
-  cl::ImageFormat fmt(CL_R, CL_FLOAT);
-  cl::Image2D cl_img(cl_ctx, CL_MEM_READ_ONLY, fmt, w, h, 0, nullptr, &err);
-  opencl::CheckCL(err, "SLIC image upload");
-  cl::array<cl::size_type, 3> origin = {{0, 0, 0}};
-  cl::array<cl::size_type, 3> region = {
-      {static_cast<cl::size_type>(w), static_cast<cl::size_type>(h), 1}};
-  queue.enqueueWriteImage(cl_img, CL_TRUE, origin, region, float_img.step[0], 0,
-                          float_img.data);
-
-  // Grid dimensions.
-  const int centers_x = (w + grid_step - 1) / grid_step;
-  const int centers_y = (h + grid_step - 1) / grid_step;
-  const int num_centers = centers_x * centers_y;
-
-  // Allocate buffers.
-  const size_t center_size = 16;  // float x,y,intensity + int count
-  cl::Buffer cl_centers(cl_ctx, CL_MEM_READ_WRITE, center_size * num_centers,
-                        nullptr, &err);
-  opencl::CheckCL(err, "SLIC centers");
-  cl::Buffer cl_labels(cl_ctx, CL_MEM_READ_WRITE, sizeof(int) * npix, nullptr,
-                       &err);
-  opencl::CheckCL(err, "SLIC labels");
-
-  // Init centers.
-  {
-    int arg = 0;
-    k_slic_init_.setArg(arg++, cl_centers);
-    k_slic_init_.setArg(arg++, cl_img);
-    k_slic_init_.setArg(arg++, w);
-    k_slic_init_.setArg(arg++, h);
-    k_slic_init_.setArg(arg++, grid_step);
-    k_slic_init_.setArg(arg++, centers_x);
-    k_slic_init_.setArg(arg++, centers_y);
-    cl::NDRange global(static_cast<size_t>((centers_x + 15) / 16 * 16),
-                       static_cast<size_t>((centers_y + 15) / 16 * 16));
-    queue.enqueueNDRangeKernel(k_slic_init_, cl::NullRange, global,
-                               cl::NDRange(16, 16));
-  }
-
-  // Iterate: assign + update.
-  for (int it = 0; it < 5; ++it) {
-    {
-      int arg = 0;
-      k_slic_assign_.setArg(arg++, cl_centers);
-      k_slic_assign_.setArg(arg++, cl_labels);
-      k_slic_assign_.setArg(arg++, cl_img);
-      k_slic_assign_.setArg(arg++, w);
-      k_slic_assign_.setArg(arg++, h);
-      k_slic_assign_.setArg(arg++, grid_step);
-      k_slic_assign_.setArg(arg++, centers_x);
-      k_slic_assign_.setArg(arg++, centers_y);
-      k_slic_assign_.setArg(arg++, compactness);
-      cl::NDRange global(static_cast<size_t>((w + 15) / 16 * 16),
-                         static_cast<size_t>((h + 15) / 16 * 16));
-      queue.enqueueNDRangeKernel(k_slic_assign_, cl::NullRange, global,
-                                 cl::NDRange(16, 16));
-    }
-    {
-      int arg = 0;
-      k_slic_update_.setArg(arg++, cl_centers);
-      k_slic_update_.setArg(arg++, cl_labels);
-      k_slic_update_.setArg(arg++, cl_img);
-      k_slic_update_.setArg(arg++, w);
-      k_slic_update_.setArg(arg++, h);
-      k_slic_update_.setArg(arg++, grid_step);
-      k_slic_update_.setArg(arg++, centers_x);
-      k_slic_update_.setArg(arg++, centers_y);
-      cl::NDRange global(static_cast<size_t>((centers_x + 15) / 16 * 16),
-                         static_cast<size_t>((centers_y + 15) / 16 * 16));
-      queue.enqueueNDRangeKernel(k_slic_update_, cl::NullRange, global,
-                                 cl::NDRange(16, 16));
-    }
-  }
-
-  // Read back labels.
-  queue.finish();
-  slic_labels_ = cv::Mat(h, w, CV_32S);
-  queue.enqueueReadBuffer(cl_labels, CL_TRUE, 0, sizeof(int) * npix,
-                          slic_labels_.ptr<int>());
-  return slic_labels_.clone();
-}
-
-// =====================================================================
-// Mahalanobis segment-aware depth filter — GPU dispatch.
-// =====================================================================
-cv::Mat GPUDepthmapCleaner::FilterMahalanobis(const cv::Mat& depth,
-                                              const Mat3d& K,
-                                              float mahal_threshold,
-                                              int window_radius) {
-  if (slic_labels_.empty()) {
-    throw std::runtime_error("FilterMahalanobis: must call ComputeSLIC first");
-  }
-
-  auto& dev = opencl::CLContext::Instance().Device(device_idx_);
-  cl::Context& cl_ctx = dev.context();
-  cl::CommandQueue& queue = dev.queue();
-  cl_int err;
-
-  // Build Mahalanobis kernel once.
-  if (!mahal_built_) {
-    mahal_program_ = dev.BuildProgram(kMahalanobisKernelSource);
-    k_mahal_filter_ = cl::Kernel(mahal_program_, "mahalanobis_filter", &err);
-    opencl::CheckCL(err, "mahalanobis_filter kernel");
-    mahal_built_ = true;
-  }
-
-  const int w = depth.cols;
-  const int h = depth.rows;
-  const int npix = w * h;
-
-  // Resize labels to match depth if needed.
-  cv::Mat labels = slic_labels_;
-  if (labels.cols != w || labels.rows != h) {
-    cv::resize(labels, labels, cv::Size(w, h), 0, 0, cv::INTER_NEAREST);
-  }
-
-  // Upload depth, labels.
-  cl::Buffer cl_depth_in(cl_ctx, CL_MEM_READ_ONLY, sizeof(float) * npix,
-                         nullptr, &err);
-  opencl::CheckCL(err, "mahal depth_in");
-  cl::Buffer cl_depth_out(cl_ctx, CL_MEM_WRITE_ONLY, sizeof(float) * npix,
-                          nullptr, &err);
-  opencl::CheckCL(err, "mahal depth_out");
-  cl::Buffer cl_labels(cl_ctx, CL_MEM_READ_ONLY, sizeof(int) * npix, nullptr,
-                       &err);
-  opencl::CheckCL(err, "mahal labels");
-
-  cv::Mat depth_cont = depth.isContinuous() ? depth : depth.clone();
-  cv::Mat labels_cont = labels.isContinuous() ? labels : labels.clone();
-
-  queue.enqueueWriteBuffer(cl_depth_in, CL_TRUE, 0, sizeof(float) * npix,
-                           depth_cont.ptr<float>());
-  queue.enqueueWriteBuffer(cl_labels, CL_TRUE, 0, sizeof(int) * npix,
-                           labels_cont.ptr<int>());
-
-  // Extract intrinsics.
-  float fx = static_cast<float>(K(0, 0));
-  float fy = static_cast<float>(K(1, 1));
-  float cx = static_cast<float>(K(0, 2));
-  float cy = static_cast<float>(K(1, 2));
-
-  // Set kernel args.
-  int arg = 0;
-  k_mahal_filter_.setArg(arg++, cl_depth_in);
-  k_mahal_filter_.setArg(arg++, cl_depth_out);
-  k_mahal_filter_.setArg(arg++, cl_labels);
-  k_mahal_filter_.setArg(arg++, fx);
-  k_mahal_filter_.setArg(arg++, fy);
-  k_mahal_filter_.setArg(arg++, cx);
-  k_mahal_filter_.setArg(arg++, cy);
-  k_mahal_filter_.setArg(arg++, w);
-  k_mahal_filter_.setArg(arg++, h);
-  k_mahal_filter_.setArg(arg++, window_radius);
-  k_mahal_filter_.setArg(arg++, mahal_threshold);
-
-  cl::NDRange global(static_cast<size_t>((w + 15) / 16 * 16),
-                     static_cast<size_t>((h + 15) / 16 * 16));
-  queue.enqueueNDRangeKernel(k_mahal_filter_, cl::NullRange, global,
-                             cl::NDRange(16, 16));
-  queue.finish();
-
-  cv::Mat result(h, w, CV_32F);
-  queue.enqueueReadBuffer(cl_depth_out, CL_TRUE, 0, sizeof(float) * npix,
-                          result.ptr<float>());
-  return result;
-}
-
 void GPUDepthmapCleaner::Clear() {
   views_.clear();
   // Release GPU resources.
@@ -446,7 +244,6 @@ void GPUDepthmapCleaner::Clear() {
   cl_src_depth_imgs_.clear();
   cl_img_w_ = 0;
   cl_img_h_ = 0;
-  slic_labels_ = cv::Mat();
 }
 
 GPUDepthmapCleaner::~GPUDepthmapCleaner() {

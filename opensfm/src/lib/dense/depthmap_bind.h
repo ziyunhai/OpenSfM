@@ -27,17 +27,7 @@ class DepthmapClusterEstimatorWrapper {
   void SetTopK(int k) { params_.top_k = k; }
   void SetUseCensus(bool v) { params_.use_census = v; }
   void SetSmoothWeight(float w) { params_.smooth_weight = w; }
-  void SetEdgeWeight(float w) { params_.edge_weight = w; }
-  void SetEscapeDepthRatio(float r) { params_.escape_depth_ratio = r; }
-  void SetCenterColorWeight(float w) { params_.center_color_weight = w; }
-  void SetVarianceGate(float v) { params_.variance_gate = v; }
   void SetAnchorViews(int n) { params_.anchor_views = n; }
-  void SetFarGradientThreshold(float t) { params_.far_gradient_threshold = t; }
-  void SetSegmentationEnabled(bool v) { params_.segmentation_enabled = v; }
-  void SetSLICGridStep(int v) { params_.slic_grid_step = v; }
-  void SetSLICCompactness(float v) { params_.slic_compactness = v; }
-  void SetDebugDir(const std::string& dir) { params_.debug_dir = dir; }
-  void SetDebugShotId(const std::string& id) { params_.debug_shot_id = id; }
   void SetCheckerboardFilter(bool v) { params_.checkerboard_filter = v; }
   void SetSpeckleMinSize(int v) { params_.speckle_min_size = v; }
   void SetGapMaxSize(int v) { params_.gap_max_size = v; }
@@ -163,36 +153,6 @@ class DepthmapCleanerWrapper {
                                           cleaned.cols);
   }
 
-  foundation::pyarray_int ComputeSLIC(Eigen::Ref<const ImageU8> gray,
-                                      int grid_step, float compactness) {
-    cv::Mat gray_cv(static_cast<int>(gray.rows()),
-                    static_cast<int>(gray.cols()), CV_8U,
-                    const_cast<uint8_t*>(gray.data()));
-    cv::Mat labels;
-    {
-      py::gil_scoped_release release;
-      labels = cleaner_.ComputeSLIC(gray_cv, grid_step, compactness);
-    }
-    return foundation::py_array_from_data(labels.ptr<int>(0), labels.rows,
-                                          labels.cols);
-  }
-
-  foundation::pyarray_f FilterMahalanobis(Eigen::Ref<const ImageF> depth,
-                                          const Mat3d& K, float mahal_threshold,
-                                          int window_radius) {
-    cv::Mat depth_cv(static_cast<int>(depth.rows()),
-                     static_cast<int>(depth.cols()), CV_32F,
-                     const_cast<float*>(depth.data()));
-    cv::Mat result;
-    {
-      py::gil_scoped_release release;
-      result = cleaner_.FilterMahalanobis(depth_cv, K, mahal_threshold,
-                                          window_radius);
-    }
-    return foundation::py_array_from_data(result.ptr<float>(0), result.rows,
-                                          result.cols);
-  }
-
   static bool IsAvailable() {
     return opencl::CLContext::Instance().IsAvailable();
   }
@@ -225,17 +185,7 @@ class DepthmapClusterEstimatorWrapper {
   void SetTopK(int) {}
   void SetUseCensus(bool) {}
   void SetSmoothWeight(float) {}
-  void SetEdgeWeight(float) {}
-  void SetEscapeDepthRatio(float) {}
-  void SetCenterColorWeight(float) {}
-  void SetVarianceGate(float) {}
   void SetAnchorViews(int) {}
-  void SetFarGradientThreshold(float) {}
-  void SetSegmentationEnabled(bool) {}
-  void SetSLICGridStep(int) {}
-  void SetSLICCompactness(float) {}
-  void SetDebugDir(const std::string&) {}
-  void SetDebugShotId(const std::string&) {}
   void SetCheckerboardFilter(bool) {}
   void SetSpeckleMinSize(int) {}
   void SetGapMaxSize(int) {}
@@ -286,13 +236,6 @@ class DepthmapCleanerWrapper {
     throw std::runtime_error("GPUDepthmapCleaner: OpenCL not available");
   }
   foundation::pyarray_f Clean(int, const py::array_t<int>&) {
-    throw std::runtime_error("GPUDepthmapCleaner: OpenCL not available");
-  }
-  foundation::pyarray_int ComputeSLIC(Eigen::Ref<const ImageF>, int, float) {
-    throw std::runtime_error("GPUDepthmapCleaner: OpenCL not available");
-  }
-  foundation::pyarray_f FilterMahalanobis(Eigen::Ref<const ImageF>,
-                                          const Mat3d&, float, int) {
     throw std::runtime_error("GPUDepthmapCleaner: OpenCL not available");
   }
   void Clear() {}

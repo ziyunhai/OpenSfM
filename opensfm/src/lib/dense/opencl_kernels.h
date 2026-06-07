@@ -315,8 +315,7 @@ int compute_cost_vector(
     float sigma_color,
     float census_weight,
     float *out_costs,
-    read_only image2d_array_t src_images,
-    float center_color_weight
+    read_only image2d_array_t src_images
 ) {
   int n_src = min(num_images - 1, MAX_SOURCES);
   const sampler_t samp = CLK_NORMALIZED_COORDS_FALSE |
@@ -488,23 +487,6 @@ int compute_cost_vector(
     }
   }
 
-
-  // Center-pixel color consensus penalty: if the projected center in a
-  // source view has significantly different intensity, the hypothesis
-  // likely maps to the wrong surface.  Penalty ramps linearly from 0
-  // (within 1x sigma_color) to center_color_weight (at 2x sigma_color).
-  if (center_color_weight > 0.0f) {
-    float inv_sc = 1.0f / max(sigma_color, 1e-6f);
-    for (int s = 0; s < n_src; s++) {
-      if (out_costs[s] >= 2.0f) continue;  // already invalid
-      float cc_diff = fabs(ref_center - src_centers[s]);
-      float cc_excess = cc_diff * inv_sc - 1.0f;
-      if (cc_excess > 0.0f) {
-        out_costs[s] += center_color_weight * fmin(cc_excess, 1.0f);
-      }
-    }
-  }
-
   return n_src;
 })CL"
     R"CL(
@@ -526,8 +508,7 @@ float compute_initial_cost_and_views(
     int top_k,
     float census_weight,
     uint *out_selected,
-    read_only image2d_array_t src_images,
-    float center_color_weight
+    read_only image2d_array_t src_images
 ) {
   float cost_vector[MAX_SOURCES];
   float cost_copy[MAX_SOURCES];
@@ -539,7 +520,7 @@ float compute_initial_cost_and_views(
 
   compute_cost_vector(ref_img, cameras, num_images, x, y, plane,
                       half_patch, sigma_spatial, sigma_color, census_weight,
-                      cost_vector, src_images, center_color_weight);
+                      cost_vector, src_images);
 
   int num_valid = 0;
   for (int i = 0; i < n_src; i++) {
@@ -943,8 +924,7 @@ __kernel void acmmp_random_init(
     float sigma_spatial,
     float sigma_color,
     int top_k,
-    float census_weight,
-    float center_color_weight
+    float census_weight
 ) {
   int x = get_global_id(0);
   int y = get_global_id(1);
@@ -980,7 +960,7 @@ __kernel void acmmp_random_init(
   costs[idx] = compute_initial_cost_and_views(
       ref_img, cameras, num_images,
       x, y, plane, half_patch, sigma_spatial, sigma_color, top_k,
-      census_weight, &sel, src_images, center_color_weight);
+      census_weight, &sel, src_images);
   selected_views[idx] = sel;
 }
 
@@ -1022,8 +1002,7 @@ __kernel void acmmp_prior_reinit(
     float smooth_weight,
     __global const float *prev_depths,
     uint prev_depth_mask,
-    float geom_weight,
-    float center_color_weight
+    float geom_weight
 ) {
   int x = get_global_id(0);
   int y = get_global_id(1);
@@ -1078,8 +1057,7 @@ __kernel void acmmp_prior_reinit(
     float cost = compute_initial_cost_and_views(
         ref_img, cameras, num_images,
         x, y, plane, half_patch, sigma_spatial, sigma_color, top_k,
-        census_weight, &sel,
-        src_images, center_color_weight);
+        census_weight, &sel, src_images);
 
     if (smooth_weight > 1e-6f) {
       cost += smooth_weight * compute_smoothness_cost(planes_img, &cameras[0],
@@ -1101,7 +1079,7 @@ __kernel void acmmp_prior_reinit(
   compute_cost_vector(ref_img, cameras, num_images, x, y, plane,
       half_patch, sigma_spatial, sigma_color, census_weight,
       cost_vec,
-      src_images, center_color_weight);
+      src_images);
 
   float cost = compute_weighted_cost_geom(cost_vec, view_weights, weight_norm,
       n_src, cameras, plane, x, y,
@@ -1161,14 +1139,8 @@ __kernel void acmmp_patchmatch(
     float geom_weight,
     __global const PlaneHypothesis *prior_planes,
     __global const uint *plane_masks,
-    float edge_weight,
-    float escape_depth_ratio,
-    float center_color_weight,
-    float variance_gate,
     int anchor_views,
-    float far_gradient_threshold,
-    __global const float *angle_weights,
-    __global const int *segment_labels
+    __global const float *angle_weights
 ) {
   // Dense checkerboard indexing: grid is (half_width x height), reconstruct
   // true pixel coordinates so all SIMD lanes are active on Apple Silicon.
@@ -1212,7 +1184,7 @@ __kernel void acmmp_patchmatch(
     compute_cost_vector(ref_img, cameras, num_images, x, y,
         best_plane, half_patch, sigma_spatial, sigma_color, census_weight,
         &cost_array[1 * MAX_SOURCES],
-        src_images, center_color_weight);
+        src_images);
   }
 
   // --- Far down ---
@@ -1230,7 +1202,7 @@ __kernel void acmmp_patchmatch(
     compute_cost_vector(ref_img, cameras, num_images, x, y,
         best_plane, half_patch, sigma_spatial, sigma_color, census_weight,
         &cost_array[3 * MAX_SOURCES],
-        src_images, center_color_weight);
+        src_images);
   }
 
   // --- Far left ---
@@ -1248,7 +1220,7 @@ __kernel void acmmp_patchmatch(
     compute_cost_vector(ref_img, cameras, num_images, x, y,
         best_plane, half_patch, sigma_spatial, sigma_color, census_weight,
         &cost_array[5 * MAX_SOURCES],
-        src_images, center_color_weight);
+        src_images);
   }
 
   // --- Far right ---
@@ -1266,7 +1238,7 @@ __kernel void acmmp_patchmatch(
     compute_cost_vector(ref_img, cameras, num_images, x, y,
         best_plane, half_patch, sigma_spatial, sigma_color, census_weight,
         &cost_array[7 * MAX_SOURCES],
-        src_images, center_color_weight);
+        src_images);
   }
 
   // --- Near up (with diagonal V-shape search) ---
@@ -1290,7 +1262,7 @@ __kernel void acmmp_patchmatch(
     compute_cost_vector(ref_img, cameras, num_images, x, y,
         best_plane, half_patch, sigma_spatial, sigma_color, census_weight,
         &cost_array[0 * MAX_SOURCES],
-        src_images, center_color_weight);
+        src_images);
   }
 )CL"
     R"CL(
@@ -1316,7 +1288,7 @@ __kernel void acmmp_patchmatch(
     compute_cost_vector(ref_img, cameras, num_images, x, y,
         best_plane, half_patch, sigma_spatial, sigma_color, census_weight,
         &cost_array[2 * MAX_SOURCES],
-        src_images, center_color_weight);
+        src_images);
   }
 
   // --- Near left ---
@@ -1340,7 +1312,7 @@ __kernel void acmmp_patchmatch(
     compute_cost_vector(ref_img, cameras, num_images, x, y,
         best_plane, half_patch, sigma_spatial, sigma_color, census_weight,
         &cost_array[4 * MAX_SOURCES],
-        src_images, center_color_weight);
+        src_images);
   }
 
   // --- Near right ---
@@ -1364,7 +1336,7 @@ __kernel void acmmp_patchmatch(
     compute_cost_vector(ref_img, cameras, num_images, x, y,
         best_plane, half_patch, sigma_spatial, sigma_color, census_weight,
         &cost_array[6 * MAX_SOURCES],
-        src_images, center_color_weight);
+        src_images);
   }
 
   // =================================================================
@@ -1544,8 +1516,7 @@ __kernel void acmmp_patchmatch(
   for (int i = 0; i < MAX_SOURCES; i++) cost_vec_now[i] = 2.0f;
   compute_cost_vector(ref_img, cameras, num_images, x, y,
       plane_now, half_patch, sigma_spatial, sigma_color, census_weight,
-      cost_vec_now,
-      src_images, center_color_weight);
+      cost_vec_now, src_images);
   float cost_now = compute_mc_cost(cost_vec_now, view_weights,
       weight_norm, n_src,
       cameras, plane_now, x, y,
@@ -1688,8 +1659,7 @@ __kernel void acmmp_patchmatch(
       for (int ci = 0; ci < MAX_SOURCES; ci++) cv[ci] = 2.0f;
       compute_cost_vector(ref_img, cameras, num_images, x, y, cand,
           half_patch, sigma_spatial, sigma_color, census_weight,
-          cv,
-          src_images, center_color_weight);
+          cv, src_images);
       float temp_cost = compute_mc_cost(cv, view_weights,
           weight_norm, n_src,
           cameras, cand, x, y,
@@ -1980,375 +1950,6 @@ __kernel void acmmp_checkerboard_filter(
 )CL";
 
 // =====================================================================
-// SLIC superpixel segmentation kernel source.
-//
-// Three kernels implementing iterative SLIC on a grayscale image:
-//   1. slic_init_centers: place initial centers on a regular grid
-//   2. slic_assign_pixels: assign each pixel to nearest center (within 2S)
-//   3. slic_update_centers: recompute center position + color as mean
-//
-// After convergence, segment labels are used to gate PatchMatch
-// propagation — hypotheses cannot cross segment boundaries.
-// =====================================================================
-inline const char* kSLICKernelSource = R"CL(
-
-// SLIC center: (x, y, intensity)
-typedef struct {
-  float x;
-  float y;
-  float intensity;
-  int count;  // number of assigned pixels (for update)
-} SLICCenter;
-
-// =====================================================================
-// Kernel: Initialize SLIC centers on a regular grid.
-// Centers are placed at (S/2 + i*S, S/2 + j*S), sampling the image
-// intensity at that position.
-// =====================================================================
-__kernel void slic_init_centers(
-    __global SLICCenter *centers,
-    read_only image2d_t img,
-    int width, int height,
-    int grid_step,
-    int centers_x, int centers_y
-) {
-  int cx = get_global_id(0);
-  int cy = get_global_id(1);
-  if (cx >= centers_x || cy >= centers_y) return;
-
-  int center_idx = cy * centers_x + cx;
-
-  int px = grid_step / 2 + cx * grid_step;
-  int py = grid_step / 2 + cy * grid_step;
-  px = min(px, width - 1);
-  py = min(py, height - 1);
-
-  const sampler_t samp = CLK_NORMALIZED_COORDS_FALSE
-                       | CLK_ADDRESS_CLAMP_TO_EDGE
-                       | CLK_FILTER_NEAREST;
-
-  float val = read_imagef(img, samp, (int2)(px, py)).x;
-
-  centers[center_idx].x = (float)px;
-  centers[center_idx].y = (float)py;
-  centers[center_idx].intensity = val;
-  centers[center_idx].count = 0;
-}
-
-// =====================================================================
-// Kernel: Assign each pixel to its nearest center within a 2S window.
-// Distance = sqrt((dx/S)^2 + (dy/S)^2 + (di*m/S)^2)  [SLIC distance]
-// =====================================================================
-__kernel void slic_assign_pixels(
-    __global const SLICCenter *centers,
-    __global int *labels,
-    read_only image2d_t img,
-    int width, int height,
-    int grid_step,
-    int centers_x, int centers_y,
-    float compactness
-) {
-  int x = get_global_id(0);
-  int y = get_global_id(1);
-  if (x >= width || y >= height) return;
-
-  const sampler_t samp = CLK_NORMALIZED_COORDS_FALSE
-                       | CLK_ADDRESS_CLAMP_TO_EDGE
-                       | CLK_FILTER_NEAREST;
-
-  float pixel_val = read_imagef(img, samp, (int2)(x, y)).x;
-
-  // Which center cell does this pixel belong to?
-  int cell_x = x / grid_step;
-  int cell_y = y / grid_step;
-
-  float best_dist = 1e10f;
-  int best_label = 0;
-
-  float inv_s = 1.0f / (float)grid_step;
-  float m_over_s = compactness * inv_s;
-
-  // Search 3x3 neighborhood of center cells
-  for (int dy = -1; dy <= 1; dy++) {
-    for (int dx = -1; dx <= 1; dx++) {
-      int ncx = cell_x + dx;
-      int ncy = cell_y + dy;
-      if (ncx < 0 || ncx >= centers_x || ncy < 0 || ncy >= centers_y) continue;
-
-      int ci = ncy * centers_x + ncx;
-      float cx_pos = centers[ci].x;
-      float cy_pos = centers[ci].y;
-      float ci_val = centers[ci].intensity;
-
-      float spatial_x = ((float)x - cx_pos) * inv_s;
-      float spatial_y = ((float)y - cy_pos) * inv_s;
-      float color_d = (pixel_val - ci_val) * m_over_s;
-
-      float dist = spatial_x * spatial_x + spatial_y * spatial_y + color_d * color_d;
-
-      if (dist < best_dist) {
-        best_dist = dist;
-        best_label = ci;
-      }
-    }
-  }
-
-  labels[y * width + x] = best_label;
-}
-
-// =====================================================================
-// Kernel: Update centers by scanning their 2S×2S neighborhood and
-// averaging all assigned pixels.  No atomics needed — each center
-// independently scans its local region.
-// =====================================================================
-__kernel void slic_update_centers(
-    __global SLICCenter *centers,
-    __global const int *labels,
-    read_only image2d_t img,
-    int width, int height,
-    int grid_step,
-    int centers_x, int centers_y
-) {
-  int cx = get_global_id(0);
-  int cy = get_global_id(1);
-  if (cx >= centers_x || cy >= centers_y) return;
-
-  int center_idx = cy * centers_x + cx;
-
-  const sampler_t samp = CLK_NORMALIZED_COORDS_FALSE
-                       | CLK_ADDRESS_CLAMP_TO_EDGE
-                       | CLK_FILTER_NEAREST;
-
-  // Scan 2S × 2S window around the current center position
-  int cur_x = (int)(centers[center_idx].x + 0.5f);
-  int cur_y = (int)(centers[center_idx].y + 0.5f);
-
-  int x_min = max(0, cur_x - grid_step);
-  int x_max = min(width - 1, cur_x + grid_step);
-  int y_min = max(0, cur_y - grid_step);
-  int y_max = min(height - 1, cur_y + grid_step);
-
-  float sum_x = 0.0f, sum_y = 0.0f, sum_val = 0.0f;
-  int count = 0;
-
-  for (int py = y_min; py <= y_max; py++) {
-    for (int px = x_min; px <= x_max; px++) {
-      if (labels[py * width + px] == center_idx) {
-        float val = read_imagef(img, samp, (int2)(px, py)).x;
-        sum_x += (float)px;
-        sum_y += (float)py;
-        sum_val += val;
-        count++;
-      }
-    }
-  }
-
-  if (count > 0) {
-    centers[center_idx].x = sum_x / (float)count;
-    centers[center_idx].y = sum_y / (float)count;
-    centers[center_idx].intensity = sum_val / (float)count;
-    centers[center_idx].count = count;
-  }
-}
-
-)CL";
-
-// =====================================================================
-// Mahalanobis segment-aware depth filtering kernel.
-//
-// For each pixel with depth > 0:
-//   1. Gather same-segment neighbors within a window
-//   2. Backproject all gathered points to 3D
-//   3. Compute robust mean + covariance (MAD-trimmed)
-//   4. Compute Mahalanobis distance of center pixel's 3D point
-//   5. Zero out if distance exceeds threshold
-//
-// This rejects points that don't belong to the local planar/ellipsoidal
-// distribution of their segment — catching foreground smear that
-// survived cross-view cleaning.
-// =====================================================================
-inline const char* kMahalanobisKernelSource = R"CL(
-
-// Maximum points to gather in the window (bounded for register use).
-#define MAHAL_MAX_GATHER 128
-
-__kernel void mahalanobis_filter(
-    __global const float *depth_in,   // input cleaned depth (W*H)
-    __global float *depth_out,        // output filtered depth (W*H)
-    __global const int *labels,       // SLIC segment labels (W*H)
-    float fx, float fy, float cx, float cy,  // intrinsics
-    int width, int height,
-    int window_radius,                // half-size of gather window
-    float mahal_threshold             // Mahalanobis distance threshold
-) {
-  int x = get_global_id(0);
-  int y = get_global_id(1);
-  if (x >= width || y >= height) return;
-
-  int idx = y * width + x;
-  float d = depth_in[idx];
-
-  // Pass-through for invalid pixels.
-  if (d <= 0.0f) {
-    depth_out[idx] = 0.0f;
-    return;
-  }
-
-  int my_label = labels[idx];
-
-  // Backproject center pixel to 3D.
-  float3 center_pt;
-  center_pt.x = d * ((float)x - cx) / fx;
-  center_pt.y = d * ((float)y - cy) / fy;
-  center_pt.z = d;
-
-  // Gather same-segment neighbors.
-  float3 pts[MAHAL_MAX_GATHER];
-  int n_pts = 0;
-
-  int x_min = max(0, x - window_radius);
-  int x_max = min(width - 1, x + window_radius);
-  int y_min = max(0, y - window_radius);
-  int y_max = min(height - 1, y + window_radius);
-
-  for (int ny = y_min; ny <= y_max && n_pts < MAHAL_MAX_GATHER; ny++) {
-    for (int nx = x_min; nx <= x_max && n_pts < MAHAL_MAX_GATHER; nx++) {
-      int ni = ny * width + nx;
-      if (labels[ni] != my_label) continue;
-      float nd = depth_in[ni];
-      if (nd <= 0.0f) continue;
-      pts[n_pts].x = nd * ((float)nx - cx) / fx;
-      pts[n_pts].y = nd * ((float)ny - cy) / fy;
-      pts[n_pts].z = nd;
-      n_pts++;
-    }
-  }
-
-  // Need minimum 4 points for a meaningful 3D covariance.
-  if (n_pts < 4) {
-    depth_out[idx] = d;
-    return;
-  }
-
-  // Compute mean.
-  float3 mean = (float3)(0.0f, 0.0f, 0.0f);
-  for (int i = 0; i < n_pts; i++) {
-    mean += pts[i];
-  }
-  mean /= (float)n_pts;
-
-  // Compute initial residuals for MAD-based trimming.
-  float residuals[MAHAL_MAX_GATHER];
-  for (int i = 0; i < n_pts; i++) {
-    float3 diff = pts[i] - mean;
-    residuals[i] = dot(diff, diff);
-  }
-
-  // Simple MAD-trimming: find median residual, keep only points within
-  // 3× median.  Use partial sort (find ~50th percentile via selection).
-  // Approximate: use the n_pts/2-th smallest via bubble partial sort.
-  float med_res = 0.0f;
-  {
-    int mid = n_pts / 2;
-    // Partial selection: find mid-th smallest element.
-    for (int i = 0; i <= mid; i++) {
-      int min_idx = i;
-      for (int j = i + 1; j < n_pts; j++) {
-        if (residuals[j] < residuals[min_idx]) min_idx = j;
-      }
-      // Swap residuals and pts.
-      float tmp_r = residuals[i];
-      residuals[i] = residuals[min_idx];
-      residuals[min_idx] = tmp_r;
-      float3 tmp_p = pts[i];
-      pts[i] = pts[min_idx];
-      pts[min_idx] = tmp_p;
-    }
-    med_res = residuals[mid];
-  }
-
-  // Trim: keep only points with residual <= 3 * median.
-  float trim_threshold = 3.0f * med_res;
-  if (trim_threshold < 1e-12f) trim_threshold = 1e-12f;
-  int n_inliers = 0;
-  for (int i = 0; i < n_pts; i++) {
-    if (residuals[i] <= trim_threshold) {
-      pts[n_inliers] = pts[i];
-      n_inliers++;
-    }
-  }
-
-  if (n_inliers < 4) {
-    depth_out[idx] = d;
-    return;
-  }
-
-  // Recompute mean from inliers.
-  mean = (float3)(0.0f, 0.0f, 0.0f);
-  for (int i = 0; i < n_inliers; i++) {
-    mean += pts[i];
-  }
-  mean /= (float)n_inliers;
-
-  // Compute 3×3 covariance matrix (symmetric).
-  // C = [cxx cxy cxz; cxy cyy cyz; cxz cyz czz]
-  float cxx = 0.0f, cxy = 0.0f, cxz = 0.0f;
-  float cyy = 0.0f, cyz = 0.0f, czz = 0.0f;
-  for (int i = 0; i < n_inliers; i++) {
-    float3 diff = pts[i] - mean;
-    cxx += diff.x * diff.x;
-    cxy += diff.x * diff.y;
-    cxz += diff.x * diff.z;
-    cyy += diff.y * diff.y;
-    cyz += diff.y * diff.z;
-    czz += diff.z * diff.z;
-  }
-  float inv_n = 1.0f / (float)(n_inliers - 1);
-  cxx *= inv_n; cxy *= inv_n; cxz *= inv_n;
-  cyy *= inv_n; cyz *= inv_n; czz *= inv_n;
-
-  // Add small regularization for numerical stability.
-  float reg = 1e-8f * (cxx + cyy + czz);
-  cxx += reg; cyy += reg; czz += reg;
-
-  // Invert 3×3 symmetric matrix via cofactors.
-  float det = cxx * (cyy * czz - cyz * cyz)
-            - cxy * (cxy * czz - cyz * cxz)
-            + cxz * (cxy * cyz - cyy * cxz);
-
-  if (fabs(det) < 1e-20f) {
-    // Degenerate covariance — keep the pixel.
-    depth_out[idx] = d;
-    return;
-  }
-  float inv_det = 1.0f / det;
-
-  // Inverse covariance (cofactor matrix / det).
-  float ixx = (cyy * czz - cyz * cyz) * inv_det;
-  float ixy = (cxz * cyz - cxy * czz) * inv_det;
-  float ixz = (cxy * cyz - cxz * cyy) * inv_det;
-  float iyy = (cxx * czz - cxz * cxz) * inv_det;
-  float iyz = (cxy * cxz - cxx * cyz) * inv_det;
-  float izz = (cxx * cyy - cxy * cxy) * inv_det;
-
-  // Mahalanobis distance² of center pixel.
-  float3 diff = center_pt - mean;
-  float mahal_sq = diff.x * (ixx * diff.x + ixy * diff.y + ixz * diff.z)
-                 + diff.y * (ixy * diff.x + iyy * diff.y + iyz * diff.z)
-                 + diff.z * (ixz * diff.x + iyz * diff.y + izz * diff.z);
-
-  // Reject if Mahalanobis distance exceeds threshold.
-  float threshold_sq = mahal_threshold * mahal_threshold;
-  if (mahal_sq > threshold_sq) {
-    depth_out[idx] = 0.0f;
-  } else {
-    depth_out[idx] = d;
-  }
-}
-
-)CL";
-
-// =====================================================================
 // Depthmap cleaning kernel: cross-view depth consistency check.
 //
 // For each pixel in the reference depth, backproject to 3D, project
@@ -2433,7 +2034,6 @@ __kernel void acmmp_clean_depthmap(
     float carving_threshold,
     int max_carved_views,
     float grazing_cos_threshold,
-    float edge_depth_ratio,
     int has_normal
 ) {
   int x = get_global_id(0);
@@ -2447,24 +2047,6 @@ __kernel void acmmp_clean_depthmap(
     clean_depth[idx] = 0.0f;
     return;
   }
-
-  // ---- Edge detection: check depth discontinuity in 3x3 neighborhood ----
-  float d_min = ref_depth;
-  float d_max = ref_depth;
-  for (int dy = -1; dy <= 1; ++dy) {
-    for (int dx = -1; dx <= 1; ++dx) {
-      if (dx == 0 && dy == 0) continue;
-      int nx = x + dx;
-      int ny = y + dy;
-      if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
-      float nd = read_imagef(ref_depth_img, samp_nn, (int2)(nx, ny)).x;
-      if (nd > 0.0f) {
-        d_min = fmin(d_min, nd);
-        d_max = fmax(d_max, nd);
-      }
-    }
-  }
-  int is_edge = (d_min > 1e-6f && d_max / d_min > edge_depth_ratio) ? 1 : 0;
 
   // ---- Grazing angle detection from per-pixel normal ----
   int is_grazing = 0;
@@ -2487,7 +2069,7 @@ __kernel void acmmp_clean_depthmap(
     }
   }
 
-  int is_suspicious = is_edge | is_grazing;
+  int is_suspicious = is_grazing;
 
   Camera ref_cam = cameras[0];
   float fx = ref_cam.K[0], cx = ref_cam.K[2];
