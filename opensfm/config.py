@@ -497,7 +497,7 @@ class OpenSfMConfig:
     depthmap_cluster_bbox_margin: float = 0.01
     # Photometric TSDF refinement (Pons-Keriven 2007 level-set).
     # Enable in-place SDF refinement after SVO fusion.
-    depthmap_fusion_svo_refine_enabled: bool = False
+    depthmap_fusion_svo_refine_enabled: bool = True
     # Number of SDF refinement iterations.
     depthmap_fusion_svo_refine_iters: int = 50
     # Laplacian regularization weight (0 = disabled).

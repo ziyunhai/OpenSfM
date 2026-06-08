@@ -133,43 +133,11 @@ PYBIND11_MODULE(pydense, m) {
       .def("clear", &dense::DepthmapCleanerWrapper::Clear)
       .def_static("is_available", &dense::DepthmapCleanerWrapper::IsAvailable);
 
-  py::class_<dense::DSMRasterizerWrapper>(m, "DSMRasterizer")
+  py::class_<dense::GPUDiffuserWrapper>(m, "GPUDiffuser")
       .def(py::init())
-      .def("set_gsd", &dense::DSMRasterizerWrapper::SetGSD)
-      .def("set_bbox", &dense::DSMRasterizerWrapper::SetBBox, py::arg("min_xy"),
-           py::arg("max_xy"))
-      .def("set_device", &dense::DSMRasterizerWrapper::SetDevice)
-      .def("set_mode_threshold", &dense::DSMRasterizerWrapper::SetModeThreshold)
-      .def("set_max_triangle_edge",
-           &dense::DSMRasterizerWrapper::SetMaxTriangleEdge)
-      .def("set_min_count", &dense::DSMRasterizerWrapper::SetMinCount)
-      .def("set_min_normal_z", &dense::DSMRasterizerWrapper::SetMinNormalZ,
-           py::arg("hard_gate"), py::arg("soft_upper"))
-      .def("set_bilateral", &dense::DSMRasterizerWrapper::SetBilateral,
-           py::arg("enabled"), py::arg("radius"), py::arg("range_sigma"))
-      .def("begin", &dense::DSMRasterizerWrapper::Begin)
-      .def("scatter", &dense::DSMRasterizerWrapper::Scatter, py::arg("K"),
-           py::arg("R"), py::arg("t"), py::arg("depth"), py::arg("normal"),
-           py::arg("confidence"))
-      .def("update_modes", &dense::DSMRasterizerWrapper::UpdateModes)
-      .def("finish", &dense::DSMRasterizerWrapper::Finish)
-      .def("get_validity_mask", &dense::DSMRasterizerWrapper::GetValidityMask)
-      .def("diffuse", &dense::DSMRasterizerWrapper::Diffuse, py::arg("guide"),
+      .def("set_device", &dense::GPUDiffuserWrapper::SetDevice)
+      .def("diffuse", &dense::GPUDiffuserWrapper::Diffuse, py::arg("guide"),
            py::arg("iterations"), py::arg("kappa"), py::arg("dt"))
-      .def("compute_gradient", &dense::DSMRasterizerWrapper::ComputeGradient)
-      .def("upsample_nn", &dense::DSMRasterizerWrapper::UpsampleNN,
-           py::arg("coarse"), py::arg("coarse_w"), py::arg("coarse_h"))
-      .def("apply_bilateral", &dense::DSMRasterizerWrapper::ApplyBilateral)
-      .def("upload_grid", &dense::DSMRasterizerWrapper::UploadGrid,
-           py::arg("grid"))
-      .def("begin_zbuf", &dense::DSMRasterizerWrapper::BeginZBuf)
-      .def("rasterize_view", &dense::DSMRasterizerWrapper::RasterizeView,
-           py::arg("K"), py::arg("R"), py::arg("t"), py::arg("depth"),
-           py::arg("normal"))
-      .def("finish_zbuf", &dense::DSMRasterizerWrapper::FinishZBuf)
-      .def_property_readonly("grid_width",
-                             &dense::DSMRasterizerWrapper::grid_width)
-      .def_property_readonly("grid_height",
-                             &dense::DSMRasterizerWrapper::grid_height)
-      .def_static("is_available", &dense::DSMRasterizerWrapper::IsAvailable);
+      .def("upload_grid", &dense::GPUDiffuserWrapper::UploadGrid,
+           py::arg("grid"));
 }
