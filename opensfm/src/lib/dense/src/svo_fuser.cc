@@ -9,6 +9,7 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace dense {
 
@@ -209,7 +210,9 @@ void SVOFuser::Fuse() {
                       "[SVOFuser] Fuse complete, hash table alive on GPU");
 }
 
-void SVOFuser::RefineGeometry(int iters, float lambda_reg) {
+void SVOFuser::RefineGeometry(
+    int iters, float lambda_reg,
+    const std::map<std::string, std::vector<std::string>>& neighbors) {
   if (!integrator_) {
     throw std::runtime_error(
         "SVOFuser::RefineGeometry: Fuse() must be called before "
@@ -217,6 +220,12 @@ void SVOFuser::RefineGeometry(int iters, float lambda_reg) {
   }
   if (views_.empty()) {
     return;
+  }
+
+  if (neighbors.empty()) {
+    throw std::runtime_error(
+        "SVOFuser::RefineGeometry: neighbor view graph is required for "
+        "RefineGeometry()");
   }
 
   const float trunc_dist = trunc_factor_ * voxel_size_;
@@ -292,8 +301,51 @@ void SVOFuser::RefineGeometry(int iters, float lambda_reg) {
 
   integrator_->PrepareRefinement(cameras, packed_colors, packed_masks,
                                  packed_depths, w0, h0, n_views);
+
+  constexpr int kMaxRefineNeighbors = 4;
+  std::vector<int32_t> neighbor_data;
+
+  std::unordered_map<std::string, int> name_to_idx;
+  name_to_idx.reserve(n_views * 2);
+  for (int i = 0; i < n_views; ++i) {
+    name_to_idx[views_[i].name] = i;
+  }
+
+  neighbor_data.assign(static_cast<size_t>(n_views) * kMaxRefineNeighbors, -1);
+  int n_with_nbrs = 0;
+  for (int i = 0; i < n_views; ++i) {
+    auto it = neighbors.find(views_[i].name);
+    if (it == neighbors.end()) {
+      continue;
+    }
+    int k = 0;
+    for (const std::string& nb_name : it->second) {
+      if (k >= kMaxRefineNeighbors) {
+        break;
+      }
+      if (nb_name == views_[i].name) {
+        continue;  // skip self (best_neighbors[0] is the shot itself)
+      }
+      auto jt = name_to_idx.find(nb_name);
+      if (jt == name_to_idx.end()) {
+        continue;  // neighbor not loaded in this sub-volume
+      }
+      neighbor_data[static_cast<size_t>(i) * kMaxRefineNeighbors + k] =
+          jt->second;
+      ++k;
+    }
+    if (k > 0) {
+      ++n_with_nbrs;
+    }
+  }
+
+  std::ostringstream oss;
+  oss << "[SVOFuser] RefineGeometry using SfM co-visibility neighbors: "
+      << n_with_nbrs << "/" << n_views << " views have ≥1 neighbor in-volume";
+  foundation::LogInfo("dense", oss.str());
+
   integrator_->RefineGeometry(iters, lambda_reg, voxel_size_, trunc_dist,
-                              min_weight_);
+                              min_weight_, neighbor_data, kMaxRefineNeighbors);
 
   {
     std::ostringstream oss;
@@ -304,8 +356,8 @@ void SVOFuser::RefineGeometry(int iters, float lambda_reg) {
 
 void SVOFuser::BakeColors(std::vector<Vec3f>& points,
                           std::vector<Vec3f>& normals,
-                          std::vector<Vec3<uint8_t>>* colors,
-                          int n_final, int irls_iters) {
+                          std::vector<Vec3<uint8_t>>* colors, int n_final,
+                          int irls_iters) {
   if (!integrator_) {
     throw std::runtime_error(
         "SVOFuser::BakeColors: Fuse() must be called first");

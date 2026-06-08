@@ -155,7 +155,9 @@ class SVOIntegratorCL {
   // Run SDF-only photometric refinement (bilateral ZNCC gradient + Adam).
   // lambda_reg: Laplacian regularization (0 = disabled, default).
   void RefineGeometry(int iters, float lambda_reg, float voxel_size,
-                      float trunc_dist, float min_weight);
+                      float trunc_dist, float min_weight,
+                      const std::vector<int32_t>& neighbor_data,
+                      int max_neighbors);
 
   // Bake colors onto extracted surface points: a robust IRLS consensus
   // gate followed by a top-n_final, resolution-weighted linear blend of
@@ -166,8 +168,8 @@ class SVOIntegratorCL {
   // |irls_iters|: Tukey reweighting iterations for the consensus.
   void BakeColors(const std::vector<Vec3f>& points,
                   const std::vector<Vec3f>& normals,
-                  std::vector<Vec3<uint8_t>>* out_colors,
-                  int n_final = 2, int irls_iters = 3);
+                  std::vector<Vec3<uint8_t>>* out_colors, int n_final = 2,
+                  int irls_iters = 3);
 
   // --- Visibility pruning ---
   // Initialize carve/support vote buffers (same capacity as hash table).
@@ -242,6 +244,7 @@ class SVOIntegratorCL {
   cl::Kernel k_bake_colors_;
   cl::Kernel k_raycast_guided_;
   cl::Buffer cl_refine_grad_;         // 1 float/slot
+  cl::Buffer cl_refine_grad_w_;       // 1 float/slot
   cl::Buffer cl_refine_adam_;         // 2 floats/slot: m_d, v_d
   cl::Image2DArray cl_color_images_;  // CL_RGBA CL_UNORM_INT8 [n_views × H × W]
   cl::Image2DArray cl_tsdf_depths_;   // CL_R CL_FLOAT [n_views × H × W]

@@ -1021,7 +1021,6 @@ float2 image_grad_array(read_only image2d_array_t images,
 // ref and src from the same image2d_array_t via their respective layer indices.
 //
 // inv_sigma_s2: spatial weight exponent, e.g. -0.5 for sigma_s=1 pixel
-// inv_sigma_c2: bilateral weight exponent, e.g. -325.0 for sigma_c=10/255 in [0,1]
 //
 // Returns (ncc_score, d2ncc, var_r, var_s):
 //   ncc_score   ∈ [-1,1]
@@ -1034,8 +1033,7 @@ float4 compute_zncc_array(
     int ref_layer, float ref_cx, float ref_cy,
     int src_layer, float src_cx, float src_cy,
     int half_patch,
-    float inv_sigma_s2,
-    float inv_sigma_c2)
+    float inv_sigma_s2)
 {
     const sampler_t samp = CLK_NORMALIZED_COORDS_FALSE |
                            CLK_ADDRESS_CLAMP_TO_EDGE |
@@ -1105,6 +1103,7 @@ float4 compute_zncc_array(
 // =====================================================================
 __kernel void svo_refine_clear(
     __global float* grad_buf,   // 1 float per slot
+    __global float* grad_w_buf, // 1 float per slot
     __global float* adam_buf,   // 2 floats per slot
     uint capacity,
     int  clear_adam)            // 1 = also clear Adam state
@@ -1112,6 +1111,7 @@ __kernel void svo_refine_clear(
     uint i = get_global_id(0);
     if (i >= capacity) return;
     grad_buf[i] = 0.0f;
+    grad_w_buf[i] = 0.0f;
     if (clear_adam) {
         adam_buf[i * 2 + 0] = 0.0f;  // m_d
         adam_buf[i * 2 + 1] = 0.0f;  // v_d
@@ -1134,6 +1134,7 @@ __kernel void svo_refine_accumulate(
     __global const VoxelSlot* table,
     uint                      capacity_mask,
     __global float*           grad_buf,          // 1 float per slot
+    __global float*           grad_w_buf,        // 1 float per slot
     read_only image2d_array_t color_images,      // CL_RGBA UNORM_INT8
     read_only image2d_array_t tsdf_depths,       // CL_R FLOAT
     __constant SVOCamera*     cameras,
@@ -1149,7 +1150,6 @@ __kernel void svo_refine_accumulate(
     float                     min_weight_scaled,
     int                       half_patch,
     float                     inv_sigma_s2,
-    float                     inv_sigma_c2,
     float                     tex_floor)
 {
     int col = get_global_id(0);
@@ -1258,7 +1258,7 @@ __kernel void svo_refine_accumulate(
             color_images,
             src_view, (float)col, (float)row,
             j, px, py,
-            half_patch, inv_sigma_s2, inv_sigma_c2);
+            half_patch, inv_sigma_s2);
 
         float ncc   = zncc_result.x;
         float d2ncc = zncc_result.y;
@@ -1314,33 +1314,39 @@ __kernel void svo_refine_accumulate(
 
     // Deposit gradient to nearest voxel slot.
     atomic_add_f(&grad_buf[nearest_slot], total_grad_d);
+    atomic_add_f(&grad_w_buf[nearest_slot], 1.0f);  // count the number of accumulated gradients for this slot
 }
 
 )CL"
     R"CL(
 
 // =====================================================================
-// svo_refine_update — Adam update + optional Laplacian regularization
+// svo_refine_update — SGD-momentum update + edge-aware anisotropic reg
 //
 // One work-item per hash table slot.
 // grad_buf: 1 float/slot.  adam_buf: 2 floats/slot (m_d, v_d).
-// Regularization is skipped entirely when lambda_reg == 0.
+// When lambda_reg == 0 only data-driven voxels update (fast path).  When
+// lambda_reg > 0, a gravity-aware tangent-aligned diffusion runs on every
+// surface voxel: it flattens facets into planes and sharpens the creases
+// where they meet (edge-stop + tangential anisotropy), with a Z-up bias
+// toward horizontal/vertical surfaces for man-made 90° structure.
 // =====================================================================
 __kernel void svo_refine_update(
     __global VoxelSlot* table,
     uint                capacity_mask,
     uint                capacity,
     __global float*     grad_buf,         // 1 float per slot
+    __global float*     grad_w_buf,       // 1 float per slot
     __global float*     adam_buf,         // 2 floats per slot
     float               min_weight_scaled,
     float               voxel_size,
     float               lambda_reg,       // 0 = no regularization
     float               lr_sdf,
     float               beta1,
-    float               beta2,
     float               epsilon,
     int                 iteration,
-    int                 n_views)     
+    int                 n_views,
+    float               edge_k)           // edge-stop threshold (norm. TSDF units)
 {
     uint i = get_global_id(0);
     if (i >= capacity) return;
@@ -1358,40 +1364,86 @@ __kernel void svo_refine_update(
     if (fabs(tsdf) > 4.f) return;
 
     float grad_d = grad_buf[i];
+    float grad_w = grad_w_buf[i];
     // Clear for next iteration.
     grad_buf[i] = 0.0f;
+    grad_w_buf[i] = 0.0f;
 
-    if (fabs(grad_d) < 1e-10f) return;
+    grad_d /= (grad_w + 1e-6f);  // mean gradient if multiple pixels contributed
 
-    // Normalize: accumulate dispatches once per source view (n_views times).
-    grad_d /= (float)n_views;
+    // Fast path: with regularization off, only voxels touched by the data
+    // term need updating.  With it on, the diffusion runs on every surface
+    // voxel below (including low-texture ones the data term now suppresses),
+    // so we must not early-out on a zero data gradient.
+    if (lambda_reg <= 0.0f && fabs(grad_d) < 1e-10f) return;
 
     int kx = (int)((key_ab >> 16) & 0xFFFF) - 32768;
     int ky = (int)(key_ab & 0xFFFF) - 32768;
     int kz = table[i].key_c;
 
-    // ---- Optional Laplacian regularization on SDF ----
+    // ---- Edge-aware anisotropic regularization (flatten facets, sharpen creases) ----
     if (lambda_reg > 0.0f) {
-        float neighbor_sum = 0.0f;
-        int n_nbrs = 0;
-        int dx[6] = {1,-1,0, 0,0, 0};
-        int dy[6] = {0, 0,1,-1,0, 0};
-        int dz[6] = {0, 0,0, 0,1,-1};
+        // Gather the 6 face-neighbor TSDF values (+x,-x,+y,-y,+z,-z).
+        const int dx[6] = {1,-1, 0, 0, 0, 0};
+        const int dy[6] = {0, 0, 1,-1, 0, 0};
+        const int dz[6] = {0, 0, 0, 0, 1,-1};
+        float nval[6];
+        int   npres[6];
         for (int nb = 0; nb < 6; nb++) {
             uint ni = hash_lookup(table, capacity_mask,
                                   kx + dx[nb], ky + dy[nb], kz + dz[nb]);
-            if (ni == 0xFFFFFFFF) continue;
+            if (ni == 0xFFFFFFFF) { npres[nb] = 0; nval[nb] = 0.0f; continue; }
             float nsw = (float)table[ni].sum_weight;
-            if (nsw < min_weight_scaled) continue;
-            float ntsdf = (float)table[ni].sum_tsdf / (nsw * (float)FP_SCALE);
-            neighbor_sum += ntsdf;
-            n_nbrs++;
+            if (nsw < min_weight_scaled) { npres[nb] = 0; nval[nb] = 0.0f; continue; }
+            npres[nb] = 1;
+            nval[nb] = (float)table[ni].sum_tsdf / (nsw * (float)FP_SCALE);
         }
-        if (n_nbrs > 0) {
-            float laplacian = tsdf - neighbor_sum / (float)n_nbrs;
-            grad_d += lambda_reg * 2.0f * laplacian;
+
+        // Local surface normal n = ∇φ via central differences (one-sided at
+        // missing neighbors).  φ increases toward the empty side, so n points
+        // outward; only its direction matters here.
+        float3 n = (float3)(0.0f, 0.0f, 0.0f);
+        if      (npres[0] && npres[1]) n.x = nval[0] - nval[1];
+        else if (npres[0])             n.x = nval[0] - tsdf;
+        else if (npres[1])             n.x = tsdf    - nval[1];
+        if      (npres[2] && npres[3]) n.y = nval[2] - nval[3];
+        else if (npres[2])             n.y = nval[2] - tsdf;
+        else if (npres[3])             n.y = tsdf    - nval[3];
+        if      (npres[4] && npres[5]) n.z = nval[4] - nval[5];
+        else if (npres[4])             n.z = nval[4] - tsdf;
+        else if (npres[5])             n.z = tsdf    - nval[5];
+
+        float nlen = length(n);
+        if (nlen > 1e-6f) {
+            n /= nlen;
+
+            // Anisotropic weighted Laplacian: weight each axis-neighbor by its
+            // tangentiality (1 − (axis·n)²) so diffusion runs ALONG the facet
+            // (flattening it) but not ACROSS the normal (preserving the crease).
+            // An edge-stop exp(−Δ²/K²) further halts diffusion across large TSDF
+            // jumps (corners), sharpening rather than rounding them.
+            float axis_n2[3] = {n.x*n.x, n.y*n.y, n.z*n.z};
+            float wsum = 0.0f, acc = 0.0f;
+            for (int nb = 0; nb < 6; nb++) {
+                if (!npres[nb]) continue;
+                float tang = 1.0f - axis_n2[nb >> 1];
+                if (tang < 1e-4f) continue;
+                float diff  = nval[nb] - tsdf;
+                float estop = exp(-(diff * diff) / (edge_k * edge_k));
+                float a = tang * estop;
+                acc  += a * diff;
+                wsum += a;
+            }
+            if (wsum > 1e-6f) {
+                // Descent gradient pulling tsdf toward the anisotropic neighbor
+                // mean: Δtsdf = +α(mean−tsdf) via new = tsdf − lr·grad.
+                grad_d -= lambda_reg * 2.0f * (acc / wsum);
+            }
         }
     }
+
+    // Nothing moved this voxel (no data gradient, flat neighborhood).
+    if (fabs(grad_d) < 1e-10f) return;
 
     // ---- Gradient clipping: prevent steps > 0.1 in normalized TSDF ----
     float max_grad = 0.25f;

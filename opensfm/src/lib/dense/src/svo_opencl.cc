@@ -916,6 +916,9 @@ void SVOIntegratorCL::PrepareRefinement(
   cl_refine_grad_ =
       cl::Buffer(ctx, CL_MEM_READ_WRITE, grad_bytes, nullptr, &err);
   opencl::CheckCL(err, "refine grad buffer");
+  cl_refine_grad_w_ =
+      cl::Buffer(ctx, CL_MEM_READ_WRITE, grad_bytes, nullptr, &err);
+  opencl::CheckCL(err, "refine grad buffer");
 
   // Allocate Adam buffer: 2 floats per slot (m_d, v_d).
   const size_t adam_bytes = static_cast<size_t>(capacity_) * 2 * sizeof(float);
@@ -983,9 +986,10 @@ void SVOIntegratorCL::PrepareRefinement(
     const size_t global =
         ((static_cast<size_t>(capacity_) + 255u) / 256u) * 256u;
     k_refine_clear_.setArg(0, cl_refine_grad_);
-    k_refine_clear_.setArg(1, cl_refine_adam_);
-    k_refine_clear_.setArg(2, capacity_);
-    k_refine_clear_.setArg(3, static_cast<cl_int>(1));  // clear Adam too
+    k_refine_clear_.setArg(1, cl_refine_grad_w_);
+    k_refine_clear_.setArg(2, cl_refine_adam_);
+    k_refine_clear_.setArg(3, capacity_);
+    k_refine_clear_.setArg(4, static_cast<cl_int>(1));  // clear Adam too
     queue.enqueueNDRangeKernel(k_refine_clear_, cl::NullRange,
                                cl::NDRange(global), cl::NDRange(256));
     queue.finish();
@@ -1004,7 +1008,9 @@ void SVOIntegratorCL::PrepareRefinement(
 
 void SVOIntegratorCL::RefineGeometry(int iters, float lambda_reg,
                                      float voxel_size, float trunc_dist,
-                                     float min_weight) {
+                                     float min_weight,
+                                     const std::vector<int32_t>& neighbor_data,
+                                     int max_neighbors) {
   if (!refine_prepared_) {
     throw std::runtime_error(
         "SVOIntegratorCL::RefineGeometry: PrepareRefinement() not called");
@@ -1021,18 +1027,17 @@ void SVOIntegratorCL::RefineGeometry(int iters, float lambda_reg,
   const float inv_voxel_size = 1.0f / voxel_size;
   const float min_weight_scaled = min_weight * kWeightScale;
   const float lr_sdf =
-      50.0f * voxel_size;  // 1.0 for voxel=0.02: ~0.1 step/iter (clipped)
-  const float beta1 = 0.7f;
-  const float beta2 = 0.999f;   // unused, kept for kernel API compat
+      50.0f * voxel_size;       // 1.0 for voxel=0.02: ~0.1 step/iter (clipped)
+  const float beta1 = 0.7f;     // unused, kept for kernel API compat
   const float epsilon = 1e-8f;  // unused
-  const int half_patch = 3;
-  const float inv_sigma_s2 = -0.5f;    // sigma_spatial = 1 px
-  const float inv_sigma_c2 = -325.0f;  // sigma_color = 10/255 ≈ 0.039
-  // Texture-confidence floor (patch-variance units, gray²).  Suppresses the
-  // photometric step in low-texture regions where the ZNCC gradient is
-  // noise-dominated; raise to suppress more speckle, lower to refine flatter
-  // areas.  Typical moderate-texture patch variance is ~0.005–0.02.
-  const float tex_floor = 0.01f;
+  const int half_patch = 5;
+  const float inv_sigma_s2 = -0.125f;  // sigma_spatial = 1 px
+  // Texture-confidence floor (patch-variance units, gray²).
+  const float tex_floor = 0.05f;
+  // Edge-aware regularization tuning (used only when lambda_reg > 0).
+  // edge_k: TSDF jump (normalized units) above which diffusion stops, i.e. the
+  //   crease/corner threshold — smaller keeps more edges, larger smooths more.
+  const float edge_k = 0.3f;
 
   const int W = refine_img_width_;
   const int H = refine_img_height_;
@@ -1052,73 +1057,12 @@ void SVOIntegratorCL::RefineGeometry(int iters, float lambda_reg,
                             nullptr, &err);
   opencl::CheckCL(err, "refine raycast hit buffer");
 
-  // ---- Build per-view neighbor list (K=4 best by triangulation angle) ----
-  static constexpr int kMaxRefineNeighbors = 4;
-  std::vector<int32_t> neighbor_data(
-      static_cast<size_t>(n_refine_views_) * kMaxRefineNeighbors, -1);
-
-  // Read back cameras to compute pairwise scores on CPU.
-  std::vector<SVOCameraGPU> cameras_cpu(n_refine_views_);
-  queue.enqueueReadBuffer(cl_cameras_array_, CL_TRUE, 0,
-                          n_refine_views_ * sizeof(SVOCameraGPU),
-                          cameras_cpu.data());
-
-  for (int i = 0; i < n_refine_views_; ++i) {
-    // Optical axis of view i: 3rd row of R (= z_cam in world = Rinv * [0,0,1]).
-    const auto& ci = cameras_cpu[i];
-    float dir_i[3] = {ci.Rinv[6], ci.Rinv[7], ci.Rinv[8]};
-
-    // Score each other view by triangulation angle quality:
-    // Prefer views with baseline angle ~20-40° (cos in [0.77, 0.94]).
-    // Score = 1 - |cos_angle - 0.85| to peak around 30°.
-    struct ViewScore {
-      int idx;
-      float score;
-    };
-    std::vector<ViewScore> scores;
-    scores.reserve(n_refine_views_ - 1);
-
-    for (int j = 0; j < n_refine_views_; ++j) {
-      if (j == i) {
-        continue;
-      }
-      const auto& cj = cameras_cpu[j];
-      // Baseline direction.
-      float bx = cj.cam_pos[0] - ci.cam_pos[0];
-      float by = cj.cam_pos[1] - ci.cam_pos[1];
-      float bz = cj.cam_pos[2] - ci.cam_pos[2];
-      float bl = std::sqrt(bx * bx + by * by + bz * bz);
-      if (bl < 1e-8f) {
-        continue;
-      }
-
-      // Optical axis of view j.
-      float dir_j[3] = {cj.Rinv[6], cj.Rinv[7], cj.Rinv[8]};
-
-      // Cos angle between optical axes (small = wide baseline).
-      float cos_axes =
-          dir_i[0] * dir_j[0] + dir_i[1] * dir_j[1] + dir_i[2] * dir_j[2];
-      // Prefer moderate baseline (peak around cos=0.85 ≈ 30°).
-      float s = 1.0f - std::abs(cos_axes - 0.85f);
-      scores.push_back({j, s});
-    }
-
-    // Sort by score descending, pick top K.
-    std::sort(scores.begin(), scores.end(),
-              [](const ViewScore& a, const ViewScore& b) {
-                return a.score > b.score;
-              });
-    int count = std::min(static_cast<int>(scores.size()), kMaxRefineNeighbors);
-    for (int k = 0; k < count; ++k) {
-      neighbor_data[i * kMaxRefineNeighbors + k] = scores[k].idx;
-    }
-  }
-
   // Upload neighbor buffer.
-  const size_t nb_bytes = static_cast<size_t>(n_refine_views_) *
-                          kMaxRefineNeighbors * sizeof(int32_t);
+  std::vector<int32_t> neighbor_data_work = neighbor_data;
+  const size_t nb_bytes =
+      static_cast<size_t>(n_refine_views_) * max_neighbors * sizeof(int32_t);
   cl::Buffer cl_neighbors(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                          nb_bytes, neighbor_data.data(), &err);
+                          nb_bytes, neighbor_data_work.data(), &err);
   opencl::CheckCL(err, "refine neighbor buffer");
 
   for (int iter = 0; iter < iters; ++iter) {
@@ -1180,12 +1124,12 @@ void SVOIntegratorCL::RefineGeometry(int iters, float lambda_reg,
       k_refine_accumulate_.setArg(arg++, cl_table_);
       k_refine_accumulate_.setArg(arg++, capacity_mask_);
       k_refine_accumulate_.setArg(arg++, cl_refine_grad_);
+      k_refine_accumulate_.setArg(arg++, cl_refine_grad_w_);
       k_refine_accumulate_.setArg(arg++, cl_color_images_);
       k_refine_accumulate_.setArg(arg++, cl_tsdf_depths_);
       k_refine_accumulate_.setArg(arg++, cl_cameras_array_);
       k_refine_accumulate_.setArg(arg++, cl_neighbors);
-      k_refine_accumulate_.setArg(arg++,
-                                  static_cast<cl_int>(kMaxRefineNeighbors));
+      k_refine_accumulate_.setArg(arg++, static_cast<cl_int>(max_neighbors));
       k_refine_accumulate_.setArg(arg++, static_cast<cl_int>(n_refine_views_));
       k_refine_accumulate_.setArg(arg++, static_cast<cl_int>(vi));
       k_refine_accumulate_.setArg(arg++, static_cast<cl_int>(W));
@@ -1196,7 +1140,6 @@ void SVOIntegratorCL::RefineGeometry(int iters, float lambda_reg,
       k_refine_accumulate_.setArg(arg++, min_weight_scaled);
       k_refine_accumulate_.setArg(arg++, static_cast<cl_int>(half_patch));
       k_refine_accumulate_.setArg(arg++, inv_sigma_s2);
-      k_refine_accumulate_.setArg(arg++, inv_sigma_c2);
       k_refine_accumulate_.setArg(arg++, tex_floor);
 
       const size_t gw = static_cast<size_t>((W + 15) / 16 * 16);
@@ -1242,16 +1185,17 @@ void SVOIntegratorCL::RefineGeometry(int iters, float lambda_reg,
       k_refine_update_.setArg(arg++, capacity_mask_);
       k_refine_update_.setArg(arg++, capacity_);
       k_refine_update_.setArg(arg++, cl_refine_grad_);
+      k_refine_update_.setArg(arg++, cl_refine_grad_w_);
       k_refine_update_.setArg(arg++, cl_refine_adam_);
       k_refine_update_.setArg(arg++, min_weight_scaled);
       k_refine_update_.setArg(arg++, voxel_size);
       k_refine_update_.setArg(arg++, lambda_reg);
       k_refine_update_.setArg(arg++, lr_sdf);
       k_refine_update_.setArg(arg++, beta1);
-      k_refine_update_.setArg(arg++, beta2);
       k_refine_update_.setArg(arg++, epsilon);
       k_refine_update_.setArg(arg++, static_cast<cl_int>(iter));
       k_refine_update_.setArg(arg++, static_cast<cl_int>(n_refine_views_));
+      k_refine_update_.setArg(arg++, edge_k);
       queue.enqueueNDRangeKernel(k_refine_update_, cl::NullRange,
                                  cl::NDRange(update_global), cl::NDRange(256));
       queue.finish();
@@ -1270,6 +1214,7 @@ void SVOIntegratorCL::RefineGeometry(int iters, float lambda_reg,
   // Keep color images and cameras alive for BakeColors.
   // Release grad/adam.
   cl_refine_grad_ = cl::Buffer();
+  cl_refine_grad_w_ = cl::Buffer();
   cl_refine_adam_ = cl::Buffer();
 }
 

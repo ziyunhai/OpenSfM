@@ -499,9 +499,9 @@ class OpenSfMConfig:
     # Enable in-place SDF refinement after SVO fusion.
     depthmap_fusion_svo_refine_enabled: bool = False
     # Number of SDF refinement iterations.
-    depthmap_fusion_svo_refine_iters: int = 20
+    depthmap_fusion_svo_refine_iters: int = 50
     # Laplacian regularization weight (0 = disabled).
-    depthmap_fusion_svo_refine_lambda_reg: float = 0.0
+    depthmap_fusion_svo_refine_lambda_reg: float = 0.2
 
     ##################################
     # Params for octree point cloud tiling (viewer streaming)

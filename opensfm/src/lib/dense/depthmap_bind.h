@@ -328,9 +328,11 @@ class SVOFuserWrapper {
     sf_.Fuse();
   }
 
-  void RefineGeometry(int iters, float lambda_reg) {
+  void RefineGeometry(
+      int iters, float lambda_reg,
+      const std::map<std::string, std::vector<std::string>>& neighbors) {
     py::gil_scoped_release release;
-    sf_.RefineGeometry(iters, lambda_reg);
+    sf_.RefineGeometry(iters, lambda_reg, neighbors);
   }
 
   // Extract surface points and bake colors from images in one call.
@@ -418,8 +420,8 @@ class SVOFuserWrapper {
 
   py::array_t<uint8_t> BakeColorsStandalone(
       const py::array_t<float, py::array::c_style>& points,
-      const py::array_t<float, py::array::c_style>& normals,
-      int n_final, int irls_iters) {
+      const py::array_t<float, py::array::c_style>& normals, int n_final,
+      int irls_iters) {
     if (points.ndim() != 2 || points.shape(1) != 3) {
       throw std::invalid_argument("points must be (N, 3)");
     }

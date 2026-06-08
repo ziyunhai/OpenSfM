@@ -36,7 +36,9 @@ PYBIND11_MODULE(pydense, m) {
       .def("fuse", &dense::SVOFuserWrapper::Fuse)
       .def("fuse_only", &dense::SVOFuserWrapper::FuseOnly)
       .def("refine_geometry", &dense::SVOFuserWrapper::RefineGeometry,
-           py::arg("iters"), py::arg("lambda_reg"))
+           py::arg("iters"), py::arg("lambda_reg"),
+           py::arg("neighbors") =
+               std::map<std::string, std::vector<std::string>>())
       .def("extract_and_bake", &dense::SVOFuserWrapper::ExtractAndBake)
       .def("prune_by_visibility", &dense::SVOFuserWrapper::PruneByVisibility,
            py::arg("iterations"), py::arg("carve_margin"),

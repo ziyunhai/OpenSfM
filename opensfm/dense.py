@@ -102,6 +102,7 @@ def compute_depthmaps(
         logger.info(
             f"Cluster assignments saved to {data.clusters_file()}")
 
+    # clusters = clusters[1:2]
     # ── 1b. Per-cluster bounding boxes ─────────────────────────────────
     cluster_bboxes: List[Tuple[NDArray, NDArray]] = [
         _compute_cluster_bbox(cl, graph, reconstruction) for cl in clusters
@@ -273,6 +274,7 @@ def compute_depthmaps(
     _fuse_per_cluster(
         data, all_neighbors, clusters, cluster_bboxes,
         processable, config, reconstruction, depth_ranges,
+        best_neighbors,
     )
 
     # ── 7.  Phase 4: Merge batch PLYs into final fused.ply ────────────
@@ -1780,6 +1782,7 @@ def _fuse_per_cluster(
     config: Dict[str, Any],
     reconstruction: types.Reconstruction,
     depth_ranges: Dict[str, Tuple[float, float]],
+    best_neighbors: Dict[str, List[pymap.Shot]],
 ) -> None:
     """Fuse cleaned depthmaps per cluster, each using N-hop expanded
     neighbors, producing a ``fused_batch_XXXX.ply`` per cluster.
@@ -2098,15 +2101,19 @@ def _fuse_per_cluster(
             ]
             if refine_enabled:
                 fuser.fuse_only()
-                if refine_enabled:
-                    fuser.refine_geometry(
-                        iters=config[
-                            "depthmap_fusion_svo_refine_iters"
-                        ],
-                        lambda_reg=config[
-                            "depthmap_fusion_svo_refine_lambda_reg"
-                        ],
-                    )
+                refine_nbrs = {
+                    sid: [s.id for s in best_neighbors.get(sid, [])]
+                    for sid in sv_views
+                }
+                fuser.refine_geometry(
+                    iters=config[
+                        "depthmap_fusion_svo_refine_iters"
+                    ],
+                    lambda_reg=config[
+                        "depthmap_fusion_svo_refine_lambda_reg"
+                    ],
+                    neighbors=refine_nbrs,
+                )
             else:
                 fuser.fuse_only()
 
