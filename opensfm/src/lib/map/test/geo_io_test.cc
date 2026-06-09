@@ -48,8 +48,8 @@ TEST(GeoIo, ParseWgs84Identity) {
   ASSERT_EQ(data.size(), 1u);
   EXPECT_EQ(data[0].filename, "img2.jpg");
   EXPECT_TRUE(data[0].has_lla);
-  EXPECT_DOUBLE_EQ(data[0].lat, 47.404);
-  EXPECT_DOUBLE_EQ(data[0].lon, 8.51);
+  EXPECT_DOUBLE_EQ(data[0].lon, 47.404);
+  EXPECT_DOUBLE_EQ(data[0].lat, 8.51);
   EXPECT_DOUBLE_EQ(data[0].alt, 600.0);
 }
 

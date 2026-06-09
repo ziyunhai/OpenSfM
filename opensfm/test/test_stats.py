@@ -202,7 +202,6 @@ def test_cameras_statistics_normal(
     )
 
     cameras_statistics = stats.cameras_statistics(dataset, [reference])
-    print(cameras_statistics)
     assert cameras_statistics == {
         "1": {
             "initial_values": {"k1": -0.1, "k2": 0.01, "focal": 0.7},
