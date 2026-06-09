@@ -97,7 +97,7 @@ def run_features_processing(data: DataSetBase, images: List[str], force: bool) -
 
         expected: int = len(images)
         for i in range(io_processes):
-            images_chunk = images[i * chunk_size : (i + 1) * chunk_size]
+            images_chunk = images[i * chunk_size: (i + 1) * chunk_size]
             arguments.append(
                 (
                     "producer",
@@ -172,7 +172,8 @@ class Counter:
 def process(args: Tuple[str, Union[ProducerArgs, ConsumerArgs]]) -> None:
     process_type, real_args = args
     if process_type == "producer":
-        queue, data, images, counter, expected, force = cast(ProducerArgs, real_args)
+        queue, data, images, counter, expected, force = cast(
+            ProducerArgs, real_args)
         read_images(queue, data, images, counter, expected, force)
     if process_type == "consumer":
         queue = cast(ConsumerArgs, real_args)
@@ -189,14 +190,16 @@ def read_images(
 ) -> None:
     full_queue_timeout = 600
     for image in images:
-        logger.info(f"Reading data for image {image} (queue-size={queue.qsize()})")
+        logger.info(
+            f"Reading data for image {image} (queue-size={queue.qsize()})")
         image_array = data.load_image(image)
         if data.config["features_bake_segmentation"]:
             segmentation_array = data.load_segmentation(image)
             instances_array = data.load_instances(image)
         else:
             segmentation_array, instances_array = None, None
-        args = (image, image_array, segmentation_array, instances_array, data, force)
+        args = (image, image_array, segmentation_array,
+                instances_array, data, force)
 
         queue.put(args, block=True, timeout=full_queue_timeout)
         counter.increment()
@@ -212,7 +215,8 @@ def run_detection(queue: ProcessQueue) -> None:
             queue.put(None)
             break
         image, image_array, segmentation_array, instances_array, data, force = args
-        detect(image, image_array, segmentation_array, instances_array, data, force)
+        detect(image, image_array, segmentation_array,
+               instances_array, data, force)
         del image_array
         del segmentation_array
         del instances_array
@@ -271,6 +275,14 @@ def detect(
     )
     has_words = not need_words or data.words_exist(image)
     has_features = data.features_exist(image)
+    if has_features:
+        try:
+            has_features &= data.load_features(image).points.shape[0] > 0
+        except Exception as e:
+            logger.error(f"Error loading features for image {image}: {e}")
+            has_features = False
+    else:
+        has_features = False
 
     if not force and has_features and has_words:
         logger.info(
@@ -281,13 +293,15 @@ def detect(
         return
 
     logger.info(
-        "Extracting {} features for image {}".format(data.feature_type().upper(), image)
+        "Extracting {} features for image {}".format(
+            data.feature_type().upper(), image)
     )
 
     start = timer()
 
     p_unmasked, f_unmasked, c_unmasked = features.extract_features(
-        image_array, data.config, is_high_res_panorama(data, image, image_array)
+        image_array, data.config, is_high_res_panorama(
+            data, image, image_array)
     )
 
     # Load segmentation and bake it in the data
@@ -323,7 +337,8 @@ def detect(
         )
     else:
         semantic_data = None
-    features_data = features.FeaturesData(p_sorted, f_sorted, c_sorted, semantic_data)
+    features_data = features.FeaturesData(
+        p_sorted, f_sorted, c_sorted, semantic_data)
     data.save_features(image, features_data)
 
     if need_words:
