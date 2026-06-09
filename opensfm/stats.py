@@ -868,10 +868,18 @@ def save_topview(
     output_path: str,
     io_handler: io.IoFilesystemBase,
 ) -> None:
+    # limit splatting to 100K random points for efficiency
+    max_points = 100000
     points = []
     colors = []
     for rec in reconstructions:
-        for point in rec.points.values():
+        # pick random subset of points if there are too many
+        if len(rec.points) > max_points:
+            sampled_ids = random.sample(list(rec.points.keys()), max_points)
+        else:
+            sampled_ids = list(rec.points.keys())
+        for point_id in sampled_ids:
+            point = rec.points[point_id]
             track = tracks_manager.get_track_observations(point.id)
             if len(track) < 2:
                 continue
