@@ -698,7 +698,7 @@ BAHelpers::BundleLocalResult BAHelpers::BundleLocalStochastic(
       "GPS", config["bundle_irls_gps_density_ratio"].cast<double>());
 
   ba.SetNumThreads(config["processes"].cast<int>());
-  ba.SetMaxNumIterations(10);
+  ba.SetMaxNumIterations(config["bundle_max_iterations"].cast<int>());
   ba.SetLinearSolverType(DetermineLinearSolver(
       interior.size() + boundary.size(), added_landmarks, added_reprojections));
   const auto timer_setup = std::chrono::high_resolution_clock::now();
@@ -1279,20 +1279,19 @@ py::dict BAHelpers::BundleStochastic(
 
   for (size_t round = 0; round < num_rounds; ++round) {
     std::vector<map::ShotId> seeds;
-    std::unordered_set<map::LandmarkId> gcp_seeds;
+    std::unordered_set<map::ShotId> gcp_seeds;
 
     if (!gcp.empty()) {
       const size_t gcp_seed_budget =
           config["stochastic_bundle_gcp_seeds_ratio"].cast<double>() *
-          effective_n;
+          gcp.size();
       const auto& shots = map.GetShots();
       std::unordered_set<map::LandmarkId> seen_gcps;
 
       // Pick random GCPs and graph-hop them to shots until we have
       // enough seeds or have seen all GCP-observing shots.
       std::uniform_int_distribution<size_t> dist(0, gcp.size() - 1);
-      while (gcp_seeds.size() < gcp_seed_budget &&
-             seen_gcps.size() < gcp.size()) {
+      while (seen_gcps.size() < gcp_seed_budget) {
         const auto& random_gcp = gcp[dist(rng)];
         if (seen_gcps.count(random_gcp.id_) == 0) {
           seen_gcps.insert(random_gcp.id_);
