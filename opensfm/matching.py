@@ -1219,39 +1219,79 @@ def generate_binary_cache(
         exifs: Dict mapping image names to their EXIF metadata.
         poses: Dict mapping image names to their poses.
     """
-    n_sample = min(config.get(
-        "binary_training_pairs", 100), len(pairs))
-    rng = np.random.RandomState(42)
-    sample_idx = rng.choice(len(pairs), n_sample, replace=False)
-    sample_pairs = [pairs[i] for i in sample_idx]
+    import os
+    import glob
 
-    # Force FLANN matching on CPU for training pairs.
-    training_config = dict(config)
-    training_config["use_opencl_matching"] = False
-    training_config["matcher_type"] = "FLANN"
-    training_config["use_robust_matching"] = True
+    descriptor_used = config.get("feature_type", "HAHOG")
+    dif_dir = os.path.join(os.path.dirname(__file__), "data", "dif")
+    P, t = None, None
 
-    training_args = list(match_arguments(
-        sample_pairs, data, training_config, cameras, exifs, None, None))
-    processes = config.get("processes", 1)
-    processes = context.processes_that_fit_in_memory(processes, 512)
-    logger.info(
-        "Matching %d training pairs with FLANN (%d processes)",
-        len(sample_pairs), processes,
-    )
-    training_matches = context.parallel_map(
-        match_unwrap_args, training_args, processes, 2)
+    if os.path.isdir(dif_dir):
+        # Find all files matching [DATASET COUNT]_[K]_[DESCRIPTOR USED].npz
+        pattern = os.path.join(dif_dir, f"*_*_{descriptor_used}.npz")
+        matches_files = glob.glob(pattern)
+        if matches_files:
+            candidates = []
+            for filepath in matches_files:
+                filename = os.path.basename(filepath)
+                name_without_ext = os.path.splitext(filename)[0]
+                parts = name_without_ext.split("_")
+                if len(parts) >= 3 and parts[-1] == descriptor_used:
+                    try:
+                        dataset_count = int(parts[0])
+                        k_val = int(parts[1])
+                        candidates.append((dataset_count, k_val, filepath))
+                    except ValueError:
+                        pass
+            if candidates:
+                candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+                best_file = candidates[0][2]
+                logger.info("Loading pre-trained DIF projection from %s", best_file)
+                try:
+                    loaded = np.load(best_file)
+                    P = loaded["P"]
+                    t = loaded["t"]
+                except Exception as e:
+                    logger.error("Failed to load pre-trained binary projection from %s: %s", best_file, str(e))
 
-    pos_d1, pos_d2, neg_d1, neg_d2 = collect_training_pairs(
-        data, training_matches, training_config,
-    )
-    P, t = train_dif_projection(
-        pos_d1, pos_d2, neg_d1, neg_d2)
+    if P is None or t is None:
+        logger.info("Pre-trained projection not found or failed to load. Falling back to runtime training.")
+        n_sample = min(config.get(
+            "binary_training_pairs", 100), len(pairs))
+        rng = np.random.RandomState(42)
+        sample_idx = rng.choice(len(pairs), n_sample, replace=False)
+        sample_pairs = [pairs[i] for i in sample_idx]
+
+        # Force FLANN matching on CPU for training pairs.
+        training_config = dict(config)
+        training_config["use_opencl_matching"] = False
+        training_config["matcher_type"] = "FLANN"
+        training_config["use_robust_matching"] = True
+
+        training_args = list(match_arguments(
+            sample_pairs, data, training_config, cameras, exifs, None, None))
+        processes = config.get("processes", 1)
+        processes = context.processes_that_fit_in_memory(processes, 512)
+        logger.info(
+            "Matching %d training pairs with FLANN (%d processes)",
+            len(sample_pairs), processes,
+        )
+        training_matches = context.parallel_map(
+            match_unwrap_args, training_args, processes, 2)
+
+        pos_d1, pos_d2, neg_d1, neg_d2 = collect_training_pairs(
+            data, training_matches, training_config,
+        )
+        P, t = train_dif_projection(
+            pos_d1, pos_d2, neg_d1, neg_d2)
+        logger.info("Binary projection trained: %d positive, %d negative pairs",
+                    len(pos_d1), len(neg_d1))
+    else:
+        logger.info("Using pre-trained DIF projection successfully.")
+
     config_override = dict(config)
     config_override["_binary_P"] = P
     config_override["_binary_t"] = t
-    logger.info("Binary projection trained: %d positive, %d negative pairs",
-                len(pos_d1), len(neg_d1))
 
     # Binarize all image descriptors once upfront so per-pair
     # matching doesn't repeat the (N, 128) @ (128, 128) matmul.
