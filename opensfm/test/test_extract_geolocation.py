@@ -11,6 +11,7 @@ class FakeData:
         self._images = images
         self._exif_overrides: Dict[str, Dict[str, Any]] = {}
         self.data_path = ""
+        self.config = {"proj_cdn_enabled": False, "proj_grid_cache_dir": ""}
 
     def images(self) -> List[str]:
         return self._images
@@ -49,17 +50,19 @@ def test_extract_geolocation_basic() -> None:
         assert "img2.jpg" in overrides
 
         img1 = overrides["img1.jpg"]
-        assert "latitude" in img1
-        assert "longitude" in img1
-        assert "altitude" in img1
-        assert abs(img1["latitude"] - 47.404) < 0.01
-        assert abs(img1["longitude"] - 8.510) < 0.01
-        assert abs(img1["altitude"] - 605.29) < 0.5
 
-        assert "latitude_std" in img1
-        assert img1["latitude_std"] == 0.03
-        assert img1["longitude_std"] == 0.03
-        assert img1["altitude_std"] == 0.05
+        img1_gps = overrides["img1.jpg"]["gps"]
+        assert "latitude" in img1_gps
+        assert "longitude" in img1_gps
+        assert "altitude" in img1_gps
+        assert abs(img1_gps["latitude"] - 47.404) < 0.01
+        assert abs(img1_gps["longitude"] - 8.510) < 0.01
+        assert abs(img1_gps["altitude"] - 605.29) < 0.5
+
+        assert "latitude_std" in img1_gps
+        assert img1_gps["latitude_std"] == 0.03
+        assert img1_gps["longitude_std"] == 0.03
+        assert img1_gps["altitude_std"] == 0.05
 
         assert "opk" in img1
         opk1 = img1["opk"]
