@@ -1664,38 +1664,51 @@ __kernel void svo_bake_colors(
         if (sw > 1e-8f) { mu_r = sr/sw; mu_g = sg/sw; mu_b = sb/sw; }
     }
 
-    // ---- Phase 1: top n_final inliers by resolution, linear blend ----
-    int   best_i = -1, second_i = -1;
-    float best_res = -1.0f, second_res = -1.0f;
+    // ---- Phase 1: smooth weighted blend over ALL consensus inliers ----
+    // The previous hard "top-n_final views by resolution" argmax flipped the
+    // chosen source image between adjacent pixels (the resolution ranking is
+    // a near-tie among overlapping views), so neighbours latched onto images
+    // with different exposure/colour -> patchy ortho seams.  Instead, blend
+    // every inlier continuously with
+    //     w = geometric prior (cos^2) × Tukey robustness × (res/res_max)^SHARP
+    // Since cos and resolution vary SMOOTHLY across the surface, the blend
+    // weights — and therefore the colour — vary smoothly between adjacent
+    // pixels: no hard view-assignment discontinuity.  SHARP controls the
+    // detail<->smoothness trade-off: higher concentrates weight on the
+    // sharpest view (more texture, less smoothing); lower blends more views.
+    const float SHARP = 4.0f;
+    (void)n_final;  // superseded by the continuous blend
+
+    float res_max = 1e-6f;
     for (int i = 0; i < n_valid; i++) {
         float dr = obs_r[i] - mu_r;
         float dg = obs_g[i] - mu_g;
         float db = obs_b[i] - mu_b;
         float u  = sqrt(dr*dr + dg*dg + db*db) / cs;
-        if (u >= 1.0f) continue;        // outlier — gated out by consensus
-        float r = obs_res[i];
-        if (r > best_res) {
-            second_res = best_res; second_i = best_i;
-            best_res   = r;        best_i   = i;
-        } else if (r > second_res) {
-            second_res = r;        second_i = i;
-        }
+        if (u < 1.0f) res_max = fmax(res_max, obs_res[i]);
+    }
+    float inv_res_max = 1.0f / res_max;
+
+    float3 out_lin = (float3)(0.0f, 0.0f, 0.0f);
+    float wsum = 0.0f;
+    for (int i = 0; i < n_valid; i++) {
+        float dr = obs_r[i] - mu_r;
+        float dg = obs_g[i] - mu_g;
+        float db = obs_b[i] - mu_b;
+        float u  = sqrt(dr*dr + dg*dg + db*db) / cs;
+        if (u >= 1.0f) continue;  // outlier — gated out by consensus
+        float robust = (1.0f - u*u) * (1.0f - u*u);
+        float rn     = obs_res[i] * inv_res_max;   // in (0, 1]
+        float w      = obs_w[i] * robust * pow(rn, SHARP);
+        out_lin += srgb_to_linear((float3)(obs_r[i], obs_g[i], obs_b[i])) * w;
+        wsum    += w;
     }
 
-    float3 out_lin;
-    if (best_i < 0) {
+    if (wsum > 1e-8f) {
+        out_lin /= wsum;
+    } else {
         // Degenerate: every view gated out — fall back to consensus color.
         out_lin = srgb_to_linear((float3)(mu_r, mu_g, mu_b));
-    } else {
-        out_lin = srgb_to_linear((float3)(obs_r[best_i], obs_g[best_i],
-                                          obs_b[best_i])) * best_res;
-        float wsum = best_res;
-        if (n_final >= 2 && second_i >= 0) {
-            out_lin += srgb_to_linear((float3)(obs_r[second_i], obs_g[second_i],
-                                               obs_b[second_i])) * second_res;
-            wsum += second_res;
-        }
-        out_lin /= wsum;
     }
 
     float3 out_srgb = linear_to_srgb(out_lin) * 255.0f;
