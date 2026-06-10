@@ -14,9 +14,9 @@ import yaml
 logger: logging.Logger = logging.getLogger(__name__)
 
 # Conversion constants
-_METERS_TO_FEET: float = 3.28084
-_SQ_METERS_TO_SQ_MILES: float = 3.86102e-7
-_CM_TO_INCHES: float = 0.393701
+_METERS_TO_FEET: float = 1.0 / 0.3048
+_SQ_METERS_TO_SQ_MILES: float = 1.0 / 2589988.11
+_CM_TO_INCHES: float = 1.0 / 2.54
 
 _LOCALE_DIR: str = os.path.join(os.path.dirname(__file__), "data", "locale")
 _SUPPORTED_LANGUAGES: tuple = ("en", "fr", "es", "de", "it")
@@ -68,7 +68,8 @@ class ReportLocale:
         result = self._fallback.get(key)
         if result is not None:
             if self._language != "en":
-                logger.debug(f"Missing translation for '{key}' in '{self._language}'")
+                logger.debug(
+                    f"Missing translation for '{key}' in '{self._language}'")
             return result
         logger.warning(f"Unknown locale key: '{key}'")
         return key
