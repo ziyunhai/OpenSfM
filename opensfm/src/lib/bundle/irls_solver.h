@@ -133,7 +133,9 @@ class IRLSSolver {
   void SetGroupDensityRatio(const std::string& group_id, double ratio);
   void SetAllGroupsDensityRatio(double ratio);
   void InitializeKFromResiduals(bool enable);
-  void SetSkipInitialReweighting(bool skip) { skip_initial_reweighting_ = skip; }
+  void SetSkipInitialReweighting(bool skip) {
+    skip_initial_reweighting_ = skip;
+  }
 
   void Run();
 

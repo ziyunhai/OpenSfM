@@ -69,13 +69,28 @@ static std::string jsonEscape(const std::string& s) {
 
 // ── ReadGcpJson ──────────────────────────────────────────────────────────────
 
-std::vector<GroundControlPoint> ReadGcpJson(const std::string& content) {
+std::vector<GroundControlPoint> ReadGcpJson(const std::string& content,
+                                            std::string* crsName,
+                                            bool cdnEnabled,
+                                            const std::string& gridCacheDir) {
   simdjson::ondemand::parser parser;
   simdjson::padded_string padded(content);
   simdjson::ondemand::document doc;
   if (parser.iterate(padded).get(doc) != simdjson::SUCCESS) {
     return {};
   }
+
+  std::string_view crsSv;
+  std::string crsStr = "WGS84";
+  if (doc["crs"].get_string().get(crsSv) == simdjson::SUCCESS) {
+    crsStr = std::string(crsSv);
+  }
+  if (crsName) {
+    *crsName = crsStr;
+  }
+
+  std::string projString = geo::ParseGcpProjectionString(crsStr);
+  geo::CrsTransform ct(projString, cdnEnabled, gridCacheDir);
 
   simdjson::ondemand::array points;
   if (doc["points"].get_array().get(points) != simdjson::SUCCESS) {
@@ -91,7 +106,7 @@ std::vector<GroundControlPoint> ReadGcpJson(const std::string& content) {
     }
 
     GroundControlPoint gcp;
-    gcp.role_ = OPTIMIZATION;
+    gcp.role_ = GCP;
 
     // id
     std::string_view idSv;
@@ -99,20 +114,54 @@ std::vector<GroundControlPoint> ReadGcpJson(const std::string& content) {
       gcp.id_ = std::string(idSv);
     }
 
+    // role (optional, defaults to GCP)
+    std::string_view roleSv;
+    if (pointObj["role"].get_string().get(roleSv) == simdjson::SUCCESS) {
+      gcp.role_ = RoleFromString(std::string(roleSv));
+    }
+
     // position → lla
     simdjson::ondemand::object posObj;
     if (pointObj["position"].get_object().get(posObj) == simdjson::SUCCESS) {
       double lat = 0, lon = 0, alt = 0;
-      posObj["latitude"].get_double().get(lat);
-      posObj["longitude"].get_double().get(lon);
+      bool has_alt = false;
+      if (posObj["altitude"].get_double().get(alt) == simdjson::SUCCESS) {
+        has_alt = true;
+      } else {
+        alt = 0.0;
+      }
+
+      double easting = 0, northing = 0;
+      if (posObj["easting"].get_double().get(easting) == simdjson::SUCCESS &&
+          posObj["northing"].get_double().get(northing) == simdjson::SUCCESS) {
+        // Transform Projected to WGS84
+        ct.transform(easting, northing, alt, lat, lon, alt);
+      } else {
+        posObj["latitude"].get_double().get(lat);
+        posObj["longitude"].get_double().get(lon);
+        // Even if given as lat/lon, they might have altitude we need to pass
+        // through transform? Wait, if it's WGS84, ParseGcpProjectionString
+        // gives empty projString, so ct.isIdentity() is true. For compound CRS,
+        // latitude/longitude but we still need vertical transform.
+        ct.transform(lon, lat, alt, lat, lon, alt);
+      }
+
       gcp.lla_["latitude"] = lat;
       gcp.lla_["longitude"] = lon;
-      if (posObj["altitude"].get_double().get(alt) == simdjson::SUCCESS) {
-        gcp.lla_["altitude"] = alt;
-        gcp.has_altitude_ = true;
-      } else {
-        gcp.lla_["altitude"] = 0.0;
-        gcp.has_altitude_ = false;
+      gcp.lla_["altitude"] = alt;
+      gcp.has_altitude_ = has_alt;
+
+      // per-point standard deviations (optional)
+      double lat_std = 0, lon_std = 0, alt_std = 0;
+      bool has_lat_std =
+          posObj["latitude_std"].get_double().get(lat_std) == simdjson::SUCCESS;
+      bool has_lon_std = posObj["longitude_std"].get_double().get(lon_std) ==
+                         simdjson::SUCCESS;
+      bool has_alt_std =
+          posObj["altitude_std"].get_double().get(alt_std) == simdjson::SUCCESS;
+
+      if (has_lat_std && has_lon_std && has_alt_std) {
+        gcp.std_dev_ = Vec3d(lon_std, lat_std, alt_std);
       }
     }
 
@@ -172,10 +221,19 @@ std::vector<GroundControlPoint> ReadGcpJson(const std::string& content) {
 
 // ── WriteGcpJson ─────────────────────────────────────────────────────────────
 
-std::string WriteGcpJson(const std::vector<GroundControlPoint>& gcps) {
+std::string WriteGcpJson(const std::vector<GroundControlPoint>& gcps,
+                         const std::string& crsName, bool cdnEnabled,
+                         const std::string& gridCacheDir) {
   std::ostringstream out;
   out << std::setprecision(kPrecision);
-  out << "{\n  \"points\": [\n";
+  out << "{\n";
+  if (!crsName.empty() && crsName != "WGS84") {
+    out << "  \"crs\": \"" << jsonEscape(crsName) << "\",\n";
+  }
+  out << "  \"points\": [\n";
+
+  geo::CrsTransform ct(geo::ParseGcpProjectionString(crsName), cdnEnabled,
+                       gridCacheDir);
 
   for (size_t i = 0; i < gcps.size(); ++i) {
     const auto& gcp = gcps[i];
@@ -184,21 +242,45 @@ std::string WriteGcpJson(const std::vector<GroundControlPoint>& gcps) {
     }
     out << "    {\n";
     out << "      \"id\": \"" << jsonEscape(gcp.id_) << "\",\n";
+    out << "      \"role\": \"" << RoleToString(gcp.role_) << "\",\n";
 
     // position (LLA)
     auto latIt = gcp.lla_.find("latitude");
     auto lonIt = gcp.lla_.find("longitude");
     auto altIt = gcp.lla_.find("altitude");
     if (latIt != gcp.lla_.end() && lonIt != gcp.lla_.end()) {
-      out << "      \"position\": {\n";
-      out << "        \"latitude\": " << latIt->second << ",\n";
-      out << "        \"longitude\": " << lonIt->second;
-      if (gcp.has_altitude_ && altIt != gcp.lla_.end()) {
-        out << ",\n        \"altitude\": " << altIt->second << "\n";
+      double lat = latIt->second;
+      double lon = lonIt->second;
+      double alt =
+          gcp.has_altitude_ && altIt != gcp.lla_.end() ? altIt->second : 0.0;
+      double easting = lon;
+      double northing = lat;
+      double out_alt = alt;
+
+      if (!ct.isIdentity() &&
+          ct.inverseTransform(lat, lon, alt, easting, northing, out_alt)) {
+        out << "      \"position\": {\n";
+        out << "        \"easting\": " << easting << ",\n";
+        out << "        \"northing\": " << northing;
+        if (gcp.has_altitude_) {
+          out << ",\n        \"altitude\": " << out_alt;
+        }
       } else {
-        out << "\n";
+        out << "      \"position\": {\n";
+        out << "        \"latitude\": " << latIt->second << ",\n";
+        out << "        \"longitude\": " << lonIt->second;
+        if (gcp.has_altitude_) {
+          out << ",\n        \"altitude\": " << alt;
+        }
       }
-      out << "      },\n";
+
+      if (gcp.std_dev_.has_value()) {
+        const auto& sd = gcp.std_dev_.value();
+        out << ",\n        \"latitude_std\": " << sd.y();
+        out << ",\n        \"longitude_std\": " << sd.x();
+        out << ",\n        \"altitude_std\": " << sd.z();
+      }
+      out << "\n      },\n";
     }
 
     // observations
@@ -227,7 +309,7 @@ std::string WriteGcpJson(const std::vector<GroundControlPoint>& gcps) {
 std::vector<GroundControlPoint> ReadGcpList(
     const std::string& content,
     const std::unordered_map<std::string, std::pair<int, int>>& imageWidths,
-    std::string* crsName) {
+    std::string* crsName, bool cdnEnabled, const std::string& gridCacheDir) {
   // Split content into lines and filter valid ones.
   std::vector<std::string> validLines;
   {
@@ -252,7 +334,7 @@ std::vector<GroundControlPoint> ReadGcpList(
 
   // Build CRS transform (identity for WGS-84, PROJ-based otherwise).
   std::string projString = geo::ParseGcpProjectionString(crs);
-  geo::CrsTransform ct(projString);
+  geo::CrsTransform ct(projString, cdnEnabled, gridCacheDir);
 
   // Parse data lines (starting from index 1).
   // Key: GCP name when provided, otherwise encoded coordinates.
@@ -299,14 +381,15 @@ std::vector<GroundControlPoint> ReadGcpList(
       }
 
       // Resolve WGS-84 lat/lon.
-      double lat = 0, lon = 0;
+      double lat = 0, lon = 0, out_alt = 0;
       if (ct.isIdentity()) {
         // WGS84 format: col1=longitude, col2=latitude
         lon = col1;
         lat = col2;
+        out_alt = alt;
       } else {
         // Projected CRS: col1=easting, col2=northing → transform to lat/lon
-        if (!ct.transform(col1, col2, lat, lon)) {
+        if (!ct.transform(col1, col2, alt, lat, lon, out_alt)) {
           keyToIndex.erase(mapIt);
           continue;
         }
@@ -315,10 +398,11 @@ std::vector<GroundControlPoint> ReadGcpList(
       gcp.id_ = gcpName.empty() ? ("unnamed-" + std::to_string(result.size()))
                                 : gcpName;
       gcp.has_altitude_ = hasAltitude;
-      gcp.role_ = OPTIMIZATION;
+      gcp.role_ = GCP;
       gcp.lla_["latitude"] = lat;
       gcp.lla_["longitude"] = lon;
-      gcp.lla_["altitude"] = alt;
+      gcp.lla_["altitude"] = out_alt;
+      // Coordinates should be the original values natively
       gcp.coordinates_ = Eigen::Vector3d(col1, col2, alt);
 
       result.push_back(std::move(gcp));
@@ -348,11 +432,12 @@ std::vector<GroundControlPoint> ReadGcpList(
 
 std::string WriteGcpList(
     const std::vector<GroundControlPoint>& gcps, const std::string& crs,
-    const std::unordered_map<std::string, std::pair<int, int>>& imageWidths) {
+    const std::unordered_map<std::string, std::pair<int, int>>& imageWidths,
+    bool cdnEnabled, const std::string& gridCacheDir) {
   std::ostringstream out;
   out << std::setprecision(kPrecision);
 
-  geo::CrsTransform ct(crs);
+  geo::CrsTransform ct(crs, cdnEnabled, gridCacheDir);
 
   // Header line: CRS
   out << (crs.empty() ? "WGS84" : crs) << "\n";
@@ -373,12 +458,13 @@ std::string WriteGcpList(
       // WGS84 format: col1=longitude, col2=latitude
     } else {
       // Projected CRS: transform lat/lon to easting/northing for output
-      double easting = 0, northing = 0;
-      if (!ct.inverseTransform(lat, lon, easting, northing)) {
+      double easting = 0, northing = 0, out_alt = 0;
+      if (!ct.inverseTransform(lat, lon, alt, easting, northing, out_alt)) {
         continue;
       }
       lon = easting;
       lat = northing;
+      alt = out_alt;
     }
 
     // One line per observation: lon lat alt px py shot_id gcp_id

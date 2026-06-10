@@ -627,24 +627,58 @@ class DataSet(DataSetBase):
         """Load ground control points."""
         exif = {image: self.load_exif(image) for image in self.images()}
 
+        cdn_enabled = self.config["proj_cdn_enabled"]
+        grid_cache_dir = self.config["proj_grid_cache_dir"]
+
         gcp = []
         if self.io_handler.isfile(self._gcp_list_file()):
             with self.io_handler.open_rt(self._gcp_list_file()) as fin:
-                gcp = io.read_gcp_list(fin, exif)
+                gcp = io.read_gcp_list(fin, exif, cdn_enabled, grid_cache_dir)
 
         pcs = []
         if self.io_handler.isfile(self._ground_control_points_file()):
             with self.io_handler.open_rt(self._ground_control_points_file()) as fin:
-                pcs = io.read_ground_control_points(fin)
+                pcs, _ = io.read_ground_control_points(
+                    fin, cdn_enabled, grid_cache_dir)
 
         return gcp + pcs
+
+    def load_gcp_coordinate_system(self) -> Optional[str]:
+        """Return the CRS string from ground_control_points.json or gcp_list.txt."""
+        crs = None
+        cdn_enabled = self.config["proj_cdn_enabled"]
+        grid_cache_dir = self.config["proj_grid_cache_dir"]
+        has_gcp_json = self.io_handler.isfile(
+            self._ground_control_points_file())
+        if has_gcp_json:
+            with self.io_handler.open_rt(self._ground_control_points_file()) as fin:
+                _, crs = io.read_ground_control_points(
+                    fin, cdn_enabled, grid_cache_dir)
+
+        has_gcp_txt = self.io_handler.isfile(self._gcp_list_file())
+        if not crs and has_gcp_txt:
+            with self.io_handler.open_rt(self._gcp_list_file()) as fin:
+                proj = io.read_gcp_projection_string(fin)
+                crs = proj
+
+        if not has_gcp_json and not has_gcp_txt:
+            return None
+
+        # None means identity / WGS84
+        result = crs if crs is not None else "WGS84"
+        geo.log_vertical_datum(result)
+        return result
 
     def save_ground_control_points(
         self,
         points: List[pymap.GroundControlPoint],
     ) -> None:
+        crs = self.load_gcp_coordinate_system() or "WGS84"
+        cdn_enabled = self.config["proj_cdn_enabled"]
+        grid_cache_dir = self.config["proj_grid_cache_dir"]
         with self.io_handler.open_wt(self._ground_control_points_file()) as fout:
-            io.write_ground_control_points(points, fout)
+            io.write_ground_control_points(
+                points, fout, crs, cdn_enabled, grid_cache_dir)
 
     def _stats_file(self) -> str:
         return os.path.join(self.data_path, "stats", "stats.json")

@@ -13,7 +13,7 @@ from opensfm import pygeometry
 from opensfm.dataset_base import DataSetBase
 from opensfm.data.camera_corrections import ypr_corrections
 from opensfm.sensors import camera_calibration, sensor_data
-from opensfm.geo import TopocentricConverter
+from opensfm.geo import TopocentricConverter, opk_from_ypr
 
 logger: logging.Logger = logging.getLogger(__name__)
 inch_in_mm: float = 25.4
@@ -651,86 +651,16 @@ class EXIF:
                     )
 
             if not any(v is None for v in ypr):
-                ypr = np.radians(ypr)
-
-                # Convert YPR --> OPK
-                # Ref: New Calibration and Computing Method for Direct
-                # Georeferencing of Image and Scanner Data Using the
-                # Position and Angular Data of an Hybrid Inertial Navigation System
-                # by Manfred Bäumker
-                y, p, r = ypr
-
-                # YPR rotation matrix
-                cnb = np.array(
-                    [
-                        [
-                            np.cos(y) * np.cos(p),
-                            np.cos(y) * np.sin(p) * np.sin(r) -
-                            np.sin(y) * np.cos(r),
-                            np.cos(y) * np.sin(p) * np.cos(r) +
-                            np.sin(y) * np.sin(r),
-                        ],
-                        [
-                            np.sin(y) * np.cos(p),
-                            np.sin(y) * np.sin(p) * np.sin(r) +
-                            np.cos(y) * np.cos(r),
-                            np.sin(y) * np.sin(p) * np.cos(r) -
-                            np.cos(y) * np.sin(r),
-                        ],
-                        [-np.sin(p), np.cos(p) * np.sin(r),
-                         np.cos(p) * np.cos(r)],
-                    ]
+                opk = opk_from_ypr(
+                    geo["latitude"],
+                    geo["longitude"],
+                    geo.get("altitude", 0),
+                    float(np.degrees(ypr[0])),
+                    float(np.degrees(ypr[1])),
+                    float(np.degrees(ypr[2])),
+                    apply_pitch_offset,
+                    tc,
                 )
-
-                # Apply pitch offset mapping safely after independent Gimbal YPR rotations.
-                if apply_pitch_offset:
-                    cnb = cnb.dot(np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]]))
-
-                # Convert between image and body coordinates
-                # Top of image pixels point to flying direction
-                # and camera is looking down.
-                # We might need to change this if we want different
-                # camera mount orientations (e.g. backward or sideways)
-
-                # (Swap X/Y, flip Z)
-                cbb = np.array([[0, 1, 0], [1, 0, 0], [0, 0, -1]])
-
-                delta = 1e-10
-                p1 = np.array(
-                    tc.to_topocentric(
-                        geo["latitude"] + delta,
-                        geo["longitude"],
-                        geo.get("altitude", 0),
-                    )
-                )
-                p2 = np.array(
-                    tc.to_topocentric(
-                        geo["latitude"] - delta,
-                        geo["longitude"],
-                        geo.get("altitude", 0),
-                    )
-                )
-                xnp = p1 - p2
-                m = np.linalg.norm(xnp)
-
-                if m == 0:
-                    logger.debug("Cannot compute OPK angles, divider = 0")
-                    return opk
-
-                # Unit vector pointing north
-                xnp /= m
-
-                znp = np.array([0, 0, -1]).T
-                ynp = np.cross(znp, xnp)
-                cen = np.array([xnp, ynp, znp]).T
-
-                # OPK rotation matrix
-                ceb = cen.dot(cnb).dot(cbb)
-
-                opk = {}
-                opk["omega"] = np.degrees(np.arctan2(-ceb[1][2], ceb[2][2]))
-                opk["phi"] = np.degrees(np.arcsin(ceb[0][2]))
-                opk["kappa"] = np.degrees(np.arctan2(-ceb[0][1], ceb[0][0]))
 
         return opk
 

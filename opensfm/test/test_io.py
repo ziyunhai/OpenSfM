@@ -143,14 +143,14 @@ def test_read_write_ground_control_points() -> None:
 
     # Read json
     fp = StringIO(text)
-    points = io.read_ground_control_points(fp)
+    points, crs = io.read_ground_control_points(fp)
     check_points(points)
 
     # Write json and re-read
     fwrite = StringIO()
-    io.write_ground_control_points(points, fwrite)
+    io.write_ground_control_points(points, fwrite, crs)
     freread = StringIO(fwrite.getvalue())
-    points_reread = io.read_ground_control_points(freread)
+    points_reread, crs2 = io.read_ground_control_points(freread)
     check_points(points_reread)
 
 

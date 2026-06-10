@@ -21,6 +21,10 @@ class OpenSfMConfig:
     default_projection_type: str = "perspective"
     # Default focal length to sensor size ratio to use when it cannot be inferred from EXIF metadata
     default_focal_prior: float = 0.85
+    # Enable downloading missing datum grids from the PROJ CDN
+    proj_cdn_enabled: bool = True
+    # Additional specific folder to load/store the geoid files and grids
+    proj_grid_cache_dir: str = ""
 
     ##################################
     # Params for features
@@ -105,10 +109,13 @@ class OpenSfMConfig:
     ##################################
     # Ratio test for matches
     lowes_ratio: float = 0.8
-    # FLANN, BRUTEFORCE, or WORDS
-    matcher_type: str = "FLANN"
+    lowes_ratio_hamming: float = 0.85
+    # FLANN, BRUTEFORCE, WORDS, OPENCL_HAMMING or OPENCL_BF
+    matcher_type: str = "OPENCL_HAMMING"
     # Match symmetrically or one-way
     symmetric_matching: bool = True
+    # Number of image pairs used to train the binary projection (OPENCL_HAMMING)
+    binary_training_pairs: int = 100
 
     ##################################
     # Params for FLANN matching
@@ -329,8 +336,24 @@ class OpenSfMConfig:
     local_bundle_grid: int = 12
     # Number of grid division for selecting tracks in final bundle adjustment
     final_bundle_grid: int = 32
+    # Min number of shots above which global bundle switches to the stochastic solver
+    stochastic_bundle_shot_count: int = 4000
+    # Max interior cameras optimized per stochastic round (N)
+    stochastic_bundle_max_shots: int = 500
+    # Number of seed shots fed to each stochastic round
+    stochastic_bundle_random_shots: int = 20
+    # How much of stochastic_bundle_max_shots, do we reserve for GCP-anchored shots
+    stochastic_bundle_gcp_seeds_ratio: float = 0.5
+    # Graph-hop radius for stochastic rounds (large so seeds can reach the N budget)
+    stochastic_bundle_radius: int = 100
+    # Upper bound on the number of stochastic rounds K (K is derived from scene size)
+    stochastic_bundle_max_rounds: int = 100
     # For debugging purpose of large datasets: limit the maximum number of shots in incremental reconstruction
     incremental_max_shots_count: int = 0
+    # Number of different pairs to try for incremental reconstruction bootstrap
+    incremental_bootstrap_tries: int = 10
+    # Average inlier ratio on resected shots to accept a bootstrap pair and grow it
+    incremental_bootstrap_min_inliers_ratio: float = 0.80
 
     # Remove uncertain and isolated points from the final point cloud
     filter_final_point_cloud: bool = False
@@ -534,6 +557,14 @@ class OpenSfMConfig:
     submodel_relpath_template: str = "submodels/submodel_%04d"
     # Template to generate the relative path to a submodel images directory
     submodel_images_relpath_template: str = "submodels/submodel_%04d/images"
+
+    ##################################
+    # Params for report localization
+    ##################################
+    # Unit system for the quality report: "metric" or "imperial"
+    report_unit_system: str = "metric"
+    # Language for the quality report: "en", "fr", "es", "de", "it"
+    report_language: str = "en"
 
 
 def default_config() -> Dict[str, Any]:

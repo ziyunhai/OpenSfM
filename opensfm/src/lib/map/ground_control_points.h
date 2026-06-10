@@ -2,18 +2,43 @@
 #include <foundation/optional.h>
 #include <map/defines.h>
 #include <map/map.h>
+
+#include <optional>
+#include <string>
+
 namespace map {
 enum GroundControlPointRole {
   /*    A ground control point role in SfM cluster merge and bundle adjuster
 
        Attributes:
-           OPTIMIZATION: used in the optimization of map chunks and logging
-  metrics METRICS_ONLY: only used in logging metrics
+           GCP: used in the optimization of map chunks and logging metrics
+           CHECKPOINT: only used in logging metrics (not in optimization)
 
   **/
-  OPTIMIZATION = 0,
-  METRICS_ONLY = 1
+  GCP = 0,
+  CHECKPOINT = 1
 };
+
+/// Convert a GroundControlPointRole enum to its string representation.
+inline std::string RoleToString(GroundControlPointRole role) {
+  switch (role) {
+    case GCP:
+      return "gcp";
+    case CHECKPOINT:
+      return "checkpoint";
+    default:
+      return "gcp";
+  }
+}
+
+/// Convert a string to a GroundControlPointRole enum.
+inline GroundControlPointRole RoleFromString(const std::string& s) {
+  if (s == "checkpoint") {
+    return CHECKPOINT;
+  }
+  return GCP;
+}
+
 struct GroundControlPointObservation {
   /*    A ground control point observation.
 
@@ -38,8 +63,8 @@ struct GroundControlPoint {
          observations: list of observations of the point on images
          id: a unique id for this point group (survey point + image
      observations) survey_point_id: a unique id for the point on the ground
-         role: OPTIMIZATION if gcp is used in SfM optimization, METRICS_ONLY if
-     the ground control point is used for computing map merging metrics
+         role: GCP if used in SfM optimization, CHECKPOINT if
+     the point is only used for computing accuracy metrics
      */
   GroundControlPoint() = default;
   LandmarkId id_;
@@ -49,6 +74,7 @@ struct GroundControlPoint {
   std::map<std::string, double> lla_;
   Vec3d coordinates_ = Vec3d::Zero();
   GroundControlPointRole role_;
+  std::optional<Vec3d> std_dev_;
 
   Vec3d GetLlaVec3d() const {
     return {

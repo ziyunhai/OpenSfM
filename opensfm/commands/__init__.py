@@ -9,6 +9,7 @@ from . import (
     compute_depthmaps,
     compute_dsm,
     compute_statistics,
+    convert_gcp,
     create_rig,
     create_submodels,
     create_tracks,
@@ -23,6 +24,7 @@ from . import (
     export_report,
     export_visualsfm,
     extend_reconstruction,
+    extract_geolocation,
     extract_metadata,
     match_features,
     mesh,
@@ -34,11 +36,13 @@ from .command_runner import command_runner
 
 
 opensfm_commands: List[ModuleType] = [
+    extract_geolocation,
     extract_metadata,
     detect_features,
     match_features,
     create_rig,
     create_tracks,
+    convert_gcp,
     reconstruct,
     crop_reconstruction,
     reconstruct_from_prior,

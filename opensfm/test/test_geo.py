@@ -1,6 +1,6 @@
 # pyre-strict
 import numpy as np
-from opensfm import geo, pygeo
+from opensfm import geo, pygeo, pymap
 
 
 def test_ecef_lla_consistency() -> None:
@@ -49,11 +49,10 @@ def test_eq_geo() -> None:
 
 
 def test_parse_projection() -> None:
-    from opensfm import io
-    proj_str = io._parse_projection_string("WGS84")
+    proj_str = pymap.parse_gcp_projection_string("WGS84")
     assert proj_str is None
 
-    proj_str = io._parse_projection_string("WGS84 UTM 31N")
+    proj_str = pymap.parse_gcp_projection_string("WGS84 UTM 31N")
     assert proj_str is not None
 
     proj = geo.construct_proj_transformer(proj_str)
@@ -96,8 +95,7 @@ def test_gps_distance_vectorized() -> None:
 
 def test_construct_proj_transformer_inverse() -> None:
     """Inverse transformer goes from WGS84 to projection."""
-    from opensfm import io
-    proj_str = io._parse_projection_string("WGS84 UTM 31N")
+    proj_str = pymap.parse_gcp_projection_string("WGS84 UTM 31N")
     assert proj_str is not None
 
     fwd = geo.construct_proj_transformer(proj_str)  # proj → WGS84
@@ -115,8 +113,7 @@ def test_construct_proj_transformer_inverse() -> None:
 
 def test_transform_to_proj_origin() -> None:
     """Origin of topocentric frame maps to the reference's projection coords."""
-    from opensfm import io
-    proj_str = io._parse_projection_string("WGS84 UTM 31N")
+    proj_str = pymap.parse_gcp_projection_string("WGS84 UTM 31N")
     assert proj_str is not None
     inv = geo.construct_proj_transformer(proj_str, inverse=True)
 
@@ -132,8 +129,7 @@ def test_transform_to_proj_origin() -> None:
 
 def test_get_proj_transform_matrix_shape() -> None:
     """Transform matrix is 4x4."""
-    from opensfm import io
-    proj_str = io._parse_projection_string("WGS84 UTM 31N")
+    proj_str = pymap.parse_gcp_projection_string("WGS84 UTM 31N")
     assert proj_str is not None
     inv = geo.construct_proj_transformer(proj_str, inverse=True)
     ref = geo.TopocentricConverter(41.38946, 2.18378, 0)

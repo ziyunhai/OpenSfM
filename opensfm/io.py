@@ -852,37 +852,6 @@ def camera_to_vector(camera: pygeometry.Camera) -> List[float]:
     return parameters
 
 
-def _parse_utm_projection_string(line: str) -> str:
-    """Convert strings like 'WGS84 UTM 32N' to a proj4 definition."""
-    words = line.lower().split()
-    assert len(words) == 3
-    zone = line.split()[2].upper()
-    if zone[-1] == "N":
-        zone_number = int(zone[:-1])
-        zone_hemisphere = "north"
-    elif zone[-1] == "S":
-        zone_number = int(zone[:-1])
-        zone_hemisphere = "south"
-    else:
-        zone_number = int(zone)
-        zone_hemisphere = "north"
-    s = "+proj=utm +zone={} +{} +ellps=WGS84 +datum=WGS84 +units=m +no_defs"
-    return s.format(zone_number, zone_hemisphere)
-
-
-def _parse_projection_string(line: str) -> Optional[str]:
-    """Parse the projection string from the GCP format line."""
-    line = line.strip()
-    if line in ["WGS84", "EPSG:4326"]:
-        return None
-    elif line.upper().startswith("WGS84 UTM"):
-        return _parse_utm_projection_string(line)
-    elif "+proj" in line or line.upper().startswith("EPSG:"):
-        return line
-    else:
-        raise ValueError("Un-supported geo system definition: {}".format(line))
-
-
 def read_gcp_projection_string(fileobj: IO[str]) -> Optional[str]:
     """Read the projection string from a gcp_list.txt file.
 
@@ -900,7 +869,7 @@ def _valid_gcp_line(line: str) -> bool:
 
 
 def read_gcp_list(
-    fileobj: IO[str], exif: Dict[str, Any]
+    fileobj: IO[str], exif: Dict[str, Any], cdn_enabled: bool = False, grid_cache_dir: str = ""
 ) -> List[pymap.GroundControlPoint]:
     """Read ground control points from a gcp_list.txt file.
 
@@ -913,21 +882,44 @@ def read_gcp_list(
     for shot_id, exif_data in exif.items():
         image_widths[shot_id] = (exif_data["width"], exif_data["height"])
 
-    return pymap.read_gcp_list(content, image_widths)
+    return pymap.read_gcp_list(content, image_widths, cdn_enabled, grid_cache_dir)
 
 
-def read_ground_control_points(fileobj: IO[str]) -> List[pymap.GroundControlPoint]:
+def write_gcp_list(
+    gcp: List[pymap.GroundControlPoint],
+    fileobj: IO[str],
+    crs: str,
+    exif: Dict[str, Any],
+    cdn_enabled: bool = False,
+    grid_cache_dir: str = "",
+) -> None:
+    """Write ground control points to a gcp_list.txt file."""
+    image_widths: Dict[str, Tuple[int, int]] = {}
+    for shot_id, exif_data in exif.items():
+        image_widths[shot_id] = (exif_data["width"], exif_data["height"])
+
+    content = pymap.write_gcp_list(
+        gcp, crs, image_widths, cdn_enabled, grid_cache_dir)
+    fileobj.write(content)
+
+
+def read_ground_control_points(
+    fileobj: IO[str], cdn_enabled: bool = False, grid_cache_dir: str = ""
+) -> Tuple[List[pymap.GroundControlPoint], str]:
     """Read ground control points from json file"""
     content = fileobj.read()
-    return pymap.read_gcp_json(content)
+    return pymap.read_gcp_json(content, cdn_enabled, grid_cache_dir)
 
 
 def write_ground_control_points(
     gcp: List[pymap.GroundControlPoint],
     fileobj: IO[str],
+    crs: str = "",
+    cdn_enabled: bool = False,
+    grid_cache_dir: str = "",
 ) -> None:
     """Write ground control points to json file."""
-    content = pymap.write_gcp_json(gcp)
+    content = pymap.write_gcp_json(gcp, crs, cdn_enabled, grid_cache_dir)
     fileobj.write(content)
 
 

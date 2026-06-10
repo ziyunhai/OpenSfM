@@ -530,15 +530,23 @@ def triangulate_all_gcp(
     gcp: List[pymap.GroundControlPoint],
     threshold: float,
 ) -> Tuple[List[NDArray], List[NDArray]]:
-    """Group and triangulate Ground Control Points seen in 2+ images."""
+    """Group and triangulate Ground Control Points seen in 2+ images.
+
+    Only points with role OPTIMIZATION are used; check points (METRICS_ONLY)
+    are skipped.
+    """
     triangulated, measured = [], []
     for point in gcp:
-        x = multiview.triangulate_gcp(
+        # Skip check points — they are not used for alignment
+        if point.role == pymap.GroundControlPointRole.CHECKPOINT:
+            continue
+        result = multiview.triangulate_gcp(
             point,
             reconstruction.shots,
             threshold,
         )
-        if x is not None and len(point.lla):
+        if result is not None and len(point.lla):
+            x, _inliers = result
             point_enu = np.array(
                 reconstruction.reference.to_topocentric(*point.lla_vec)
             )

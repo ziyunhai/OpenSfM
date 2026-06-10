@@ -1,9 +1,13 @@
 # pyre-strict
-from typing import Any, Dict, List, overload, Sequence, Tuple, Union
+import logging
+from typing import Any, Dict, List, Optional, overload, Sequence, Tuple, Union
 
 import numpy as np
 import pyproj
+import warnings
+
 from numpy.typing import NDArray
+from opensfm import pymap
 
 Scalars = Union[float, NDArray]
 
@@ -11,6 +15,111 @@ WGS84_a = 6378137.0
 WGS84_b = 6356752.314245
 
 DEFAULT_GPS_STD: NDArray = np.array([5.0, 5.0, 15.0])
+
+logger = logging.getLogger(__name__)
+
+
+def log_vertical_datum(crs: str) -> None:
+    if not crs or crs.upper() in ("WGS84", "EPSG:4326"):
+        logger.warning(
+            f"GCPs: using implicit ellipsoid height ({crs or 'WGS84'}). Geoid effects are ignored."
+        )
+        return
+    elif "4979" in crs:
+        logger.warning(
+            f"GCPs: using explicit ellipsoid height ({crs}). Geoid effects are ignored."
+        )
+        return
+
+    try:
+        parsed = pymap.parse_gcp_projection_string(crs)
+        if not parsed:
+            logger.warning(
+                "GCPs: using implicit ellipsoid height (WGS84). Geoid effects are ignored.")
+            return
+
+        pyproj_crs = pyproj.CRS(parsed)
+        if pyproj_crs.is_compound:
+            vert_crs = pyproj_crs.sub_crs_list[1]
+            logger.info(
+                f"GCPs: using vertical datum '{vert_crs.name}' from compound CRS."
+            )
+        elif hasattr(pyproj_crs, "has_z") and pyproj_crs.has_z:
+            logger.warning(
+                f"GCPs: using 3D CRS '{pyproj_crs.name}'. If this represents an ellipsoid height, geoid effects are ignored."
+            )
+    except Exception as e:
+        logger.debug(f"Could not parse GCP vertical datum for logging: {e}")
+
+
+def nicify_crs(crs_string: str) -> Tuple[str, str]:
+    """Produce a standardized string representation of horizontal and vertical CRS.
+
+    Returns:
+        Tuple[str, str]: A tuple specifying (Horizontal CRS, Vertical CRS).
+    """
+    if not crs_string or crs_string.upper() == "WGS84":
+        return "WGS84", "WGS 84 Ellipsoid"
+
+    upper_crs = crs_string.upper()
+    if upper_crs == "EPSG:4326":
+        return "WGS84", "WGS 84 Ellipsoid (implicit)"
+
+    if upper_crs == "EPSG:4979":
+        return "WGS84", "WGS 84 Ellipsoid (explicit)"
+
+    if upper_crs.startswith("WGS84 UTM"):
+        # e.g., "WGS84 UTM 17N"
+        parts = upper_crs.split()
+        return f"UTM {parts[-1]}", "WGS 84 Ellipsoid"
+
+    if "+" in upper_crs and upper_crs.startswith("EPSG:"):
+        # Compound EPSG: EPSG:4979+5773
+        parts = upper_crs.split("+")
+        horiz = parts[0]
+        vert = f"EPSG:{parts[1]}" if not parts[1].startswith(
+            "EPSG:") else parts[1]
+        return horiz, vert
+
+    try:
+        parsed = pymap.parse_gcp_projection_string(crs_string)
+        if not parsed:
+            return crs_string, "WGS 84 Ellipsoid"
+
+        pyproj_crs = pyproj.CRS(parsed)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            crs_dict = pyproj_crs.to_dict()
+            ellps = crs_dict.get("ellps", "Ellipsoid")
+            vert = f"{ellps.upper()}" if ellps != "Ellipsoid" else "WGS 84 Ellipsoid"
+            if "towgs84" in crs_dict and np.array(crs_dict["towgs84"]).any():
+                vert += f" ({','.join(map(str, crs_dict['towgs84']))})"
+
+        if crs_string.strip().startswith("+proj="):
+            if crs_dict.get("proj") == "utm":
+                zone = crs_dict.get("zone", "")
+                hemisphere = "S" if "south" in crs_dict else "N"
+                horiz = f"UTM {zone}{hemisphere}"
+            else:
+                horiz = crs_string
+            return str(horiz), str(vert)
+
+        if pyproj_crs.coordinate_operation and pyproj_crs.coordinate_operation.name:
+            op_name = pyproj_crs.coordinate_operation.name
+            if op_name.startswith("UTM zone "):
+                horiz = "UTM " + op_name.replace("UTM zone ", "")
+                return str(horiz), str(vert)
+
+        horiz = pyproj_crs.name if pyproj_crs.name != "unknown" else crs_string
+
+        if pyproj_crs.is_compound:
+            horiz = pyproj_crs.sub_crs_list[0].name
+            vert = pyproj_crs.sub_crs_list[1].name
+
+        return str(horiz), str(vert)
+    except Exception:
+        return crs_string, "WGS 84 Ellipsoid"
 
 
 @overload
@@ -310,6 +419,70 @@ class TopocentricConverter:
 
     def __eq__(self, o: "TopocentricConverter") -> bool:
         return np.allclose([self.lat, self.lon, self.alt], (o.lat, o.lon, o.alt))
+
+
+def opk_from_ypr(
+    lat: float,
+    lon: float,
+    alt: float,
+    yaw: float,
+    pitch: float,
+    roll: float,
+    apply_pitch_offset: bool = False,
+    tc: Optional[TopocentricConverter] = None,
+) -> Optional[Dict[str, float]]:
+    """Convert Yaw, Pitch, Roll to Omega, Phi, Kappa."""
+    if tc is None:
+        tc = TopocentricConverter(lat, lon, alt)
+    y, p, r = np.radians([yaw, pitch, roll])
+
+    # YPR rotation matrix
+    cnb = np.array(
+        [
+            [
+                np.cos(y) * np.cos(p),
+                np.cos(y) * np.sin(p) * np.sin(r) - np.sin(y) * np.cos(r),
+                np.cos(y) * np.sin(p) * np.cos(r) + np.sin(y) * np.sin(r),
+            ],
+            [
+                np.sin(y) * np.cos(p),
+                np.sin(y) * np.sin(p) * np.sin(r) + np.cos(y) * np.cos(r),
+                np.sin(y) * np.sin(p) * np.cos(r) - np.cos(y) * np.sin(r),
+            ],
+            [-np.sin(p), np.cos(p) * np.sin(r), np.cos(p) * np.cos(r)],
+        ]
+    )
+
+    if apply_pitch_offset:
+        cnb = cnb.dot(np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]]))
+
+    # Convert between image and body coordinates
+    cbb = np.array([[0, 1, 0], [1, 0, 0], [0, 0, -1]])
+
+    delta = 1e-10
+    p1 = np.array(tc.to_topocentric(lat + delta, lon, alt))
+    p2 = np.array(tc.to_topocentric(lat - delta, lon, alt))
+    xnp = p1 - p2
+    m = np.linalg.norm(xnp)
+
+    if m == 0:
+        return None
+
+    # Unit vector pointing north
+    xnp /= m
+
+    znp = np.array([0, 0, -1]).T
+    ynp = np.cross(znp, xnp)
+    cen = np.array([xnp, ynp, znp]).T
+
+    # OPK rotation matrix
+    ceb = cen.dot(cnb).dot(cbb)
+
+    return {
+        "omega": float(np.degrees(np.arctan2(-ceb[1][2], ceb[2][2]))),
+        "phi": float(np.degrees(np.arcsin(ceb[0][2]))),
+        "kappa": float(np.degrees(np.arctan2(-ceb[0][1], ceb[0][0]))),
+    }
 
 
 def construct_proj_transformer(proj_str: str, inverse: bool = False) -> pyproj.Transformer:

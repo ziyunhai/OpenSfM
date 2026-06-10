@@ -297,6 +297,7 @@ class BundleAdjuster {
   RigInstance GetRigInstance(const std::string& instance_id) const;
   std::map<std::string, RigCamera> GetRigCameras() const;
   std::map<std::string, RigInstance> GetRigInstances() const;
+  const std::map<std::string, Shot>& GetShots() const;
   Shot* GetShotRaw(const std::string& id);
 
   // Minimization details

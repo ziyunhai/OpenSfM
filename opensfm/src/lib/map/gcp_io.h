@@ -15,12 +15,17 @@ namespace map {
 ///
 /// Mirrors opensfm/io.py::read_ground_control_points.
 /// Observations are expected in normalized image coordinates.
-std::vector<GroundControlPoint> ReadGcpJson(const std::string& content);
+std::vector<GroundControlPoint> ReadGcpJson(
+    const std::string& content, std::string* crsName = nullptr,
+    bool cdnEnabled = false, const std::string& gridCacheDir = "");
 
 /// Write ground control points to a ground_control_points.json string.
 ///
 /// Mirrors opensfm/io.py::write_ground_control_points.
-std::string WriteGcpJson(const std::vector<GroundControlPoint>& gcps);
+std::string WriteGcpJson(const std::vector<GroundControlPoint>& gcps,
+                         const std::string& crsName = "",
+                         bool cdnEnabled = false,
+                         const std::string& gridCacheDir = "");
 
 /// Read ground control points from a gcp_list.txt string.
 ///
@@ -39,7 +44,8 @@ std::string WriteGcpJson(const std::vector<GroundControlPoint>& gcps);
 std::vector<GroundControlPoint> ReadGcpList(
     const std::string& content,
     const std::unordered_map<std::string, std::pair<int, int>>& imageWidths,
-    std::string* crsName = nullptr);
+    std::string* crsName = nullptr, bool cdnEnabled = false,
+    const std::string& gridCacheDir = "");
 
 /// Write ground control points to a gcp_list.txt string.
 ///
@@ -54,6 +60,7 @@ std::vector<GroundControlPoint> ReadGcpList(
 ///       pixel_y = proj_y * max(w,h) + h/2 - 0.5
 std::string WriteGcpList(
     const std::vector<GroundControlPoint>& gcps, const std::string& crs,
-    const std::unordered_map<std::string, std::pair<int, int>>& imageWidths);
+    const std::unordered_map<std::string, std::pair<int, int>>& imageWidths,
+    bool cdnEnabled = false, const std::string& gridCacheDir = "");
 
 }  // namespace map

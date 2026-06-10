@@ -1329,6 +1329,10 @@ Point BundleAdjuster::GetPoint(const std::string& id) const {
   return points_.at(id);
 }
 
+const std::map<std::string, Shot>& BundleAdjuster::GetShots() const {
+  return shots_;
+}
+
 Point* BundleAdjuster::GetPointRaw(const std::string& id) {
   return &points_.at(id);
 }

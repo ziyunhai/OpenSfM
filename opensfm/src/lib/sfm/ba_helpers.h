@@ -48,6 +48,19 @@ class BAHelpers {
       const map::ShotId& central_shot_id, int grid_size,
       const py::dict& config);
 
+  /// Stochastic local bundle adjustment: a single limited-size round seeded
+  /// from multiple shots. Mirrors BundleLocal's neighborhood/grid/triangulation
+  /// machinery but sets up the problem like the full Bundle (GPS-bias
+  /// compensation + alignment), with camera intrinsics and rig cameras fixed.
+  static BundleLocalResult BundleLocalStochastic(
+      map::Map& map,
+      const std::unordered_map<map::CameraId, geometry::Camera>& camera_priors,
+      const std::unordered_map<map::RigCameraId, map::RigCamera>&
+          rig_camera_priors,
+      const AlignedVector<map::GroundControlPoint>& gcp,
+      const std::vector<map::ShotId>& central_shot_ids, int grid_size,
+      const py::dict& config);
+
   // ---- Python wrappers (for pybind, return py:: objects) ----
 
   /// Python wrapper: returns py::make_tuple(py_outliers, py_removed).
@@ -65,8 +78,20 @@ class BAHelpers {
       const map::ShotId& central_shot_id, int grid_size,
       const py::dict& config);
 
+  /// Python wrapper for BundleLocalStochastic: returns (py_point_ids, report).
+  static py::tuple BundleLocalStochasticPython(
+      map::Map& map,
+      const std::unordered_map<map::CameraId, geometry::Camera>& camera_priors,
+      const std::unordered_map<map::RigCameraId, map::RigCamera>&
+          rig_camera_priors,
+      const AlignedVector<map::GroundControlPoint>& gcp,
+      const std::vector<map::ShotId>& central_shot_ids, int grid_size,
+      const py::dict& config);
+
   // ---- Other APIs ----
 
+  /// Global bundle adjustment. Dispatches to BundleFull for small scenes and to
+  /// BundleStochastic once the shot count reaches stochastic_bundle_shot_count.
   static py::dict Bundle(
       map::Map& map,
       const std::unordered_map<map::CameraId, geometry::Camera>& camera_priors,
@@ -85,14 +110,10 @@ class BAHelpers {
   static void BundleToMap(const bundle::BundleAdjuster& bundle_adjuster,
                           map::Map& output_map, bool update_cameras);
 
-  static std::pair<std::unordered_set<map::ShotId>,
-                   std::unordered_set<map::ShotId>>
-  ShotNeighborhoodIds(map::Map& map, const map::ShotId& central_shot_id,
-                      size_t radius, size_t min_common_points,
-                      size_t max_interior_size);
   static std::pair<std::unordered_set<map::Shot*>,
                    std::unordered_set<map::Shot*>>
-  ShotNeighborhood(map::Map& map, const map::ShotId& central_shot_id,
+  ShotNeighborhood(map::Map& map,
+                   const std::vector<map::ShotId>& central_shot_ids,
                    size_t radius, size_t min_common_points,
                    size_t max_interior_size);
   static std::string DetectAlignmentConstraints(
@@ -109,13 +130,32 @@ class BAHelpers {
       size_t grid_size);
 
  private:
+  // Full-scene global bundle (the historical Bundle implementation).
+  static py::dict BundleFull(
+      map::Map& map,
+      const std::unordered_map<map::CameraId, geometry::Camera>& camera_priors,
+      const std::unordered_map<map::RigCameraId, map::RigCamera>&
+          rig_camera_priors,
+      const AlignedVector<map::GroundControlPoint>& gcp, int grid_size,
+      const py::dict& config);
+
+  // Stochastic global bundle: K rounds of BundleLocalStochastic over uniformly
+  // random seed shots, for scenes too large to bundle in a single solve.
+  static py::dict BundleStochastic(
+      map::Map& map,
+      const std::unordered_map<map::CameraId, geometry::Camera>& camera_priors,
+      const std::unordered_map<map::RigCameraId, map::RigCamera>&
+          rig_camera_priors,
+      const AlignedVector<map::GroundControlPoint>& gcp, int grid_size,
+      const py::dict& config);
+
   static std::unordered_set<map::Shot*> DirectShotNeighbors(
       map::Map& map, const std::unordered_set<map::Shot*>& shot_ids,
       const size_t min_common_points, const size_t max_neighbors);
   static bool TriangulateGCP(
       const map::GroundControlPoint& point,
       const std::unordered_map<map::ShotId, map::Shot>& shots,
-      float reproj_threshold, Vec3d& coordinates);
+      float reproj_threshold, Vec3d& coordinates, std::vector<bool>& inliers);
 
   static void AlignmentConstraints(
       const map::Map& map, const py::dict& config,

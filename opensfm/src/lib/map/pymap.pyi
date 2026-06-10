@@ -41,6 +41,8 @@ __all__ = [
     "ShotMesh",
     "ShotView",
     "TracksManager",
+    "GeolocationData",
+    "parse_geolocation_file",
     "Angular",
     "METRICS_ONLY",
     "Normalized",
@@ -654,3 +656,24 @@ METRICS_ONLY: "GroundControlPointRole"
 Normalized: "ErrorType"
 OPTIMIZATION: "GroundControlPointRole"
 Pixel: "ErrorType"
+
+
+class GeolocationData:
+    filename: str
+    has_lla: bool
+    lat: float
+    lon: float
+    alt: float
+    has_std: bool
+    lat_std: float
+    lon_std: float
+    alt_std: float
+    has_ypr: bool
+    yaw: float
+    pitch: float
+    roll: float
+    def __init__(self) -> None: ...
+
+
+def parse_geolocation_file(
+    content: str, dataset_images: List[str], crs: str, cdn_enabled: bool = False, grid_cache_dir: str = "") -> List[GeolocationData]: ...

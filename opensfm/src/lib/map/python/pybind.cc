@@ -7,6 +7,7 @@
 #include <map/dataviews.h>
 #include <map/defines.h>
 #include <map/gcp_io.h>
+#include <map/geo_io.h>
 #include <map/ground_control_points.h>
 #include <map/landmark.h>
 #include <map/map.h>
@@ -280,8 +281,8 @@ PYBIND11_MODULE(pymap, m) {
                      &map::GroundControlPointObservation::projection_);
 
   py::enum_<map::GroundControlPointRole>(m, "GroundControlPointRole")
-      .value("OPTIMIZATION", map::GroundControlPointRole::OPTIMIZATION)
-      .value("METRICS_ONLY", map::GroundControlPointRole::METRICS_ONLY)
+      .value("GCP", map::GroundControlPointRole::GCP)
+      .value("CHECKPOINT", map::GroundControlPointRole::CHECKPOINT)
       .export_values();
 
   py::class_<map::GroundControlPoint>(m, "GroundControlPoint")
@@ -295,6 +296,7 @@ PYBIND11_MODULE(pymap, m) {
       .def_property("lla_vec", &map::GroundControlPoint::GetLlaVec3d,
                     &map::GroundControlPoint::SetLla)
       .def_readwrite("role", &map::GroundControlPoint::role_)
+      .def_readwrite("std_dev", &map::GroundControlPoint::std_dev_)
       .def_property("observations", &map::GroundControlPoint::GetObservations,
                     &map::GroundControlPoint::SetObservations)
       .def("add_observation", &map::GroundControlPoint::AddObservation);
@@ -714,22 +716,60 @@ PYBIND11_MODULE(pymap, m) {
       .def("get_valid_observations", &map::Map::GetValidObservations)
       .def("to_tracks_manager", &map::Map::ToTracksManager);
   // ── GCP I/O functions ──────────────────────────────────────────────────
-  m.def("read_gcp_json", &map::ReadGcpJson, py::arg("content"),
-        "Read ground control points from a JSON string.");
+  m.def(
+      "read_gcp_json",
+      [](const std::string& content, bool cdnEnabled,
+         const std::string& gridCacheDir) {
+        std::string crsName;
+        auto gcps =
+            map::ReadGcpJson(content, &crsName, cdnEnabled, gridCacheDir);
+        return py::make_tuple(gcps, crsName);
+      },
+      py::arg("content"), py::arg("cdn_enabled") = false,
+      py::arg("grid_cache_dir") = "",
+      "Read ground control points from a JSON string.\n"
+      "Returns a tuple (points_list, crs_string).");
   m.def("write_gcp_json", &map::WriteGcpJson, py::arg("gcps"),
+        py::arg("crs_name") = "", py::arg("cdn_enabled") = false,
+        py::arg("grid_cache_dir") = "",
         "Write ground control points to a JSON string.");
   m.def(
       "read_gcp_list",
       [](const std::string& content,
          const std::unordered_map<std::string, std::pair<int, int>>&
-             imageWidths) {
-        return map::ReadGcpList(content, imageWidths, nullptr);
+             imageWidths,
+         bool cdnEnabled, const std::string& gridCacheDir) {
+        return map::ReadGcpList(content, imageWidths, nullptr, cdnEnabled,
+                                gridCacheDir);
       },
       py::arg("content"), py::arg("image_widths"),
+      py::arg("cdn_enabled") = false, py::arg("grid_cache_dir") = "",
       "Read ground control points from a gcp_list.txt string.");
   m.def("write_gcp_list", &map::WriteGcpList, py::arg("gcps"), py::arg("crs"),
-        py::arg("image_widths"),
+        py::arg("image_widths"), py::arg("cdn_enabled") = false,
+        py::arg("grid_cache_dir") = "",
         "Write ground control points to a gcp_list.txt string.");
+
+  py::class_<map::GeolocationData>(m, "GeolocationData")
+      .def(py::init<>())
+      .def_readwrite("filename", &map::GeolocationData::filename)
+      .def_readwrite("has_lla", &map::GeolocationData::has_lla)
+      .def_readwrite("lat", &map::GeolocationData::lat)
+      .def_readwrite("lon", &map::GeolocationData::lon)
+      .def_readwrite("alt", &map::GeolocationData::alt)
+      .def_readwrite("has_std", &map::GeolocationData::has_std)
+      .def_readwrite("lat_std", &map::GeolocationData::lat_std)
+      .def_readwrite("lon_std", &map::GeolocationData::lon_std)
+      .def_readwrite("alt_std", &map::GeolocationData::alt_std)
+      .def_readwrite("has_ypr", &map::GeolocationData::has_ypr)
+      .def_readwrite("yaw", &map::GeolocationData::yaw)
+      .def_readwrite("pitch", &map::GeolocationData::pitch)
+      .def_readwrite("roll", &map::GeolocationData::roll);
+
+  m.def("parse_geolocation_file", &map::ParseGeolocationFile,
+        py::arg("content"), py::arg("dataset_images"), py::arg("crs"),
+        py::arg("cdn_enabled") = false, py::arg("grid_cache_dir") = "");
+
   m.def(
       "parse_gcp_projection_string",
       [](const std::string& line) -> std::optional<std::string> {

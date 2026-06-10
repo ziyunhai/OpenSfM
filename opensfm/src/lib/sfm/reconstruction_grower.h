@@ -67,6 +67,12 @@ class ReconstructionGrower {
 
  private:
   // ---- Resection ----
+  struct ResectedShotInfo {
+    map::ShotId shot_id;
+    double inliers_ratio;
+    int num_inliers;
+  };
+
   struct ResectionResult {
     bool success = false;
     std::unordered_set<map::ShotId> new_shots;

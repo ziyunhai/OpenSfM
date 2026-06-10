@@ -211,6 +211,7 @@ def test_cameras_statistics_normal(
                 "scale": 1.0,
                 "translation": [0.0, 0.0, 0.0],
             },
+            "relative_difference": {"k1": 0.0, "k2": 0.0, "focal": 0.0},
         }
     }
 
@@ -265,7 +266,8 @@ def test_gps_errors_normal(
 ) -> None:
     reference = scene_synthetic.reconstruction
     gps_errors = stats.gps_errors([reference])
-    assert set(gps_errors.keys()) == {"average_error", "error", "mean", "std"}
+    assert set(gps_errors.keys()) == {
+        "average_error", "error", "mean", "std", "average_gps_std"}
     # scene_synthetic generated GPS noise is 5 meters
     assert 3.0 < gps_errors["average_error"] < 7.0
 

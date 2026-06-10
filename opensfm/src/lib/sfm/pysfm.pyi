@@ -26,6 +26,7 @@ __all__ = [
     "remove_isolated_points",
 ]
 
+
 class BAHelpers:
     @staticmethod
     def add_gcp_to_bundle(
@@ -34,6 +35,7 @@ class BAHelpers:
         arg2: list[opensfm.pymap.GroundControlPoint],
         arg3: dict,
     ) -> int: ...
+
     @staticmethod
     def bundle(
         arg0: opensfm.pymap.Map,
@@ -42,6 +44,7 @@ class BAHelpers:
         arg3: list[opensfm.pymap.GroundControlPoint],
         arg4: dict,
     ) -> dict: ...
+
     @staticmethod
     def bundle_local(
         arg0: opensfm.pymap.Map,
@@ -51,6 +54,17 @@ class BAHelpers:
         arg4: str,
         arg5: dict,
     ) -> tuple: ...
+
+    @staticmethod
+    def bundle_local_stochastic(
+        arg0: opensfm.pymap.Map,
+        arg1: dict[str, opensfm.pygeometry.Camera],
+        arg2: dict[str, opensfm.pymap.RigCamera],
+        arg3: list[opensfm.pymap.GroundControlPoint],
+        arg4: list[str],
+        arg5: dict,
+    ) -> tuple: ...
+
     @staticmethod
     def bundle_shot_poses(
         arg0: opensfm.pymap.Map,
@@ -59,36 +73,44 @@ class BAHelpers:
         arg3: dict[str, opensfm.pymap.RigCamera],
         arg4: dict,
     ) -> dict: ...
+
     @staticmethod
     def bundle_to_map(
         arg0: opensfm.pybundle.BundleAdjuster, arg1: opensfm.pymap.Map, arg2: bool
     ) -> None: ...
+
     @staticmethod
     def detect_alignment_constraints(
         arg0: opensfm.pymap.Map,
         arg1: dict,
         arg2: list[opensfm.pymap.GroundControlPoint],
     ) -> str: ...
-    @staticmethod
-    def shot_neighborhood_ids(
-        arg0: opensfm.pymap.Map, arg1: str, arg2: int, arg3: int, arg4: int
-    ) -> tuple[set[str], set[str]]: ...
+
 
 class StaticExtensionLoader:
     pass
 
+
 def add_connections(
     arg0: opensfm.pymap.TracksManager, arg1: str, arg2: list[str]
 ) -> None: ...
+
+
 def count_tracks_per_shot(
     arg0: opensfm.pymap.TracksManager, arg1: list[str], arg2: list[str]
 ) -> dict[str, int]: ...
+
+
 def filter_badly_conditioned_points(
     map: opensfm.pymap.Map, min_angle_deg: float = 1.0, min_abs_det: float = 1e-15
 ) -> int: ...
+
+
 def realign_maps(
     arg0: opensfm.pymap.Map, arg1: opensfm.pymap.Map, arg2: bool
 ) -> None: ...
+
+
 def remove_connections(
     arg0: opensfm.pymap.TracksManager, arg1: str, arg2: list[str]
 ) -> None: ...

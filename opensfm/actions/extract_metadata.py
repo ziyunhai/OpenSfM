@@ -18,17 +18,23 @@ def _load_or_extract_exif(
     force: bool,
     exif_overrides: Dict[str, Dict[str, Any]],
 ) -> Tuple[str, Dict[str, Any], bool]:
+    re_extracted = False
+
     if not force and data.exif_exists(image):
         logger.info("Loading existing EXIF for %s", image)
-        return image, data.load_exif(image), False
-
-    logger.info("Extracting EXIF for %s", image)
-    metadata = _extract_exif(image, data)
+        re_extracted = False
+        metadata = data.load_exif(image)
+    else:
+        re_extracted = True
+        logger.info("Extracting EXIF for %s", image)
+        metadata = _extract_exif(image, data)
 
     if image in exif_overrides:
+        re_extracted = True
+        logger.info("Applying EXIF overrides for %s", image)
         metadata.update(exif_overrides[image])
 
-    return image, metadata, True
+    return image, metadata, re_extracted
 
 
 def run_dataset(data: DataSetBase, force: bool = False) -> None:
