@@ -529,9 +529,11 @@ void Map::SetBias(const CameraId& camera_id,
 
 std::unordered_map<ShotId, std::unordered_map<LandmarkId, Vec2d> >
 Map::ComputeReprojectionErrors(const TracksManager& tracks_manager,
-                               const Map::ErrorType& error_type) const {
+                               const Map::ErrorType& error_type,
+                               const std::vector<ShotId>& shot_ids) const {
   std::unordered_map<ShotId, std::unordered_map<LandmarkId, Vec2d> > errors;
-  for (const auto& shot_id : tracks_manager.GetShotIds()) {
+  const std::vector<ShotId>& shots_to_eval = shot_ids.empty() ? tracks_manager.GetShotIds() : shot_ids;
+  for (const auto& shot_id : shots_to_eval) {
     const auto find_shot = shots_.find(shot_id);
     if (find_shot == shots_.end()) {
       continue;
@@ -572,10 +574,12 @@ Map::ComputeReprojectionErrors(const TracksManager& tracks_manager,
 }
 
 std::unordered_map<ShotId, std::unordered_map<LandmarkId, Observation> >
-Map::GetValidObservations(const TracksManager& tracks_manager) const {
+Map::GetValidObservations(const TracksManager& tracks_manager,
+                          const std::vector<ShotId>& shot_ids) const {
   std::unordered_map<ShotId, std::unordered_map<LandmarkId, Observation> >
       observations;
-  for (const auto& shot_id : tracks_manager.GetShotIds()) {
+  const std::vector<ShotId>& shots_to_eval = shot_ids.empty() ? tracks_manager.GetShotIds() : shot_ids;
+  for (const auto& shot_id : shots_to_eval) {
     const auto find_shot = shots_.find(shot_id);
     if (find_shot == shots_.end()) {
       continue;

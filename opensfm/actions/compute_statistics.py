@@ -21,15 +21,19 @@ def run_dataset(data: DataSet, diagram_max_points: int = -1) -> None:
     output_path = os.path.join(data.data_path, "stats")
     data.io_handler.mkdir_p(output_path)
 
-    stats_dict = stats.compute_all_statistics(data, tracks_manager, reconstructions)
+    stats_dict = stats.compute_all_statistics(
+        data, tracks_manager, reconstructions)
 
     stats.save_residual_grids(
         data, tracks_manager, reconstructions, output_path, data.io_handler
     )
+    print("Residual grids saved")
     stats.save_matchgraph(
         data, tracks_manager, reconstructions, output_path, data.io_handler
     )
+    print("Matchgraph saved")
     stats.save_residual_histogram(stats_dict, output_path, data.io_handler)
+    print("Residual histogram saved")
 
     if diagram_max_points > 0:
         stats.decimate_points(reconstructions, diagram_max_points)
@@ -37,9 +41,11 @@ def run_dataset(data: DataSet, diagram_max_points: int = -1) -> None:
     stats.save_heatmap(
         data, tracks_manager, reconstructions, output_path, data.io_handler
     )
+    print("Heatmap saved")
     stats.save_topview(
         data, tracks_manager, reconstructions, output_path, data.io_handler
     )
+    print("Topview saved")
     stats.save_overlap_map(
         reconstructions, output_path, data.io_handler
     )

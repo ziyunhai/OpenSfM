@@ -86,8 +86,7 @@ def _gps_gcp_opk_errors_stats(errors: Optional[NDArray], names: List[str]) -> Di
     average = np.average(np.linalg.norm(errors, axis=1))
 
     stats["mean"] = {names[0]: mean[0], names[1]: mean[1], names[2]: mean[2]}
-    stats["std"] = {names[0]: std_dev[0], names[1]
-        : std_dev[1], names[2]: std_dev[2]}
+    stats["std"] = {names[0]: std_dev[0], names[1]                    : std_dev[1], names[2]: std_dev[2]}
     stats["error"] = {
         names[0]: math.sqrt(m_squared[0]),
         names[1]: math.sqrt(m_squared[1]),
@@ -243,14 +242,15 @@ def gcp_errors(
 
 def _compute_errors(
     reconstructions: List[types.Reconstruction], tracks_manager: pymap.TracksManager
-) -> Callable[[int, pymap.ErrorType], Dict[str, Dict[str, NDArray]]]:
+) -> Callable[[int, pymap.ErrorType, Optional[Tuple[str, ...]]], Dict[str, Dict[str, NDArray]]]:
     @lru_cache(10)
     def _compute_errors_cached(
-        index: int, error_type: pymap.ErrorType
+        index: int, error_type: pymap.ErrorType, shot_ids: Optional[Tuple[str, ...]] = None
     ) -> Dict[str, Dict[str, NDArray]]:
         return reconstructions[index].map.compute_reprojection_errors(
             tracks_manager,
             error_type,
+            list(shot_ids) if shot_ids is not None else []
         )
 
     return _compute_errors_cached
@@ -258,12 +258,15 @@ def _compute_errors(
 
 def _get_valid_observations(
     reconstructions: List[types.Reconstruction], tracks_manager: pymap.TracksManager
-) -> Callable[[int], Dict[str, Dict[str, pymap.Observation]]]:
+) -> Callable[[int, Optional[Tuple[str, ...]]], Dict[str, Dict[str, pymap.Observation]]]:
     @lru_cache(10)
     def _get_valid_observations_cached(
-        index: int,
+        index: int, shot_ids: Optional[Tuple[str, ...]] = None
     ) -> Dict[str, Dict[str, pymap.Observation]]:
-        return reconstructions[index].map.get_valid_observations(tracks_manager)
+        return reconstructions[index].map.get_valid_observations(
+            tracks_manager,
+            list(shot_ids) if shot_ids is not None else []
+        )
 
     return _get_valid_observations_cached
 
@@ -274,53 +277,101 @@ THist = Tuple[NDArray, NDArray]
 def _projection_error(
     tracks_manager: pymap.TracksManager, reconstructions: List[types.Reconstruction]
 ) -> Tuple[float, float, float, THist, THist, THist]:
-    all_errors_normalized, all_errors_pixels, all_errors_angular = [], [], []
-    average_error_normalized, average_error_pixels, average_error_angular = 0, 0, 0
-    for i in range(len(reconstructions)):
-        errors_normalized = _compute_errors(reconstructions, tracks_manager)(
-            i, pymap.ErrorType.Normalized
-        )
-        errors_unnormalized = _compute_errors(reconstructions, tracks_manager)(
-            i, pymap.ErrorType.Pixel
-        )
-        errors_angular = _compute_errors(reconstructions, tracks_manager)(
-            i, pymap.ErrorType.Angular
-        )
+    max_shots = 4000
 
-        for shot_id, shot_errors_normalized in errors_normalized.items():
+    # Pre-select random shots per reconstruction
+    rec_shots = []
+    for rec in reconstructions:
+        shot_ids = list(rec.shots.keys())
+        if len(shot_ids) > max_shots:
+            shot_ids = random.sample(shot_ids, max_shots)
+        rec_shots.append(tuple(shot_ids))
+
+    bins = 30
+
+    # 1. Normalized errors
+    all_errors_normalized = []
+    average_error_normalized = 0.0
+    for i in range(len(reconstructions)):
+        if not rec_shots[i]:
+            continue
+        errors_normalized = _compute_errors(reconstructions, tracks_manager)(
+            i, pymap.ErrorType.Normalized, rec_shots[i]
+        )
+        for shot_id, shot_errors in errors_normalized.items():
+            for error_normalized in shot_errors.values():
+                norm_normalized = _norm2d(error_normalized)
+                average_error_normalized += norm_normalized
+                all_errors_normalized.append(norm_normalized)
+
+    error_count_normalized = len(all_errors_normalized)
+    avg_normalized = average_error_normalized / \
+        error_count_normalized if error_count_normalized > 0 else -1.0
+    hist_normalized = np.histogram(
+        all_errors_normalized, bins) if error_count_normalized > 0 else (np.array([]), np.array([]))
+    del all_errors_normalized
+
+    # 2. Pixel errors
+    all_errors_pixels = []
+    average_error_pixels = 0.0
+    for i in range(len(reconstructions)):
+        if not rec_shots[i]:
+            continue
+        errors_unnormalized = _compute_errors(reconstructions, tracks_manager)(
+            i, pymap.ErrorType.Pixel, rec_shots[i]
+        )
+        for shot_id, shot_errors in errors_unnormalized.items():
             shot = reconstructions[i].get_shot(shot_id)
             normalizer = max(shot.camera.width, shot.camera.height)
-
-            for error_normalized, error_unnormalized, error_angular in zip(
-                shot_errors_normalized.values(),
-                errors_unnormalized[shot_id].values(),
-                errors_angular[shot_id].values(),
-            ):
+            for error_unnormalized in shot_errors.values():
                 norm_pixels = _norm2d(error_unnormalized * normalizer)
-                norm_normalized = _norm2d(error_normalized)
-                norm_angle = error_angular[0]
-                if norm_pixels > RESIDUAL_PIXEL_CUTOFF or math.isnan(norm_angle):
+                if norm_pixels > RESIDUAL_PIXEL_CUTOFF:
                     continue
-                average_error_normalized += norm_normalized
                 average_error_pixels += norm_pixels
-                average_error_angular += norm_angle
-                all_errors_normalized.append(norm_normalized)
                 all_errors_pixels.append(norm_pixels)
+
+    error_count_pixels = len(all_errors_pixels)
+    avg_pixels = average_error_pixels / \
+        error_count_pixels if error_count_pixels > 0 else -1.0
+    hist_pixels = np.histogram(all_errors_pixels, bins) if error_count_pixels > 0 else (
+        np.array([]), np.array([]))
+    del all_errors_pixels
+
+    # 3. Angular errors
+    all_errors_angular = []
+    average_error_angular = 0.0
+    for i in range(len(reconstructions)):
+        if not rec_shots[i]:
+            continue
+        errors_angular = _compute_errors(reconstructions, tracks_manager)(
+            i, pymap.ErrorType.Angular, rec_shots[i]
+        )
+        for shot_id, shot_errors in errors_angular.items():
+            for error_angular in shot_errors.values():
+                norm_angle = error_angular[0]
+                if math.isnan(norm_angle):
+                    continue
+                average_error_angular += norm_angle
                 all_errors_angular.append(norm_angle)
 
-    error_count = len(all_errors_normalized)
-    if error_count == 0:
+    error_count_angular = len(all_errors_angular)
+    avg_angular = average_error_angular / \
+        error_count_angular if error_count_angular > 0 else -1.0
+    hist_angular = np.histogram(all_errors_angular, bins) if error_count_angular > 0 else (
+        np.array([]), np.array([]))
+    del all_errors_angular
+
+    if error_count_normalized == 0 and error_count_pixels == 0 and error_count_angular == 0:
         dummy = (np.array([]), np.array([]))
         return (-1.0, -1.0, -1.0, dummy, dummy, dummy)
 
-    bins = 30
     return (
-        average_error_normalized / error_count,
-        average_error_pixels / error_count,
-        average_error_angular / error_count,
-        np.histogram(all_errors_normalized, bins),
-        np.histogram(all_errors_pixels, bins),
-        np.histogram(all_errors_angular, bins),
+        avg_normalized,
+        avg_pixels,
+        avg_angular,
+        hist_normalized,
+        hist_pixels,
+        hist_angular,
     )
 
 
@@ -1161,20 +1212,25 @@ def save_residual_grids(
     io_handler: io.IoFilesystemBase,
 ) -> None:
     all_errors = {}
-
+    max_shots = 2000
     scaling = 4
+
     for rec in reconstructions:
         for camera_id in rec.cameras:
             all_errors[camera_id] = []
 
     for i in range(len(reconstructions)):
+        shot_ids = list(reconstructions[i].shots.keys())
+        ramdom_shot_ids = tuple(random.sample(
+            shot_ids, min(max_shots, len(shot_ids))))
+
         valid_observations = _get_valid_observations(
             reconstructions, tracks_manager)(i)
         errors_scaled = _compute_errors(reconstructions, tracks_manager)(
-            i, pymap.ErrorType.Normalized
+            i, pymap.ErrorType.Normalized, ramdom_shot_ids
         )
         errors_unscaled = _compute_errors(reconstructions, tracks_manager)(
-            i, pymap.ErrorType.Pixel
+            i, pymap.ErrorType.Pixel, ramdom_shot_ids
         )
 
         for shot_id, shot_errors in errors_scaled.items():
@@ -1203,6 +1259,9 @@ def save_residual_grids(
 
                 shots_errors.append((x, y, error_scaled))
             all_errors[shot.camera.id] += shots_errors
+
+        del errors_scaled
+        del errors_unscaled
 
     for camera_id, errors in all_errors.items():
         if not errors:

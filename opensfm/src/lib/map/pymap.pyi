@@ -238,7 +238,7 @@ class Map:
     def clear_observations_and_landmarks(self) -> None: ...
 
     def compute_reprojection_errors(
-        self, arg0: TracksManager, arg1: ErrorType
+        self, arg0: TracksManager, arg1: ErrorType, arg2: List[str] = []
     ) -> Dict[str, Dict[str, numpy.ndarray]]: ...
 
     def create_camera(
@@ -280,7 +280,7 @@ class Map:
     def get_shots(self) -> ShotView: ...
 
     def get_valid_observations(
-        self, arg0: TracksManager
+        self, arg0: TracksManager, arg1: List[str] = []
     ) -> Dict[str, Dict[str, Observation]]: ...
     def has_landmark(self, arg0: str) -> bool: ...
     @overload
