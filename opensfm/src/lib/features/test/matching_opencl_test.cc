@@ -12,6 +12,10 @@ namespace py = pybind11;
 
 namespace {
 
+// The OpenCL matcher API takes/returns numpy arrays, so the embedded Python
+// interpreter must be initialized before any py::array_t is constructed.
+py::scoped_interpreter kPythonInterpreter{};
+
 // Generate N random 128-dim float32 descriptors.
 std::vector<float> RandomDescriptors(int n, int dim, unsigned seed) {
   std::mt19937 rng(seed);
