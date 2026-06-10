@@ -1578,8 +1578,8 @@ __kernel void svo_bake_colors(
     }
 
     // Fallback: no valid observation.  Emit black (0) — NOT grey (128) — so
-    // the ortho hole-fill (_ortho_diffuse_holes, keyed on sum==0) inpaints
-    // these cells from their neighbours instead of leaving a grey patch.
+    // the post-process ortho hole-fill (keyed on colour sum==0) fills these
+    // cells from their neighbours instead of leaving a grey patch.
     if (n_valid == 0) {
         out_colors[gid * 3 + 0] = 0;
         out_colors[gid * 3 + 1] = 0;

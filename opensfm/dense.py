@@ -40,6 +40,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple, Union
 import cv2
 import numpy as np
 from numpy.typing import NDArray
+from scipy import ndimage
 from opensfm import context, io, log, pydense, pypointcloud, pymap, pysfm, tracking, types
 from opensfm.dataset import UndistortedDataSet
 
@@ -1435,43 +1436,228 @@ def _split_into_subvolumes(
 # ── DSM post-processing helpers ─────────────────────────────────────
 
 
-def _ortho_diffuse_holes(
-    ortho_grid: NDArray, dsm_grid: NDArray, iterations: int
+def _gpu_diffuse_grid(
+    grid_nan: NDArray, iters: int, kappa: float, dt: float, device: int = 0
 ) -> NDArray:
-    """Diffuse ortho colors into cells that have a valid DSM but no color.
+    """Bounded GPU Perona-Malik diffusion of a single-channel float grid.
 
-    Uses cv2.inpaint (Telea algorithm) for fast C++-backed hole filling.
-    The inpaint radius is derived from iterations (clamped to a reasonable
-    range) to control how far colors spread into holes.
+    NaN cells are holes (seeded from valid neighbours, one ring per
+    iteration, then relaxed); non-NaN cells are frozen (Dirichlet BC).
+    Returns the diffused grid as float32.
     """
-    if iterations <= 0:
-        return ortho_grid
+    diff = pydense.GPUDiffuser()
+    diff.set_device(int(device))
+    diff.upload_grid(np.ascontiguousarray(grid_nan, dtype=np.float32))
+    # Empty guide → self-guided (edge magnitude from the grid itself).
+    empty_guide = np.empty((0,), dtype=np.float32)
+    res = diff.diffuse(empty_guide, int(iters), float(kappa), float(dt))
+    return np.asarray(res, dtype=np.float32)
 
-    h, w, _ = ortho_grid.shape
+
+def _linear_fill_components(
+    grid: NDArray,
+    labels: NDArray,
+    fill_ids: NDArray,
+    sample_valid: NDArray,
+    ring_iters: int = 3,
+) -> None:
+    """Fill large hole components by linear (Delaunay) interpolation.
+
+    For each labelled component in ``fill_ids`` a thin ring of valid samples
+    around it (``sample_valid`` cells within ``ring_iters`` of the hole) is
+    triangulated and the hole interior is linearly interpolated across it.
+    Cells outside the ring's convex hull fall back to nearest-neighbour.
+    Works per-component so colours/heights never bleed between holes.
+    ``grid`` (``(H,W)`` or ``(H,W,C)`` float) is modified in place.
+    """
+    from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
+
+    multichannel = grid.ndim == 3
+    H, W = labels.shape
+    pad = ring_iters + 1
+    # All per-component work is cropped to the component's bounding box (+pad
+    # for the boundary ring) so cost scales with hole size, not grid size.
+    boxes = ndimage.find_objects(labels)
+    for lid in fill_ids:
+        box = boxes[lid - 1]
+        if box is None:
+            continue
+        y0 = max(box[0].start - pad, 0)
+        y1 = min(box[0].stop + pad, H)
+        x0 = max(box[1].start - pad, 0)
+        x1 = min(box[1].stop + pad, W)
+
+        sub_grid = grid[y0:y1, x0:x1]  # a view → writes propagate to grid
+        comp = labels[y0:y1, x0:x1] == lid
+        ring = ndimage.binary_dilation(
+            comp, iterations=ring_iters) & sample_valid[y0:y1, x0:x1]
+        ys, xs = np.nonzero(ring)
+        if ys.size < 4:
+            continue
+        pts = np.column_stack((xs, ys)).astype(np.float64)  # local frame
+        qy, qx = np.nonzero(comp)
+        q = np.column_stack((qx, qy)).astype(np.float64)
+        vals = sub_grid[ys, xs, :] if multichannel else sub_grid[ys, xs]
+
+        try:
+            filled = LinearNDInterpolator(pts, vals)(q)
+        except Exception:
+            filled = np.full(
+                (q.shape[0],) + vals.shape[1:], np.nan, dtype=np.float64
+            )
+
+        bad = (
+            np.isnan(filled).any(axis=1) if multichannel else np.isnan(filled)
+        )
+        if np.any(bad):
+            filled[bad] = NearestNDInterpolator(pts, vals)(q[bad])
+
+        if multichannel:
+            sub_grid[qy, qx, :] = filled.astype(grid.dtype)
+        else:
+            sub_grid[qy, qx] = filled.astype(grid.dtype)
+
+
+def _fill_holes_2pass(
+    values: NDArray,
+    sample_valid: NDArray,
+    hole_mask: NDArray,
+    *,
+    small_area_max: int,
+    diffuse_iters: int,
+    kappa: float,
+    dt: float,
+    device: int = 0,
+) -> NDArray:
+    """Two-stage hole fill on a float grid (post-process).
+
+    Stage 1 — tiny holes (connected components <= ``small_area_max`` cells):
+    bounded GPU Perona-Malik diffusion seeded from the surrounding data.
+    Stage 2 — larger holes: per-component linear (Delaunay) interpolation
+    from their boundary ring.
+
+    ``values``      : float ``(H,W)`` or ``(H,W,C)``.
+    ``sample_valid``: bool ``(H,W)``, True where real data exists (samples,
+                      frozen during diffusion).
+    ``hole_mask``   : bool ``(H,W)``, cells to fill.  Cells that are neither a
+                      sample nor a hole are left untouched (never used as a
+                      sample, never frozen).
+    Returns a filled copy (float32).
+    """
+    out = values.astype(np.float32, copy=True)
+    if not hole_mask.any():
+        return out
+
+    labels, n_comp = ndimage.label(hole_mask)
+    if n_comp == 0:
+        return out
+
+    comp_size = np.bincount(labels.ravel())
+    small_mask = hole_mask & (comp_size[labels] <= small_area_max)
+
+    # Large components that touch the grid border are the no-data "background"
+    # (margins + un-reconstructed area outside the surface), NOT real holes —
+    # interpolating across them would invent a fake surface, so leave them NaN.
+    # Only ENCLOSED large components are genuine holes worth filling.
+    border_labels = np.unique(
+        np.concatenate(
+            (labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1])
+        )
+    )
+    large_ids = np.nonzero(comp_size > small_area_max)[0]
+    large_ids = large_ids[large_ids != 0]  # drop background label 0
+    enclosed_large = large_ids[~np.isin(large_ids, border_labels)]
+
+    multichannel = out.ndim == 3
+    nchan = out.shape[2] if multichannel else 1
+
+    # Stage 1: GPU diffusion for tiny holes.  Only sample cells are frozen;
+    # holes and ignored cells are NaN so they neither seed nor bleed.
+    diffuse_ok = True
+    if small_mask.any():
+        frozen = ~sample_valid
+        for c in range(nchan):
+            ch = out[..., c] if multichannel else out
+            grid = ch.copy()
+            grid[frozen] = np.nan
+            try:
+                filled = _gpu_diffuse_grid(
+                    grid, diffuse_iters, kappa, dt, device)
+            except Exception as e:  # OpenCL unavailable → fall back to linear
+                logger.warning(
+                    f"GPU diffuse hole-fill unavailable ({e}); "
+                    "routing tiny holes through linear interpolation"
+                )
+                diffuse_ok = False
+                break
+            if multichannel:
+                out[..., c][small_mask] = filled[small_mask]
+            else:
+                out[small_mask] = filled[small_mask]
+
+    # Stage 2: per-component linear interpolation for enclosed large holes
+    # (and enclosed tiny holes too if the diffusion pass was unavailable).
+    if diffuse_ok:
+        stage2_ids = enclosed_large
+        stage2_valid = sample_valid | small_mask  # tiny holes now hold values
+    else:
+        all_ids = np.nonzero(comp_size != 0)[0]
+        all_ids = all_ids[all_ids != 0]
+        stage2_ids = all_ids[~np.isin(all_ids, border_labels)]
+        stage2_valid = sample_valid
+
+    n_tiny = int(small_mask.sum()) if diffuse_ok else 0
+    n_linear = int(comp_size[stage2_ids].sum()) if stage2_ids.size else 0
+    n_nodata = int(hole_mask.sum()) - n_tiny - n_linear
+    logger.info(
+        f"Hole fill: {n_tiny} tiny cells (diffusion), {n_linear} enclosed "
+        f"cells (linear), {n_nodata} cells left as no-data"
+    )
+
+    if stage2_ids.size:
+        _linear_fill_components(out, labels, stage2_ids, stage2_valid)
+
+    return out
+
+
+def _fill_dsm_holes(dsm_grid: NDArray, config: Dict[str, Any]) -> NDArray:
+    """Fill DSM no-data holes: tiny ones by edge-aware GPU diffusion, large
+    ones by linear interpolation.  Holes are NaN cells."""
+    valid = ~np.isnan(dsm_grid)
+    if valid.all() or not valid.any():
+        return dsm_grid
+    return _fill_holes_2pass(
+        dsm_grid,
+        sample_valid=valid,
+        hole_mask=~valid,
+        small_area_max=config["hole_fill_small_area_max"],
+        diffuse_iters=config["hole_fill_diffuse_iters"],
+        kappa=0.5,  # metres: large steps (building edges) stop diffusion
+        dt=0.2,
+    )
+
+
+def _fill_ortho_holes(
+    ortho_grid: NDArray, dsm_grid: NDArray, config: Dict[str, Any]
+) -> NDArray:
+    """Fill ortho colour holes where a DSM surface exists but no colour was
+    baked.  Tiny holes by (near-isotropic) GPU diffusion, large holes by
+    linear interpolation.  Cells with no DSM stay untouched (black)."""
     has_dsm = ~np.isnan(dsm_grid)
     has_color = has_dsm & (ortho_grid.sum(axis=2) > 0)
-    needs_color = has_dsm & ~has_color
-
-    if not needs_color.any():
+    fillable = has_dsm & ~has_color
+    if not fillable.any():
         return ortho_grid
-
-    # Inpaint mask: cells that have DSM surface but no color yet.
-    inpaint_mask = needs_color.astype(np.uint8) * 255
-
-    # Inpaint radius controls diffusion reach; clamp to avoid excessive cost.
-    radius = min(max(iterations // 10, 3), 10)
-
-    result = cv2.inpaint(
-        ortho_grid, inpaint_mask, radius, cv2.INPAINT_TELEA
+    filled = _fill_holes_2pass(
+        ortho_grid,
+        sample_valid=has_color,  # only real colour seeds the fill
+        hole_mask=fillable,
+        small_area_max=config["hole_fill_small_area_max"],
+        diffuse_iters=config["hole_fill_diffuse_iters"],
+        kappa=1e9,  # near-isotropic: smooth colour fill, no false edges
+        dt=0.2,
     )
-
-    # Only apply inpainted values where we actually need color AND have DSM.
-    # Keep original colors untouched everywhere else.
-    result = np.where(
-        needs_color[:, :, np.newaxis], result, ortho_grid
-    )
-
-    return result
+    return np.clip(filled, 0, 255).astype(ortho_grid.dtype)
 
 
 def _render_dsm_patch_from_sv(
@@ -1947,11 +2133,11 @@ def _fuse_per_cluster(
 
         # --- Save DSM + ortho if enabled ---
         # The Surface Nets mesh rasterization produces a clean, speckle-free
-        # DSM directly: every surface cube emits a mesh vertex (no per-ray
-        # sampling) and the triangulated surface interpolates small gaps.  No
-        # median / Delaunay / diffusion tail is needed.  We only fill ortho
-        # color holes (cells with a DSM surface but no baked color); genuine
-        # no-data DSM holes are left NaN.
+        # DSM directly, but leaves no-data holes wherever the surface had no
+        # coverage.  Post-process both grids with a two-stage hole fill: tiny
+        # holes via bounded GPU diffusion, large holes via linear (Delaunay)
+        # interpolation.  The DSM is filled first so the ortho can reuse the
+        # completed surface mask.
         if dsm_grid is not None:
             valid_count = int(np.count_nonzero(~np.isnan(dsm_grid)))
             logger.info(
@@ -1959,9 +2145,13 @@ def _fuse_per_cluster(
                 f"{valid_count}/{dsm_grid.size} valid cells"
             )
 
+            dsm_grid = _fill_dsm_holes(dsm_grid, config)
+            logger.info("  Filled DSM holes (diffuse tiny + linear large)")
+
             if ortho_grid is not None:
-                ortho_grid = _ortho_diffuse_holes(ortho_grid, dsm_grid, 16)
-                logger.info("  Filled ortho color holes")
+                ortho_grid = _fill_ortho_holes(ortho_grid, dsm_grid, config)
+                logger.info(
+                    "  Filled ortho holes (diffuse tiny + linear large)")
 
             reference = reconstruction.reference
             data.save_dsm(

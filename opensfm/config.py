@@ -526,6 +526,13 @@ class OpenSfMConfig:
     ortho_bake_n_final_views: int = 3
     # Tukey-biweight reweighting iterations for the robust color consensus.
     ortho_bake_irls_iterations: int = 5
+    # Post-process hole filling (DSM + ortho).  A hole's connected component
+    # is "tiny" when it has <= hole_fill_small_area_max cells: those are filled
+    # by bounded GPU Perona-Malik diffusion (hole_fill_diffuse_iters steps).
+    # Larger holes are filled by per-component linear (Delaunay) interpolation
+    # from their boundary ring.
+    hole_fill_diffuse_iters: int = 64
+    hole_fill_small_area_max: int = 256
 
     ##################################
     # Params for multi-processing/threading
