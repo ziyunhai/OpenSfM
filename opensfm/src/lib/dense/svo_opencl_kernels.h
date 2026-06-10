@@ -1577,11 +1577,13 @@ __kernel void svo_bake_colors(
         n_valid++;
     }
 
-    // Fallback: no valid observation.
+    // Fallback: no valid observation.  Emit black (0) — NOT grey (128) — so
+    // the ortho hole-fill (_ortho_diffuse_holes, keyed on sum==0) inpaints
+    // these cells from their neighbours instead of leaving a grey patch.
     if (n_valid == 0) {
-        out_colors[gid * 3 + 0] = 128;
-        out_colors[gid * 3 + 1] = 128;
-        out_colors[gid * 3 + 2] = 128;
+        out_colors[gid * 3 + 0] = 0;
+        out_colors[gid * 3 + 1] = 0;
+        out_colors[gid * 3 + 2] = 0;
         return;
     }
 
@@ -1937,173 +1939,455 @@ __kernel void svo_raycast_guided(
 
 
 // =====================================================================
-// svo_render_dsm_ortho: Orthographic top-down raycast of the TSDF.
+// DSM extraction by Surface Nets (dual contouring) + top-down raster.
 //
-// 2D dispatch: one work-item per DSM grid cell.
-// Fires a vertical ray downward (z_max -> z_min) through the hash table,
-// detects the FIRST zero-crossing (highest surface), writes Z and normal.
+// Replaces the per-column raycast.  Three passes:
+//   1. svo_dc_vertex   — one Surface Nets vertex per surface cube.
+//   2. svo_dc_raster   — emit the dual quads, scan-convert top-down into
+//                        an integer max-z buffer.
+//   3. svo_dc_finalize — int z-buffer -> float DSM + per-cell normal.
 //
-// Acceleration: hash-miss skip only.  If a voxel is not in the table,
-// no surface exists within trunc_dist of that location, so we can safely
-// advance by trunc_dist.  When we DO find a voxel, we step by voxel_size
-// (linear march) since TSDF values are not distances along the ray axis.
-//
-// DSM: Float32 grid -- NaN where no surface.
-// Ortho: unused (zeroed) — color comes from BakeColors in Python.
-// Normals: float3 per cell (nx, ny, nz); (0,0,0) where no surface.
+// Because every surface cube emits a vertex (no per-ray sampling), there
+// is no miss-raycast / punch-through speckle.  The triangulated surface
+// interpolates across small gaps; max-z keeps the topmost surface.
 // =====================================================================
-__kernel void svo_render_dsm_ortho(
+
+// Fixed-point Z encoding for the atomic max-z buffer (1 mm precision).
+#define DSM_Z_FP 1000.0f
+
+// Decode a slot's weighted-average TSDF.  Returns 0 (and leaves outputs
+// unset) only if the slot is missing or empty.  A corner just needs to be
+// PRESENT to give its sign — the surface test is the cube's sign change,
+// not a per-corner weight gate (off-surface corners are seen by far fewer
+// rays, so gating each one individually erases most of the surface).
+int dc_tsdf(__global const VoxelSlot* table, uint slot, float* out,
+            int* weight) {
+    if (slot == 0xFFFFFFFF) return 0;
+    int sw = table[slot].sum_weight;
+    if (sw < 1) return 0;
+    *out = (float)table[slot].sum_tsdf / ((float)sw * (float)FP_SCALE);
+    *weight = sw;
+    return 1;
+}
+
+// Look up a cube's Surface Nets vertex by its min-corner voxel.
+// Returns 1 and fills *out if that cube produced a vertex (z != NaN).
+int dc_vertex_lookup(__global const VoxelSlot* table, uint mask,
+                     __global const float* vert_pos,
+                     int kx, int ky, int kz, float3* out) {
+    uint slot = hash_lookup(table, mask, kx, ky, kz);
+    if (slot == 0xFFFFFFFF) return 0;
+    float vz = vert_pos[slot * 3 + 2];
+    if (isnan(vz)) return 0;
+    out->x = vert_pos[slot * 3 + 0];
+    out->y = vert_pos[slot * 3 + 1];
+    out->z = vz;
+    return 1;
+}
+
+// ---- Pass 1: one Surface Nets vertex per surface cube ----------------
+// One work-item per hash slot.  The slot's voxel (kx,ky,kz) is the
+// min-corner of a dual cube; the vertex is the mean of the cube's TSDF
+// edge-crossings.  vert_pos[slot].z = NaN marks "no vertex".
+__kernel void svo_dc_vertex(
     __global const VoxelSlot* table,
     uint                      capacity_mask,
-    __global float*           dsm_out,
-    __global uint*            ortho_out,
-    __global float*           normals_out,
+    uint                      capacity,
+    __global float*           vert_pos,
+    const float               voxel_size,
+    const float               min_weight)
+{
+    uint i = get_global_id(0);
+    if (i >= capacity) return;
+
+    // Default: no vertex (sentinel).  Written for every slot.
+    vert_pos[i * 3 + 2] = NAN;
+
+    uint key_ab = table[i].key_ab;
+    if (key_ab == EMPTY_KEY) return;
+
+    const int min_weight_fp = (int)(min_weight * (float)WEIGHT_SCALE);
+    int kx = (int)((key_ab >> 16) & 0xFFFF) - 32768;
+    int ky = (int)(key_ab & 0xFFFF) - 32768;
+    int kz = table[i].key_c;
+
+    // Corner index c = bit0(x) | bit1(y) | bit2(z).
+    const int cox[8] = {0, 1, 0, 1, 0, 1, 0, 1};
+    const int coy[8] = {0, 0, 1, 1, 0, 0, 1, 1};
+    const int coz[8] = {0, 0, 0, 0, 1, 1, 1, 1};
+
+    float tsdf[8];
+    float cx[8], cy[8], cz[8];  // corner world centres
+    int present[8];             // band voxels between rays are simply absent
+    int max_w = 0;              // anchor the cube on its best-supported corner
+    for (int c = 0; c < 8; c++) {
+        int x = kx + cox[c], y = ky + coy[c], z = kz + coz[c];
+        uint s = (c == 0) ? i : hash_lookup(table, capacity_mask, x, y, z);
+        int wc = 0;
+        present[c] = dc_tsdf(table, s, &tsdf[c], &wc);
+        if (wc > max_w) max_w = wc;
+        cx[c] = ((float)x + 0.5f) * voxel_size;
+        cy[c] = ((float)y + 0.5f) * voxel_size;
+        cz[c] = ((float)z + 0.5f) * voxel_size;
+    }
+    // Reject cubes not anchored to any well-supported surface (one strong
+    // corner is enough; the occluded backside is legitimately low-weight).
+    if (max_w < min_weight_fp) return;
+
+    // 12 cube edges (corner pairs differing in exactly one bit).  TOLERANT:
+    // only accumulate a crossing on edges whose BOTH endpoints are present.
+    // The surface-crossing edge's endpoints are the best-observed voxels, so
+    // they survive even where off-surface corners are absent — this fills the
+    // per-cell holes the strict all-8 rule left, mirroring how
+    // svo_extract_points needs only the 2 voxels across the crossing edge.
+    const int e0[12] = {0, 2, 4, 6, 0, 1, 4, 5, 0, 1, 2, 3};
+    const int e1[12] = {1, 3, 5, 7, 2, 3, 6, 7, 4, 5, 6, 7};
+
+    float sx = 0.0f, sy = 0.0f, sz = 0.0f;
+    int n = 0;
+    for (int e = 0; e < 12; e++) {
+        int a = e0[e], b = e1[e];
+        if (!present[a] || !present[b]) continue;
+        float ta = tsdf[a], tb = tsdf[b];
+        // Straddle zero?  (treat 0 as inside)
+        if ((ta <= 0.0f) == (tb <= 0.0f)) continue;
+        float t = ta / (ta - tb);
+        t = clamp(t, 0.0f, 1.0f);
+        sx += cx[a] + t * (cx[b] - cx[a]);
+        sy += cy[a] + t * (cy[b] - cy[a]);
+        sz += cz[a] + t * (cz[b] - cz[a]);
+        n++;
+    }
+    if (n == 0) return;  // cube fully inside/outside -> no surface
+
+    float inv = 1.0f / (float)n;
+    vert_pos[i * 3 + 0] = sx * inv;
+    vert_pos[i * 3 + 1] = sy * inv;
+    vert_pos[i * 3 + 2] = sz * inv;
+}
+
+// ---- Triangle scan-convert into the atomic max-z buffer --------------
+void dc_raster_tri(__global int* zbuf, int grid_w, int grid_h,
+                   float origin_x, float origin_y, float gsd,
+                   float z_min, int max_tri_cells,
+                   float3 a, float3 b, float3 c) {
+    // World XY -> continuous cell coordinates.
+    float ax = (a.x - origin_x) / gsd, ay = (a.y - origin_y) / gsd;
+    float bx = (b.x - origin_x) / gsd, by = (b.y - origin_y) / gsd;
+    float cx = (c.x - origin_x) / gsd, cy = (c.y - origin_y) / gsd;
+
+    int minx = (int)floor(fmin(ax, fmin(bx, cx)));
+    int maxx = (int)ceil(fmax(ax, fmax(bx, cx)));
+    int miny = (int)floor(fmin(ay, fmin(by, cy)));
+    int maxy = (int)ceil(fmax(ay, fmax(by, cy)));
+
+    // Guard: reject degenerate / oversized triangles (kills stray bridges).
+    if ((maxx - minx) > max_tri_cells || (maxy - miny) > max_tri_cells) return;
+
+    minx = max(minx, 0);
+    miny = max(miny, 0);
+    maxx = min(maxx, grid_w - 1);
+    maxy = min(maxy, grid_h - 1);
+    if (minx > maxx || miny > maxy) return;
+
+    float denom = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy);
+    if (fabs(denom) < 1e-12f) return;
+    float inv_denom = 1.0f / denom;
+
+    for (int py = miny; py <= maxy; py++) {
+        for (int px = minx; px <= maxx; px++) {
+            float fx = (float)px + 0.5f;
+            float fy = (float)py + 0.5f;
+            float l0 = ((by - cy) * (fx - cx) + (cx - bx) * (fy - cy)) * inv_denom;
+            float l1 = ((cy - ay) * (fx - cx) + (ax - cx) * (fy - cy)) * inv_denom;
+            float l2 = 1.0f - l0 - l1;
+            if (l0 < -1e-4f || l1 < -1e-4f || l2 < -1e-4f) continue;
+            float wz = l0 * a.z + l1 * b.z + l2 * c.z;
+            int zi = (int)((wz - z_min) * DSM_Z_FP);
+            // Below the valid range -> not a surface; leave the cell empty
+            // (NaN) rather than fabricating a z_min "floor".
+            if (zi < 0) continue;
+            atomic_max(&zbuf[py * grid_w + px], zi);
+        }
+    }
+}
+
+// ---- Pass 2: emit dual quads and rasterize top-down ------------------
+// One work-item per hash slot that produced a vertex.  For each axis,
+// when the TSDF straddles zero across the edge A->A+axis, the 4 cubes
+// around that grid edge each have a vertex; connect them into a quad
+// (2 triangles) and scan-convert into the max-z buffer.  Each interior
+// grid edge is owned by exactly one work-item (its lower endpoint A).
+__kernel void svo_dc_raster(
+    __global const VoxelSlot* table,
+    uint                      capacity_mask,
+    uint                      capacity,
+    __global const float*     vert_pos,
+    __global int*             zbuf,
     const float               origin_x,
     const float               origin_y,
     const float               gsd,
     const int                 grid_w,
     const int                 grid_h,
-    const float               z_max,
     const float               z_min,
-    const float               voxel_size,
-    const float               min_weight,
-    const float               trunc_dist)
+    const int                 max_tri_cells)
 {
-    const int gx = get_global_id(0);
-    const int gy = get_global_id(1);
+    uint i = get_global_id(0);
+    if (i >= capacity) return;
+    if (isnan(vert_pos[i * 3 + 2])) return;  // this cube has no vertex
+
+    uint key_ab = table[i].key_ab;
+    int kx = (int)((key_ab >> 16) & 0xFFFF) - 32768;
+    int ky = (int)(key_ab & 0xFFFF) - 32768;
+    int kz = table[i].key_c;
+
+    float tA;
+    int wA;
+    dc_tsdf(table, i, &tA, &wA);  // present: this slot owns a vertex
+
+    for (int axis = 0; axis < 3; axis++) {
+        int bx = kx, by = ky, bz = kz;
+        if (axis == 0) bx++;
+        else if (axis == 1) by++;
+        else bz++;
+
+        uint sB = hash_lookup(table, capacity_mask, bx, by, bz);
+        float tB;
+        int wB;
+        if (!dc_tsdf(table, sB, &tB, &wB)) continue;
+        if ((tA <= 0.0f) == (tB <= 0.0f)) continue;  // no crossing this edge
+
+        // Two perpendicular unit axes P, Q for this edge.
+        int Px, Py, Pz, Qx, Qy, Qz;
+        if (axis == 0)      { Px = 0; Py = 1; Pz = 0; Qx = 0; Qy = 0; Qz = 1; }
+        else if (axis == 1) { Px = 1; Py = 0; Pz = 0; Qx = 0; Qy = 0; Qz = 1; }
+        else                { Px = 1; Py = 0; Pz = 0; Qx = 0; Qy = 1; Qz = 0; }
+
+        // 4 cubes sharing the edge: A, A-P, A-Q, A-P-Q (by min-corner).
+        float3 v00, v10, v01, v11;
+        if (!dc_vertex_lookup(table, capacity_mask, vert_pos,
+                              kx, ky, kz, &v00)) continue;
+        if (!dc_vertex_lookup(table, capacity_mask, vert_pos,
+                              kx - Px, ky - Py, kz - Pz, &v10)) continue;
+        if (!dc_vertex_lookup(table, capacity_mask, vert_pos,
+                              kx - Qx, ky - Qy, kz - Qz, &v01)) continue;
+        if (!dc_vertex_lookup(table, capacity_mask, vert_pos,
+                              kx - Px - Qx, ky - Py - Qy, kz - Pz - Qz,
+                              &v11)) continue;
+
+        dc_raster_tri(zbuf, grid_w, grid_h, origin_x, origin_y, gsd,
+                      z_min, max_tri_cells, v00, v10, v11);
+        dc_raster_tri(zbuf, grid_w, grid_h, origin_x, origin_y, gsd,
+                      z_min, max_tri_cells, v00, v11, v01);
+    }
+}
+
+// ---- Pass 3: int z-buffer -> float DSM + per-cell normal -------------
+// One work-item per grid cell.  Normal from DSM central differences.
+__kernel void svo_dc_finalize(
+    __global const int* zbuf,
+    __global float*     dsm_out,
+    __global uint*      ortho_out,
+    __global float*     normals_out,
+    const int           grid_w,
+    const int           grid_h,
+    const float         z_min,
+    const float         gsd)
+{
+    int gx = get_global_id(0);
+    int gy = get_global_id(1);
     if (gx >= grid_w || gy >= grid_h) return;
 
-    const int cell = gy * grid_w + gx;
+    int cell = gy * grid_w + gx;
+    ortho_out[cell] = 0;
 
-    // World XY at cell center.
-    const float wx = origin_x + ((float)gx + 0.5f) * gsd;
-    const float wy = origin_y + ((float)gy + 0.5f) * gsd;
-
-    const float inv_vs = 1.0f / voxel_size;
-    const int min_weight_fp = (int)(min_weight * (float)WEIGHT_SCALE);
-
-    // Voxel column coordinates (X and Y are constant along the ray).
-    const int vx = (int)floor(wx * inv_vs);
-    const int vy = (int)floor(wy * inv_vs);
-
-    if (vx < -32768 || vx > 32766 || vy < -32768 || vy > 32766) {
+    int zi = zbuf[cell];
+    if (zi < 0) {
         dsm_out[cell] = NAN;
-        ortho_out[cell] = 0;
         normals_out[cell * 3 + 0] = 0.0f;
         normals_out[cell * 3 + 1] = 0.0f;
         normals_out[cell * 3 + 2] = 0.0f;
         return;
     }
 
-    // Linear march from top (z_max) downward to z_min with hash-miss skip.
-    // Detect zero-crossing: prev_tsdf > 0, current <= 0.
-    float prev_tsdf = 2.0f;  // sentinel (no valid sample yet)
-    float prev_z = z_max;
-    int   prev_vz = (int)floor(z_max * inv_vs) + 1;  // impossible value
+    const float inv_z = 1.0f / DSM_Z_FP;
+    dsm_out[cell] = z_min + (float)zi * inv_z;
 
-    for (float z = z_max; z >= z_min; ) {
-        const int vz = (int)floor(z * inv_vs);
+    float nx = 0.0f, ny = 0.0f, nz = 1.0f;
+    if (gx > 0 && gx < grid_w - 1) {
+        int zl = zbuf[cell - 1], zr = zbuf[cell + 1];
+        if (zl >= 0 && zr >= 0)
+            nx = -((float)(zr - zl) * inv_z) / (2.0f * gsd);
+    }
+    if (gy > 0 && gy < grid_h - 1) {
+        int zd = zbuf[cell - grid_w], zu = zbuf[cell + grid_w];
+        if (zd >= 0 && zu >= 0)
+            ny = -((float)(zu - zd) * inv_z) / (2.0f * gsd);
+    }
+    float len = sqrt(nx * nx + ny * ny + nz * nz);
+    normals_out[cell * 3 + 0] = nx / len;
+    normals_out[cell * 3 + 1] = ny / len;
+    normals_out[cell * 3 + 2] = nz / len;
+}
 
-        // Skip if same voxel as previous step.
-        if (vz == prev_vz && prev_tsdf < 2.0f) {
-            prev_z = z;
-            z -= voxel_size;
-            continue;
-        }
+// =====================================================================
+// Multi-scale gap fill for the DSM mesh.
+//
+// The fine TSDF band is not solid — voxels between rays are absent, so the
+// fine Surface Nets mesh TEARS at those gaps and a missing cube cannot be
+// spanned by any fine triangle (salt-and-pepper holes).  Fix: build COARSER
+// TSDF levels by downsampling the fine table by 2^L.  A coarse voxel
+// aggregates up to 2^(3L) fine voxels, so it is present wherever ANY of them
+// is (bridging the per-voxel gaps) and its summed weight clears the anchor
+// even in low-confidence regions.  The coarse table is meshed with the SAME
+// svo_dc_vertex/svo_dc_raster kernels; its (larger) triangles rasterize into
+// the cells the finer levels left empty.  Finest level wins (preserve detail).
+// Mirrors svo_extract_fill for the point cloud.
+// =====================================================================
 
-        uint slot_idx = hash_lookup(table, capacity_mask, vx, vy, vz);
-        if (slot_idx > capacity_mask) {
-            // Hash miss: no voxel → no surface within trunc_dist.
-            prev_tsdf = 2.0f;
-            prev_z = z;
-            prev_vz = vz;
-            z -= trunc_dist;
-            continue;
-        }
-
-        int sw = table[slot_idx].sum_weight;
-        if (sw < min_weight_fp) {
-            // Low-weight: unreliable, treat as empty but step conservatively.
-            prev_tsdf = 2.0f;
-            prev_z = z;
-            prev_vz = vz;
-            z -= voxel_size;
-            continue;
-        }
-
-        float tsdf = (float)table[slot_idx].sum_tsdf
-                   / ((float)sw * (float)FP_SCALE);
-
-        // Zero-crossing: positive -> negative/zero (entering surface).
-        if (prev_tsdf > 0.0f && prev_tsdf <= 1.0f && tsdf <= 0.0f) {
-            // Interpolate exact Z of crossing.
-            float t_frac = prev_tsdf / (prev_tsdf - tsdf + 1e-8f);
-            float hit_z = prev_z - t_frac * (prev_z - z);
-
-            dsm_out[cell] = hit_z;
-
-            // Extract and normalize surface normal.
-            float inv_sw = 1.0f / (float)sw;
-            float nx = (float)table[slot_idx].sum_nx * inv_sw / (float)FP_SCALE;
-            float ny = (float)table[slot_idx].sum_ny * inv_sw / (float)FP_SCALE;
-            float nz = (float)table[slot_idx].sum_nz * inv_sw / (float)FP_SCALE;
-            float len = sqrt(nx*nx + ny*ny + nz*nz);
-            if (len > 0.001f) { nx /= len; ny /= len; nz /= len; }
-            else { nx = 0.0f; ny = 0.0f; nz = 1.0f; }
-
-            normals_out[cell * 3 + 0] = nx;
-            normals_out[cell * 3 + 1] = ny;
-            normals_out[cell * 3 + 2] = nz;
-
-            ortho_out[cell] = 0;
+// Accumulate one fine slot's raw (already weight-premultiplied) sums into a
+// coarse bucket.  Mirrors hash_accumulate's claim protocol; the zero crossing
+// is scale-invariant so the summed TSDF needs no re-normalisation.
+void dc_coarse_accumulate(__global VoxelSlot* table, uint mask,
+                          __global uint* overflow, int kx, int ky, int kz,
+                          int count, int sw, int st, int snx, int sny, int snz) {
+    uint my_ab = pack_xy(kx, ky);
+    if (my_ab == EMPTY_KEY) return;
+    uint h = voxel_hash(kx, ky, kz) & mask;
+    for (int probe = 0; probe < MAX_PROBES; probe++) {
+        uint slot = (h + (uint)probe) & mask;
+        uint old = atomic_cmpxchg(&table[slot].key_ab, EMPTY_KEY, my_ab);
+        if (old == EMPTY_KEY) {
+            atomic_xchg(&table[slot].key_c, kz);
+            mem_fence(CLK_GLOBAL_MEM_FENCE);
+            atomic_add(&table[slot].count,      count);
+            atomic_add(&table[slot].sum_weight, sw);
+            atomic_add(&table[slot].sum_tsdf,   st);
+            atomic_add(&table[slot].sum_nx,     snx);
+            atomic_add(&table[slot].sum_ny,     sny);
+            atomic_add(&table[slot].sum_nz,     snz);
             return;
         }
-
-        // Oblique-entry fix: When cameras view a surface obliquely, the
-        // TSDF positive band is laterally offset from the negative band.
-        // A vertical ray can miss the positive voxels entirely and enter
-        // the band directly into negative territory — creating thin holes
-        // (streaks) aligned with the camera direction.
-        //
-        // Fix: if we arrive from empty space (sentinel prev_tsdf) directly
-        // into shallow-negative TSDF with an upward-facing normal, this is
-        // a valid surface.  Estimate hit_z by correcting for TSDF depth.
-        // Use tight thresholds to avoid wobble at roof/ground edges.
-        if (prev_tsdf >= 2.0f && tsdf < 0.0f && tsdf > -0.3f) {
-            float inv_sw2 = 1.0f / (float)sw;
-            float nx = (float)table[slot_idx].sum_nx * inv_sw2 / (float)FP_SCALE;
-            float ny = (float)table[slot_idx].sum_ny * inv_sw2 / (float)FP_SCALE;
-            float nz = (float)table[slot_idx].sum_nz * inv_sw2 / (float)FP_SCALE;
-            float len2 = sqrt(nx*nx + ny*ny + nz*nz);
-            if (len2 > 0.001f) { nx /= len2; ny /= len2; nz /= len2; }
-            else { nz = 0.0f; }  // reject if no normal
-
-            // Accept only if normal is strongly upward (not edges/walls).
-            if (nz > 0.5f) {
-                // Surface is |tsdf| * trunc_dist above current z.
-                float hit_z = z + (-tsdf) * trunc_dist;
-
-                dsm_out[cell] = hit_z;
-                normals_out[cell * 3 + 0] = nx;
-                normals_out[cell * 3 + 1] = ny;
-                normals_out[cell * 3 + 2] = nz;
-                ortho_out[cell] = 0;
+        if (old == my_ab) {
+            int stored_z = KEY_C_UNINIT;
+            for (int s = 0; s < 32768; s++) {
+                stored_z = atomic_add(&table[slot].key_c, 0);
+                if (stored_z != KEY_C_UNINIT) break;
+            }
+            if (stored_z == KEY_C_UNINIT) { atomic_add(overflow, 1u); continue; }
+            if (stored_z == kz) {
+                atomic_add(&table[slot].count,      count);
+                atomic_add(&table[slot].sum_weight, sw);
+                atomic_add(&table[slot].sum_tsdf,   st);
+                atomic_add(&table[slot].sum_nx,     snx);
+                atomic_add(&table[slot].sum_ny,     sny);
+                atomic_add(&table[slot].sum_nz,     snz);
                 return;
             }
         }
-
-        prev_tsdf = tsdf;
-        prev_z = z;
-        prev_vz = vz;
-        z -= voxel_size;
     }
+    atomic_add(overflow, 1u);
+}
 
-    // No surface found.
-    dsm_out[cell] = NAN;
-    ortho_out[cell] = 0;
-    normals_out[cell * 3 + 0] = 0.0f;
-    normals_out[cell * 3 + 1] = 0.0f;
-    normals_out[cell * 3 + 2] = 0.0f;
+// floor(a / 2^sh) for signed a.  (Right-shift of a negative signed value is
+// implementation-defined in OpenCL, and voxel coords can be negative.)
+int dc_floor_shift(int a, int sh) {
+    return (a >= 0) ? (a >> sh) : -(((-a) + ((1 << sh) - 1)) >> sh);
+}
+
+// Downsample the fine table into a coarse table by 2^level_shift.
+// One work-item per fine slot; coarse coord = floor(fine / 2^L).
+__kernel void svo_dc_downsample(
+    __global const VoxelSlot* fine_table,
+    uint                      fine_capacity,
+    __global VoxelSlot*       coarse_table,
+    uint                      coarse_mask,
+    __global uint*            overflow,
+    const int                 level_shift)
+{
+    uint i = get_global_id(0);
+    if (i >= fine_capacity) return;
+    uint key_ab = fine_table[i].key_ab;
+    if (key_ab == EMPTY_KEY) return;
+
+    int kx = (int)((key_ab >> 16) & 0xFFFF) - 32768;
+    int ky = (int)(key_ab & 0xFFFF) - 32768;
+    int kz = fine_table[i].key_c;
+
+    int cx = dc_floor_shift(kx, level_shift);
+    int cy = dc_floor_shift(ky, level_shift);
+    int cz = dc_floor_shift(kz, level_shift);
+
+    // Accumulate the fine voxel's AVERAGED (decoded) TSDF as one unit-weight
+    // sample.  Summing the raw weight-premultiplied sums would overflow int32
+    // when many high-weight fine voxels land in one coarse cell; the decoded
+    // average is bounded to ±FP_SCALE and the DC sign/crossing is
+    // scale-invariant, so this reproduces the coarse surface exactly while
+    // staying safely within int32.  Coarse sum_weight = (#fine voxels)·
+    // WEIGHT_SCALE, so the min_weight anchor needs ≥ min_weight fine voxels.
+    int sw_i = fine_table[i].sum_weight;
+    if (sw_i < 1) return;
+    int avg_t = fine_table[i].sum_tsdf / sw_i;
+    int avg_nx = fine_table[i].sum_nx / sw_i;
+    int avg_ny = fine_table[i].sum_ny / sw_i;
+    int avg_nz = fine_table[i].sum_nz / sw_i;
+
+    dc_coarse_accumulate(coarse_table, coarse_mask, overflow, cx, cy, cz, 1,
+                         WEIGHT_SCALE, avg_t, avg_nx, avg_ny, avg_nz);
+}
+
+// Composite per-level z-buffers into one, finest first (preserve detail).
+__kernel void svo_dc_resolve(
+    __global const int* z_fine,
+    __global const int* z_c1,
+    __global const int* z_c2,
+    __global int*       z_out,
+    const uint          ncells)
+{
+    uint i = get_global_id(0);
+    if (i >= ncells) return;
+    int z = z_fine[i];
+    if (z < 0) z = z_c1[i];
+    if (z < 0) z = z_c2[i];
+    z_out[i] = z;
+}
+
+// 5x5 median despeckle of the resolved z-buffer.  Ignores empty (-1) cells in
+// the window and never fills holes (an empty cell stays empty), so it removes
+// isolated speckle while preserving real step edges and no-data borders.  The
+// ortho is baked in Python from THIS despeckled DSM, so DSM<->ortho stay synced.
+__kernel void svo_dc_median(
+    __global const int* z_in,
+    __global int*       z_out,
+    const int           grid_w,
+    const int           grid_h)
+{
+    int gx = get_global_id(0);
+    int gy = get_global_id(1);
+    if (gx >= grid_w || gy >= grid_h) return;
+    int cell = gy * grid_w + gx;
+
+    int self = z_in[cell];
+    if (self < 0) { z_out[cell] = -1; return; }  // keep no-data empty
+
+    // Gather valid neighbours into a sorted prefix (insertion sort, ≤25).
+    int vals[81];
+    int n = 0;
+    for (int dy = -4; dy <= 4; dy++) {
+        int yy = gy + dy;
+        if (yy < 0 || yy >= grid_h) continue;
+        for (int dx = -4; dx <= 4; dx++) {
+            int xx = gx + dx;
+            if (xx < 0 || xx >= grid_w) continue;
+            int v = z_in[yy * grid_w + xx];
+            if (v < 0) continue;
+            int j = n;
+            while (j > 0 && vals[j - 1] > v) { vals[j] = vals[j - 1]; j--; }
+            vals[j] = v;
+            n++;
+        }
+    }
+    z_out[cell] = vals[n / 2];  // n >= 1 (self is valid)
 }
 )CL";
 

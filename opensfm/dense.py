@@ -102,7 +102,7 @@ def compute_depthmaps(
         logger.info(
             f"Cluster assignments saved to {data.clusters_file()}")
 
-    # clusters = clusters[1:2]
+    clusters = clusters[1:2]
     # ── 1b. Per-cluster bounding boxes ─────────────────────────────────
     cluster_bboxes: List[Tuple[NDArray, NDArray]] = [
         _compute_cluster_bbox(cl, graph, reconstruction) for cl in clusters
@@ -1435,218 +1435,6 @@ def _split_into_subvolumes(
 # ── DSM post-processing helpers ─────────────────────────────────────
 
 
-def _dsm_median_filter(grid: NDArray, radius: int) -> NDArray:
-    """Apply median filter to valid cells only, preserving NaN holes."""
-    from scipy.ndimage import median_filter
-
-    kernel_size = 2 * radius + 1
-    valid = ~np.isnan(grid)
-    if not valid.any():
-        return grid
-    # Use a sentinel below all data for NaN cells
-    data_min = float(np.nanmin(grid))
-    sentinel = data_min - 9999.0
-    work = np.where(valid, grid, sentinel)
-    filtered = median_filter(work, size=kernel_size).astype(np.float32)
-    # Reject sentinel-contaminated results: if the median fell below the
-    # data minimum, the window was majority-hole → restore original value.
-    contaminated = filtered < data_min - 1.0
-    filtered = np.where(contaminated, grid, filtered)
-    # Only keep filtered values where originally valid
-    return np.where(valid, filtered, np.nan).astype(np.float32)
-
-
-def _dsm_delaunay_fill(
-    dsm_grid: NDArray,
-    ortho_grid: Optional[NDArray],
-    max_z_range: float,
-) -> int:
-    """Fill NaN holes via Delaunay triangulation of boundary cells.
-
-    Boundary cells = valid cells 4-connected to at least one NaN cell.
-    For each NaN cell inside a Delaunay triangle, interpolate Z using
-    barycentric weights. Reject triangles where Z span > max_z_range.
-
-    Returns number of cells filled.
-    """
-    from scipy.spatial import Delaunay
-
-    h, w = dsm_grid.shape
-    valid = ~np.isnan(dsm_grid)
-    nan_mask = ~valid
-
-    if not nan_mask.any() or not valid.any():
-        return 0
-
-    # Build point set: all boundary cells + subsampled interior valid cells.
-    # Boundary gives accurate hole edges; interior cells ensure triangles
-    # span large gaps so interpolation can reach deep into holes.
-    boundary = np.zeros_like(valid)
-    boundary[:-1, :] |= valid[:-1, :] & nan_mask[1:, :]
-    boundary[1:, :] |= valid[1:, :] & nan_mask[:-1, :]
-    boundary[:, :-1] |= valid[:, :-1] & nan_mask[:, 1:]
-    boundary[:, 1:] |= valid[:, 1:] & nan_mask[:, :-1]
-
-    bnd_rows, bnd_cols = np.where(boundary)
-
-    # Subsample interior valid cells (every 4th cell in each axis)
-    stride = 4
-    interior = valid & ~boundary
-    int_rows, int_cols = np.where(interior)
-    if len(int_rows) > 0:
-        # Keep every stride-th point
-        subsample = ((int_rows % stride == 0) & (int_cols % stride == 0))
-        int_rows = int_rows[subsample]
-        int_cols = int_cols[subsample]
-
-    # Combine boundary + subsampled interior
-    all_rows = np.concatenate([bnd_rows, int_rows]) if len(
-        int_rows) > 0 else bnd_rows
-    all_cols = np.concatenate([bnd_cols, int_cols]) if len(
-        int_cols) > 0 else bnd_cols
-    n_pts = len(all_rows)
-    if n_pts < 3:
-        return 0
-
-    # Build Delaunay triangulation
-    tri_pts = np.column_stack([all_cols.astype(np.float64),
-                               all_rows.astype(np.float64)])
-    try:
-        tri = Delaunay(tri_pts)
-    except Exception:
-        return 0
-
-    # Get NaN cell coordinates
-    nan_rows, nan_cols = np.where(nan_mask)
-    if len(nan_rows) == 0:
-        return 0
-
-    # Find which triangle each NaN cell belongs to
-    nan_pts = np.column_stack([nan_cols.astype(np.float64),
-                               nan_rows.astype(np.float64)])
-    simplex_idx = tri.find_simplex(nan_pts)
-
-    # Process cells that are inside some triangle
-    inside = simplex_idx >= 0
-    if not inside.any():
-        return 0
-
-    n_filled = 0
-    # Get boundary Z values
-    all_z = dsm_grid[all_rows, all_cols]
-    all_color: Optional[NDArray] = None
-    if ortho_grid is not None:
-        all_color = ortho_grid[all_rows, all_cols, :]  # (N, 3)
-
-    # Process in bulk per simplex
-    simplices = tri.simplices  # (n_tri, 3) indices into bnd_pts
-    inside_indices = np.where(inside)[0]
-    tri_indices = simplex_idx[inside_indices]
-
-    # Barycentric coordinates for all inside points
-    # For point P in triangle (A, B, C):
-    #   bary = T^-1 * (P - C), where T = [[Ax-Cx, Bx-Cx], [Ay-Cy, By-Cy]]
-    for chunk_start in range(0, len(inside_indices), 100000):
-        chunk = inside_indices[chunk_start:chunk_start + 100000]
-        chunk_tri = tri_indices[chunk_start:chunk_start + 100000]
-
-        # Get triangle vertex indices (into boundary arrays)
-        v0 = simplices[chunk_tri, 0]
-        v1 = simplices[chunk_tri, 1]
-        v2 = simplices[chunk_tri, 2]
-
-        # Z values at vertices
-        z0 = all_z[v0]
-        z1 = all_z[v1]
-        z2 = all_z[v2]
-
-        # Reject triangles with excessive Z range
-        z_min_t = np.minimum(np.minimum(z0, z1), z2)
-        z_max_t = np.maximum(np.maximum(z0, z1), z2)
-        z_ok = (z_max_t - z_min_t) <= max_z_range
-
-        if not z_ok.any():
-            continue
-
-        # Compute barycentric coordinates
-        ax = all_cols[v0].astype(np.float64)
-        ay = all_rows[v0].astype(np.float64)
-        bx = all_cols[v1].astype(np.float64)
-        by = all_rows[v1].astype(np.float64)
-        cx = all_cols[v2].astype(np.float64)
-        cy = all_rows[v2].astype(np.float64)
-
-        px = nan_cols[chunk].astype(np.float64)
-        py_arr = nan_rows[chunk].astype(np.float64)
-
-        # Barycentric via cross products
-        d00 = (bx - ax) * (bx - ax) + (by - ay) * (by - ay)
-        d01 = (bx - ax) * (cx - ax) + (by - ay) * (cy - ay)
-        d11 = (cx - ax) * (cx - ax) + (cy - ay) * (cy - ay)
-        d20 = (px - ax) * (bx - ax) + (py_arr - ay) * (by - ay)
-        d21 = (px - ax) * (cx - ax) + (py_arr - ay) * (cy - ay)
-
-        denom = d00 * d11 - d01 * d01
-        # Avoid division by zero for degenerate triangles
-        denom_safe = np.where(np.abs(denom) < 1e-10, 1.0, denom)
-        bary_v = (d11 * d20 - d01 * d21) / denom_safe
-        bary_w = (d00 * d21 - d01 * d20) / denom_safe
-        bary_u = 1.0 - bary_v - bary_w
-
-        # Interpolate Z
-        z_interp = (
-            bary_u * z0 + bary_v * z1 + bary_w * z2
-        ).astype(np.float32)
-
-        # Final mask: z_ok and non-degenerate
-        fill_mask = z_ok & (np.abs(denom) > 1e-10)
-
-        # Write into grid
-        fill_rows = nan_rows[chunk[fill_mask]]
-        fill_cols = nan_cols[chunk[fill_mask]]
-        dsm_grid[fill_rows, fill_cols] = z_interp[fill_mask]
-        n_filled += int(fill_mask.sum())
-
-        # Interpolate ortho colors
-        if ortho_grid is not None and all_color is not None:
-            c0 = all_color[v0[fill_mask]]  # (K, 3)
-            c1 = all_color[v1[fill_mask]]
-            c2 = all_color[v2[fill_mask]]
-            bu = bary_u[fill_mask, np.newaxis]
-            bv = bary_v[fill_mask, np.newaxis]
-            bw = bary_w[fill_mask, np.newaxis]
-            c_interp = (
-                bu * c0.astype(np.float64)
-                + bv * c1.astype(np.float64)
-                + bw * c2.astype(np.float64)
-            )
-            ortho_grid[fill_rows, fill_cols, :] = np.clip(
-                c_interp, 0, 255
-            ).astype(np.uint8)
-
-    return n_filled
-
-
-def _dsm_gpu_diffuse(
-    grid: NDArray, iterations: int, kappa: float, dt: float
-) -> NDArray:
-    """Run Perona-Malik diffusion on the DSM grid via GPU DSMRasterizer."""
-    rasterizer = pydense.DSMRasterizer()
-    rasterizer.set_device(0)
-    rasterizer.upload_grid(grid.astype(np.float32, copy=False))
-
-    # Self-guided diffusion (empty guide → compute gradient from grid itself)
-    guide = np.empty(0, dtype=np.float32)
-    result = rasterizer.diffuse(guide, iterations, kappa, dt)
-    result = np.asarray(result, dtype=np.float32)
-
-    # Restore NaN where original was NaN (diffusion fills them, which
-    # is desired, but we only want to keep fills where the grid was
-    # previously filled by triangulation — so don't restore NaN here).
-    # Actually: we DO want diffusion to fill remaining tiny holes.
-    return result
-
-
 def _ortho_diffuse_holes(
     ortho_grid: NDArray, dsm_grid: NDArray, iterations: int
 ) -> NDArray:
@@ -2157,70 +1945,24 @@ def _fuse_per_cluster(
 
         view_cache.clear()
 
-        # --- Post-process and save DSM + ortho if enabled ---
+        # --- Save DSM + ortho if enabled ---
+        # The Surface Nets mesh rasterization produces a clean, speckle-free
+        # DSM directly: every surface cube emits a mesh vertex (no per-ray
+        # sampling) and the triangulated surface interpolates small gaps.  No
+        # median / Delaunay / diffusion tail is needed.  We only fill ortho
+        # color holes (cells with a DSM surface but no baked color); genuine
+        # no-data DSM holes are left NaN.
         if dsm_grid is not None:
             valid_count = int(np.count_nonzero(~np.isnan(dsm_grid)))
             logger.info(
-                f"Cluster {batch_num}: raw DSM composite, "
+                f"Cluster {batch_num}: DSM mesh raster, "
                 f"{valid_count}/{dsm_grid.size} valid cells"
             )
 
-            # --- Step 1: Median filter (remove speckle) ---
-            median_radius: int = config.get("dsm_median_radius", 2)
-            if median_radius > 0:
-                dsm_grid = _dsm_median_filter(dsm_grid, median_radius)
-                logger.info(
-                    f"  Applied {2 * median_radius + 1}x"
-                    f"{2 * median_radius + 1} median filter"
-                )
-
-            # --- Step 2: Delaunay triangulation hole fill ---
-            max_z_range: float = config.get(
-                "dsm_max_interp_z_range", 2.0
-            )
-            n_filled = _dsm_delaunay_fill(
-                dsm_grid, ortho_grid, max_z_range
-            )
-            if n_filled > 0:
-                logger.info(
-                    f"  Triangulation filled {n_filled} cells"
-                )
-
-            # --- Step 3: Perona-Malik diffusion (GPU) ---
-            diff_iters: int = config.get(
-                "dsm_diffusion_iterations", 50
-            )
-            diff_kappa: float = config.get("dsm_diffusion_kappa", 0.5)
-            diff_dt: float = config.get("dsm_diffusion_dt", 0.2)
-            if diff_iters > 0:
-                dsm_grid = _dsm_gpu_diffuse(
-                    dsm_grid, diff_iters, diff_kappa, diff_dt
-                )
-                logger.info(
-                    f"  Applied {diff_iters} diffusion iterations"
-                )
-
-            # --- Step 3.5: Median filter ortho (remove boundary speckle) ---
-            if ortho_grid is not None and median_radius > 0:
-                ks = 2 * median_radius + 1
-                ortho_grid = cv2.medianBlur(ortho_grid, ks)
-                logger.info(
-                    f"  Applied {ks}x{ks} median to ortho"
-                )
-
-            # --- Step 4: Diffuse ortho colors into holes ---
             if ortho_grid is not None:
-                ortho_grid = _ortho_diffuse_holes(
-                    ortho_grid, dsm_grid, diff_iters // 2
-                )
-                logger.info("  Diffused ortho colors into holes")
+                ortho_grid = _ortho_diffuse_holes(ortho_grid, dsm_grid, 16)
+                logger.info("  Filled ortho color holes")
 
-            # --- Save ---
-            valid_count = int(np.count_nonzero(~np.isnan(dsm_grid)))
-            logger.info(
-                f"Cluster {batch_num}: final DSM, "
-                f"{valid_count}/{dsm_grid.size} valid cells"
-            )
             reference = reconstruction.reference
             data.save_dsm(
                 dsm_grid, dsm_origin_x, dsm_origin_y,

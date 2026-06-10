@@ -1495,8 +1495,8 @@ void SVOIntegratorCL::ClearVotes() {
 
 void SVOIntegratorCL::RenderDSMOrtho(float origin_x, float origin_y, float gsd,
                                      int width, int height, float z_min,
-                                     float z_max, float voxel_size,
-                                     float min_weight, float trunc_dist,
+                                     float /*z_max*/, float voxel_size,
+                                     float min_weight,
                                      std::vector<float>* dsm_out,
                                      std::vector<uint8_t>* ortho_out,
                                      std::vector<float>* normals_out) {
@@ -1505,34 +1505,142 @@ void SVOIntegratorCL::RenderDSMOrtho(float origin_x, float origin_y, float gsd,
   cl::CommandQueue& queue = dev.queue();
 
   const size_t ncells = static_cast<size_t>(width) * height;
+  const int32_t kEmptyZ = -1;
 
-  // Allocate output buffers on GPU.
+  // ---- Mesh one TSDF table's Surface Nets surface into a z-buffer. ----
+  // Allocates a transient per-slot vertex buffer, runs the vertex + raster
+  // passes.  Used for the fine level and each downsampled coarse level.
+  auto mesh_level = [&](const cl::Buffer& table, uint32_t mask, uint32_t cap,
+                        float vsize, const cl::Buffer& zbuf) {
+    cl::Buffer vert(ctx, CL_MEM_READ_WRITE,
+                    static_cast<size_t>(cap) * 3 * sizeof(float));
+    queue.enqueueFillBuffer(zbuf, kEmptyZ, 0, ncells * sizeof(int32_t));
+    // Cap a triangle's cell footprint generously above the cube pitch (1
+    // voxel) to kill degenerate triangles; scales with the level's voxel.
+    const int max_tri_cells = std::max(4, static_cast<int>(4.0f * vsize / gsd));
+    const size_t g = ((static_cast<size_t>(cap) + 255) / 256) * 256;
+    {
+      cl::Kernel k(program_, "svo_dc_vertex");
+      k.setArg(0, table);
+      k.setArg(1, mask);
+      k.setArg(2, cap);
+      k.setArg(3, vert);
+      k.setArg(4, vsize);
+      k.setArg(5, min_weight);
+      queue.enqueueNDRangeKernel(k, cl::NullRange, cl::NDRange(g),
+                                 cl::NDRange(256));
+    }
+    {
+      cl::Kernel k(program_, "svo_dc_raster");
+      k.setArg(0, table);
+      k.setArg(1, mask);
+      k.setArg(2, cap);
+      k.setArg(3, vert);
+      k.setArg(4, zbuf);
+      k.setArg(5, origin_x);
+      k.setArg(6, origin_y);
+      k.setArg(7, gsd);
+      k.setArg(8, width);
+      k.setArg(9, height);
+      k.setArg(10, z_min);
+      k.setArg(11, max_tri_cells);
+      queue.enqueueNDRangeKernel(k, cl::NullRange, cl::NDRange(g),
+                                 cl::NDRange(256));
+    }
+  };
+
+  // Fine level (L=0).
+  cl::Buffer z_fine(ctx, CL_MEM_READ_WRITE, ncells * sizeof(int32_t));
+  mesh_level(cl_table_, capacity_mask_, capacity_, voxel_size, z_fine);
+
+  // Coarse fill levels: downsample the fine table by 2^L, mesh it, and let
+  // its larger triangles cover the cells the finer levels left empty.
+  const int kNumCoarse = 2;
+  cl::Buffer z_coarse[2];
+  cl::Buffer cl_overflow(ctx, CL_MEM_READ_WRITE, sizeof(uint32_t));
+  for (int L = 1; L <= kNumCoarse; ++L) {
+    // Coarse band ≈ 1/4 of the fine count per octave — size generously.
+    uint32_t ccap = std::max<uint32_t>(capacity_ >> L, 1u << 16);
+    uint32_t cmask = ccap - 1;
+    cl::Buffer ctable(ctx, CL_MEM_READ_WRITE,
+                      static_cast<size_t>(ccap) * sizeof(GPUVoxelSlot));
+    const size_t cg = ((static_cast<size_t>(ccap) + 255) / 256) * 256;
+    {
+      cl::Kernel k(program_, "svo_clear_table");
+      k.setArg(0, ctable);
+      k.setArg(1, ccap);
+      queue.enqueueNDRangeKernel(k, cl::NullRange, cl::NDRange(cg),
+                                 cl::NDRange(256));
+    }
+    const uint32_t zero = 0;
+    queue.enqueueFillBuffer(cl_overflow, zero, 0, sizeof(uint32_t));
+    {
+      cl::Kernel k(program_, "svo_dc_downsample");
+      k.setArg(0, cl_table_);
+      k.setArg(1, capacity_);
+      k.setArg(2, ctable);
+      k.setArg(3, cmask);
+      k.setArg(4, cl_overflow);
+      k.setArg(5, L);
+      const size_t fg = ((static_cast<size_t>(capacity_) + 255) / 256) * 256;
+      queue.enqueueNDRangeKernel(k, cl::NullRange, cl::NDRange(fg),
+                                 cl::NDRange(256));
+    }
+    z_coarse[L - 1] =
+        cl::Buffer(ctx, CL_MEM_READ_WRITE, ncells * sizeof(int32_t));
+    mesh_level(ctable, cmask, ccap, voxel_size * static_cast<float>(1 << L),
+               z_coarse[L - 1]);
+  }
+
   cl::Buffer cl_dsm(ctx, CL_MEM_WRITE_ONLY, ncells * sizeof(float));
   cl::Buffer cl_ortho(ctx, CL_MEM_WRITE_ONLY, ncells * sizeof(uint32_t));
   cl::Buffer cl_normals(ctx, CL_MEM_WRITE_ONLY, ncells * 3 * sizeof(float));
 
-  // Build kernel (reuses cached program).
-  cl::Kernel k(program_, "svo_render_dsm_ortho");
-  k.setArg(0, cl_table_);
-  k.setArg(1, capacity_mask_);
-  k.setArg(2, cl_dsm);
-  k.setArg(3, cl_ortho);
-  k.setArg(4, cl_normals);
-  k.setArg(5, origin_x);
-  k.setArg(6, origin_y);
-  k.setArg(7, gsd);
-  k.setArg(8, width);
-  k.setArg(9, height);
-  k.setArg(10, z_max);
-  k.setArg(11, z_min);
-  k.setArg(12, voxel_size);
-  k.setArg(13, min_weight);
-  k.setArg(14, trunc_dist);
+  // Resolve the levels finest-first into a single z-buffer.
+  cl::Buffer z_final(ctx, CL_MEM_READ_WRITE, ncells * sizeof(int32_t));
+  {
+    cl::Kernel k(program_, "svo_dc_resolve");
+    k.setArg(0, z_fine);
+    k.setArg(1, z_coarse[0]);
+    k.setArg(2, z_coarse[1]);
+    k.setArg(3, z_final);
+    k.setArg(4, static_cast<uint32_t>(ncells));
+    const size_t g = ((ncells + 255) / 256) * 256;
+    queue.enqueueNDRangeKernel(k, cl::NullRange, cl::NDRange(g),
+                               cl::NDRange(256));
+  }
 
-  const size_t gx = ((static_cast<size_t>(width) + 15) / 16) * 16;
-  const size_t gy = ((static_cast<size_t>(height) + 15) / 16) * 16;
-  queue.enqueueNDRangeKernel(k, cl::NullRange, cl::NDRange(gx, gy),
-                             cl::NDRange(16, 16));
+  // 5x5 median despeckle (GPU).  Finalize + the Python ortho bake both read
+  // this despeckled buffer, so DSM and ortho stay in sync.
+  cl::Buffer z_median(ctx, CL_MEM_READ_WRITE, ncells * sizeof(int32_t));
+  {
+    cl::Kernel k(program_, "svo_dc_median");
+    k.setArg(0, z_final);
+    k.setArg(1, z_median);
+    k.setArg(2, width);
+    k.setArg(3, height);
+    const size_t gx = ((static_cast<size_t>(width) + 15) / 16) * 16;
+    const size_t gy = ((static_cast<size_t>(height) + 15) / 16) * 16;
+    queue.enqueueNDRangeKernel(k, cl::NullRange, cl::NDRange(gx, gy),
+                               cl::NDRange(16, 16));
+  }
+
+  // Finalize: despeckled int z-buffer -> float DSM + per-cell normal.
+  {
+    cl::Kernel k(program_, "svo_dc_finalize");
+    k.setArg(0, z_median);
+    k.setArg(1, cl_dsm);
+    k.setArg(2, cl_ortho);
+    k.setArg(3, cl_normals);
+    k.setArg(4, width);
+    k.setArg(5, height);
+    k.setArg(6, z_min);
+    k.setArg(7, gsd);
+    const size_t gx = ((static_cast<size_t>(width) + 15) / 16) * 16;
+    const size_t gy = ((static_cast<size_t>(height) + 15) / 16) * 16;
+    queue.enqueueNDRangeKernel(k, cl::NullRange, cl::NDRange(gx, gy),
+                               cl::NDRange(16, 16));
+  }
   queue.finish();
 
   // Download results.

@@ -516,50 +516,12 @@ class OpenSfMConfig:
     ##################################
     # Params for DSM (Digital Surface Model) generation
     ##################################
-    # Method: "triangles" (per-view triangle rasterization with MAX z-buffer)
-    # or "modes" (legacy: per-point scatter with mode tracking).
+    # DSM + ortho rendering.  "svo" extracts the surface from the fused TSDF
+    # by Surface Nets (dual contouring) and rasterizes it top-down into a
+    # max-z buffer (see svo_dc_* kernels).  Any other value disables it.
     dsm_method: str = "svo"
     # Ground sample distance in meters/pixel. 0 = auto from voxel size.
     dsm_gsd: float = 0.0
-    # Mode-seeking threshold in meters: incoming Z samples closer than
-    # this to an existing mode are merged; farther samples go to the
-    # ring buffer for new-mode detection.
-    dsm_mode_threshold: float = 0.5
-    # Max triangle edge length in grid cells for triangle rasterization.
-    # Triangles with any edge longer than this are rejected (prevents
-    # overgrowth of thin structures and capping of concave regions).
-    dsm_max_triangle_edge: float = 6.0
-    # Minimum number of depthmap pixel contributions per mode.  Modes
-    # with fewer observations are discarded during finalization.
-    dsm_min_count: int = 3
-    # Number of pyramid levels for multi-scale DSM (coarsest first).
-    dsm_num_levels: int = 3
-    # GSD multiplier between consecutive levels (e.g. 2.0 → 4x, 2x, 1x).
-    dsm_level_factor: float = 2.0
-    # Hard gate on world normal Z: samples with wnz below this are rejected.
-    dsm_min_normal_z: float = 0.2
-    # Upper bound for soft normal weighting smoothstep.
-    # Surfaces with wnz >= this get full confidence weight.
-    dsm_soft_upper_nz: float = 0.7
-    # Enable edge-preserving bilateral smoothing on the final DSM grid.
-    dsm_bilateral_enabled: bool = True
-    # Bilateral filter spatial radius in pixels.
-    dsm_bilateral_spatial: int = 2
-    # Bilateral filter range sigma in meters.
-    dsm_bilateral_range: float = 0.3
-    # Number of Perona-Malik diffusion iterations per level.
-    dsm_diffusion_iterations: int = 200
-    # Edge-stopping parameter kappa (meters). Controls how much gradient
-    # magnitude inhibits diffusion across edges.
-    dsm_diffusion_kappa: float = 0.5
-    # Diffusion time-step (must be ≤ 0.25 for stability).
-    dsm_diffusion_dt: float = 0.2
-    # Post-process median filter radius (0 = disabled, 1 = 3x3, 2 = 5x5).
-    dsm_median_radius: int = 2
-    # Maximum Z range (meters) across a Delaunay triangle for hole
-    # interpolation. Triangles spanning larger Z gaps are rejected
-    # (avoids bridging across cliffs/building edges).
-    dsm_max_interp_z_range: float = 2.0
     # Orthophoto color baking (svo_bake_colors): number of sharpest inlier views blended for the final color
     ortho_bake_n_final_views: int = 3
     # Tukey-biweight reweighting iterations for the robust color consensus.

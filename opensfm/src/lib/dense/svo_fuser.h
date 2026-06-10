@@ -90,9 +90,10 @@ class SVOFuser {
                      std::vector<Vec3f>* fused_normals,
                      std::vector<Vec3<uint8_t>>* fused_colors);
 
-  // Render DSM + ortho by orthographic top-down raycast of the fused TSDF.
-  // Call after Fuse(). Outputs: dsm (H×W float), ortho (H×W×4 uint8 RGBA),
-  // normals (H×W×3 float, surface normal per cell).
+  // Render DSM + normals by Surface Nets (dual contouring) of the fused
+  // TSDF, rasterized top-down into a max-z buffer.  Call after Fuse().
+  // Outputs: dsm (H×W float, NaN where empty), ortho (H×W×4 uint8 RGBA,
+  // zeroed — color baked in Python), normals (H×W×3 float per cell).
   void RenderDSMOrtho(float origin_x, float origin_y, float gsd, int width,
                       int height, float z_min, float z_max,
                       std::vector<float>* dsm_out,

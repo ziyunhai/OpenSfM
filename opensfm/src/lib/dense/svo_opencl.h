@@ -189,15 +189,15 @@ class SVOIntegratorCL {
   // Clear vote counters (call between iterations if doing multiple passes).
   void ClearVotes();
 
-  // Render DSM + ortho (hillshade) + surface normals by orthographic raycast.
-  // Fires vertical rays downward through the hash table for each grid cell.
+  // Render DSM + surface normals by Surface Nets (dual contouring) of the
+  // TSDF rasterized top-down into a max-z buffer.  Speckle-free vs raycast
+  // because every surface cube emits a mesh vertex (no per-ray sampling).
   // dsm_out: (height × width) float, NaN where no surface.
   // ortho_out: (height × width × 4) uint8 RGBA.
   // normals_out: (height × width × 3) float, surface normal per cell.
   void RenderDSMOrtho(float origin_x, float origin_y, float gsd, int width,
                       int height, float z_min, float z_max, float voxel_size,
-                      float min_weight, float trunc_dist,
-                      std::vector<float>* dsm_out,
+                      float min_weight, std::vector<float>* dsm_out,
                       std::vector<uint8_t>* ortho_out,
                       std::vector<float>* normals_out);
 
