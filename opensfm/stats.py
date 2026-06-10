@@ -86,7 +86,8 @@ def _gps_gcp_opk_errors_stats(errors: Optional[NDArray], names: List[str]) -> Di
     average = np.average(np.linalg.norm(errors, axis=1))
 
     stats["mean"] = {names[0]: mean[0], names[1]: mean[1], names[2]: mean[2]}
-    stats["std"] = {names[0]: std_dev[0], names[1]                    : std_dev[1], names[2]: std_dev[2]}
+    stats["std"] = {names[0]: std_dev[0], names[1]
+        : std_dev[1], names[2]: std_dev[2]}
     stats["error"] = {
         names[0]: math.sqrt(m_squared[0]),
         names[1]: math.sqrt(m_squared[1]),
@@ -289,30 +290,9 @@ def _projection_error(
 
     bins = 30
 
-    # 1. Normalized errors
-    all_errors_normalized = []
-    average_error_normalized = 0.0
-    for i in range(len(reconstructions)):
-        if not rec_shots[i]:
-            continue
-        errors_normalized = _compute_errors(reconstructions, tracks_manager)(
-            i, pymap.ErrorType.Normalized, rec_shots[i]
-        )
-        for shot_id, shot_errors in errors_normalized.items():
-            for error_normalized in shot_errors.values():
-                norm_normalized = _norm2d(error_normalized)
-                average_error_normalized += norm_normalized
-                all_errors_normalized.append(norm_normalized)
-
-    error_count_normalized = len(all_errors_normalized)
-    avg_normalized = average_error_normalized / \
-        error_count_normalized if error_count_normalized > 0 else -1.0
-    hist_normalized = np.histogram(
-        all_errors_normalized, bins) if error_count_normalized > 0 else (np.array([]), np.array([]))
-    del all_errors_normalized
-
-    # 2. Pixel errors
+    # 1. Pixel errors
     all_errors_pixels = []
+    to_skip = defaultdict(set)
     average_error_pixels = 0.0
     for i in range(len(reconstructions)):
         if not rec_shots[i]:
@@ -323,9 +303,10 @@ def _projection_error(
         for shot_id, shot_errors in errors_unnormalized.items():
             shot = reconstructions[i].get_shot(shot_id)
             normalizer = max(shot.camera.width, shot.camera.height)
-            for error_unnormalized in shot_errors.values():
+            for j, error_unnormalized in enumerate(shot_errors.values()):
                 norm_pixels = _norm2d(error_unnormalized * normalizer)
                 if norm_pixels > RESIDUAL_PIXEL_CUTOFF:
+                    to_skip[shot_id].add(j)
                     continue
                 average_error_pixels += norm_pixels
                 all_errors_pixels.append(norm_pixels)
@@ -337,6 +318,30 @@ def _projection_error(
         np.array([]), np.array([]))
     del all_errors_pixels
 
+    # 2. Normalized errors
+    all_errors_normalized = []
+    average_error_normalized = 0.0
+    for i in range(len(reconstructions)):
+        if not rec_shots[i]:
+            continue
+        errors_normalized = _compute_errors(reconstructions, tracks_manager)(
+            i, pymap.ErrorType.Normalized, rec_shots[i]
+        )
+        for shot_id, shot_errors in errors_normalized.items():
+            for j, error_normalized in enumerate(shot_errors.values()):
+                if j in to_skip[shot_id]:
+                    continue
+                norm_normalized = _norm2d(error_normalized)
+                average_error_normalized += norm_normalized
+                all_errors_normalized.append(norm_normalized)
+
+    error_count_normalized = len(all_errors_normalized)
+    avg_normalized = average_error_normalized / \
+        error_count_normalized if error_count_normalized > 0 else -1.0
+    hist_normalized = np.histogram(
+        all_errors_normalized, bins) if error_count_normalized > 0 else (np.array([]), np.array([]))
+    del all_errors_normalized
+
     # 3. Angular errors
     all_errors_angular = []
     average_error_angular = 0.0
@@ -347,9 +352,9 @@ def _projection_error(
             i, pymap.ErrorType.Angular, rec_shots[i]
         )
         for shot_id, shot_errors in errors_angular.items():
-            for error_angular in shot_errors.values():
+            for j, error_angular in enumerate(shot_errors.values()):
                 norm_angle = error_angular[0]
-                if math.isnan(norm_angle):
+                if math.isnan(norm_angle) or j in to_skip[shot_id]:
                     continue
                 average_error_angular += norm_angle
                 all_errors_angular.append(norm_angle)
