@@ -1527,7 +1527,6 @@ def _fill_holes_2pass(
     diffuse_iters: int,
     kappa: float,
     dt: float,
-    large_area_max: Optional[int] = None,
     device: int = 0,
 ) -> NDArray:
     """Two-stage hole fill on a float grid (post-process).
@@ -1542,12 +1541,9 @@ def _fill_holes_2pass(
                       frozen during diffusion).
     ``hole_mask``   : bool ``(H,W)``, cells to fill.  Cells that are neither a
                       sample nor a hole are left untouched (never used as a
-                      sample, never frozen).
-    ``large_area_max``: if set, a large component is treated as un-fillable
-                      no-data BACKGROUND only when it BOTH touches the grid
-                      border AND exceeds this many cells (everything else is
-                      interpolated).  ``None`` fills every component (used for
-                      the ortho, where the background is already excluded by
+                      sample, never frozen).  Every cell in ``hole_mask`` is
+                      filled — the caller is responsible for excluding the
+                      genuine no-data exterior (DSM: the footprint test; ortho:
                       ``has_dsm``).
     Returns a filled copy (float32).
     """
@@ -1562,27 +1558,10 @@ def _fill_holes_2pass(
     comp_size = np.bincount(labels.ravel())
     small_mask = hole_mask & (comp_size[labels] <= small_area_max)
 
-    # The no-data "background" (margins + un-reconstructed area outside the
-    # surface) is the only thing we must NOT interpolate across.  It is the
-    # component that BOTH touches the grid border AND is huge; every other hole
-    # — enclosed at any size, or border-touching but smaller than
-    # ``large_area_max`` — is a genuine hole worth filling.
-    border_labels = np.unique(
-        np.concatenate(
-            (labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1])
-        )
-    )
-
-    def _drop_background(ids: NDArray) -> NDArray:
-        if large_area_max is None or ids.size == 0:
-            return ids
-        is_border = np.isin(ids, border_labels)
-        too_big = comp_size[ids] > large_area_max
-        return ids[~(is_border & too_big)]
-
+    # Every hole in ``hole_mask`` is fillable here — the genuine no-data exterior
+    # was already excluded by the caller (DSM footprint / ortho ``has_dsm``).
     large_ids = np.nonzero(comp_size > small_area_max)[0]
-    large_ids = large_ids[large_ids != 0]  # drop background label 0
-    fillable_large = _drop_background(large_ids)
+    large_ids = large_ids[large_ids != 0]  # drop the non-hole label 0
 
     multichannel = out.ndim == 3
     nchan = out.shape[2] if multichannel else 1
@@ -1614,12 +1593,11 @@ def _fill_holes_2pass(
     # Stage 2: per-component linear interpolation for enclosed large holes
     # (and enclosed tiny holes too if the diffusion pass was unavailable).
     if diffuse_ok:
-        stage2_ids = fillable_large
+        stage2_ids = large_ids
         stage2_valid = sample_valid | small_mask  # tiny holes now hold values
     else:
         all_ids = np.nonzero(comp_size != 0)[0]
-        all_ids = all_ids[all_ids != 0]
-        stage2_ids = _drop_background(all_ids)
+        stage2_ids = all_ids[all_ids != 0]
         stage2_valid = sample_valid
 
     n_tiny = int(small_mask.sum()) if diffuse_ok else 0
@@ -1636,30 +1614,85 @@ def _fill_holes_2pass(
     return out
 
 
+def _dsm_footprint(valid: NDArray, close_iters: int) -> NDArray:
+    """Reconstructed footprint of the DSM: the valid region morphologically
+    closed (to bridge ragged-boundary concavity mouths) and hole-filled.
+
+    No-data INSIDE the footprint are fillable pockets/concavities; no-data
+    OUTSIDE it is the genuine exterior (kept as no-data).
+    """
+    if close_iters > 0:
+        structure = ndimage.generate_binary_structure(2, 1)
+        closed = ndimage.binary_closing(
+            valid, structure=structure, iterations=int(close_iters)
+        )
+    else:
+        closed = valid
+    return ndimage.binary_fill_holes(closed)
+
+
 def _fill_dsm_holes(dsm_grid: NDArray, config: Dict[str, Any]) -> NDArray:
-    """Fill DSM no-data holes: tiny ones by edge-aware GPU diffusion, large
-    ones by linear interpolation.  Holes are NaN cells."""
+    """Fill DSM no-data holes that lie INSIDE the reconstructed footprint: tiny
+    ones by edge-aware GPU diffusion, larger pockets/boundary concavities by
+    per-component linear (Delaunay) interpolation.  The no-data EXTERIOR outside
+    the footprint is kept as no-data (so the ortho stays transparent there).
+    """
     valid = ~np.isnan(dsm_grid)
     if valid.all() or not valid.any():
         return dsm_grid
+
+    footprint = _dsm_footprint(valid, int(config["hole_fill_footprint_close"]))
+    fillable = (~valid) & footprint
+    if not fillable.any():
+        return dsm_grid
+
     return _fill_holes_2pass(
         dsm_grid,
         sample_valid=valid,
-        hole_mask=~valid,
+        hole_mask=fillable,
         small_area_max=config["hole_fill_small_area_max"],
         diffuse_iters=config["hole_fill_diffuse_iters"],
         kappa=0.5,  # metres: large steps (building edges) stop diffusion
         dt=0.2,
-        large_area_max=int(config["hole_fill_large_area_max"]),
     )
+
+
+def _propagate_owner_into_filled(
+    owner_grid: NDArray, dsm_grid: NDArray
+) -> None:
+    """Give the newly-filled (interpolated) DSM cells an owner leaf.
+
+    A filled pocket cell has no owner (``owner_grid < 0``) but now carries a
+    height; assign it to the leaf that owns the nearest reconstructed cell so the
+    Pass-2 ortho bake reprojects real image colour onto it (rather than leaving
+    it for colour-domain interpolation).  ``owner_grid`` is modified in place;
+    work is cropped to the filled region's bounding box.
+    """
+    fill_mask = (owner_grid < 0) & ~np.isnan(dsm_grid)
+    if not fill_mask.any():
+        return
+    ys, xs = np.nonzero(fill_mask)
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    owner_sub = owner_grid[y0:y1, x0:x1]  # a view → writes propagate
+    have_owner = owner_sub >= 0
+    if not have_owner.any():
+        return
+    _, (iy, ix) = ndimage.distance_transform_edt(
+        ~have_owner, return_indices=True
+    )
+    sub_fill = fill_mask[y0:y1, x0:x1]
+    owner_sub[sub_fill] = owner_sub[iy[sub_fill], ix[sub_fill]]
 
 
 def _fill_ortho_holes(
     ortho_grid: NDArray, dsm_grid: NDArray, config: Dict[str, Any]
 ) -> NDArray:
-    """Fill ortho colour holes where a DSM surface exists but no colour was
-    baked.  Tiny holes by (near-isotropic) GPU diffusion, large holes by
-    linear interpolation.  Cells with no DSM stay untouched (black)."""
+    """Residual ortho colour fill: cells where a DSM surface exists but the bake
+    produced no colour (occluded in every view → black).  Most filled-DSM cells
+    are coloured by the Pass-2 reprojection bake; this only mops up the few the
+    bake could not see.  Tiny holes by (near-isotropic) GPU diffusion, larger
+    ones by linear interpolation.  Cells with no DSM stay untouched (black)."""
     has_dsm = ~np.isnan(dsm_grid)
     has_color = has_dsm & (ortho_grid.sum(axis=2) > 0)
     fillable = has_dsm & ~has_color
@@ -2225,10 +2258,17 @@ def _fuse_per_cluster(
             )
 
             dsm_grid = _fill_dsm_holes(dsm_grid, config)
-            logger.info("  Filled DSM holes (diffuse tiny + linear large)")
+            logger.info(
+                "  Filled DSM footprint holes (diffuse tiny + Delaunay pockets)"
+            )
 
             dsm_grid = _shock_dsm_edges(dsm_grid, dsm_gsd, config)
             logger.info("  Sharpened DSM edges (shock filter)")
+
+            # Hand the newly-filled (interpolated) cells to the leaf that owns the
+            # nearest surface, so Pass 2 bakes real reprojected colour onto them.
+            if owner_grid is not None:
+                _propagate_owner_into_filled(owner_grid, dsm_grid)
 
             # --- Pass 2: bake the ortho from the corrected DSM. ---
             if ortho_grid is not None and owner_grid is not None:
@@ -2266,7 +2306,7 @@ def _fuse_per_cluster(
                 )
                 ortho_grid = _fill_ortho_holes(ortho_grid, dsm_grid, config)
                 logger.info(
-                    "  Filled ortho holes (diffuse tiny + linear large)")
+                    "  Filled residual ortho holes (bake-occluded cells)")
 
                 ortho_grid = _ortho_gated_median(ortho_grid, dsm_grid, config)
                 logger.info("  Despeckled ortho (gated 3x3 median)")

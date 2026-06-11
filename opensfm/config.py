@@ -545,12 +545,14 @@ class OpenSfMConfig:
     # from their boundary ring.
     hole_fill_diffuse_iters: int = 64
     hole_fill_small_area_max: int = 256
-    # Only the no-data BACKGROUND (the un-reconstructed area outside the scene)
-    # is left unfilled: a DSM hole is treated as background when it BOTH touches
-    # the grid border AND exceeds this many cells.  Every other hole — enclosed
-    # at any size, or border-touching but smaller — is interpolated.  Raise if
-    # genuine large holes near the border are wrongly left as no-data.
-    hole_fill_large_area_max: int = 1_000_000
+    # Boundary handling for the DSM: the no-data EXTERIOR outside the
+    # reconstructed footprint is left as no-data (keeps the ortho transparent
+    # there), while bounded pockets / boundary concavities INSIDE the footprint
+    # are filled.  The footprint is the valid region morphologically closed by
+    # this many cells — bridging ragged-boundary concavity mouths up to ~2x this
+    # wide — then hole-filled.  Larger = fill wider boundary bays; too large
+    # merges across genuine gaps (streets/courtyards open to the exterior).
+    hole_fill_footprint_close: int = 24
     # Coherence-enhancing shock filter on the DSM (post-process, after hole
     # fill).  Sharpens fattened roof/ground height ramps into steps WITHOUT the
     # ortho (avoids the ortho<->DSM chicken-and-egg), steered by a local
