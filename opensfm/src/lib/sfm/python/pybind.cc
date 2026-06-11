@@ -75,8 +75,7 @@ PYBIND11_MODULE(pysfm, m) {
   m.def("reconstruct_from_tracks_manager",
         &sfm::retriangulation::ReconstructFromTracksManager, py::arg("map"),
         py::arg("tracks_manager"), py::arg("config"),
-        py::arg("use_robust") = false,
-        py::call_guard<py::gil_scoped_release>());
+        py::arg("use_robust") = false);
 
   // ── dense_helpers: super-point covisibility & neighbor selection ────
 

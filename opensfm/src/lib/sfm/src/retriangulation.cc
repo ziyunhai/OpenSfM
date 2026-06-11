@@ -146,6 +146,9 @@ void ReconstructFromTracksManager(map::Map& map,
   int processes = config["processes"].cast<int>();
   const float min_angle_rad = min_angle * M_PI / 180.0;
 
+  // Safe to release GIL after accessing config
+  py::gil_scoped_release release; 
+
   // Clear existing observations and landmarks
   map.ClearObservationsAndLandmarks();
 
