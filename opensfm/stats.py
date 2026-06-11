@@ -303,10 +303,10 @@ def _projection_error(
         for shot_id, shot_errors in errors_unnormalized.items():
             shot = reconstructions[i].get_shot(shot_id)
             normalizer = max(shot.camera.width, shot.camera.height)
-            for j, error_unnormalized in enumerate(shot_errors.values()):
+            for lm_id, error_unnormalized in shot_errors.items():
                 norm_pixels = _norm2d(error_unnormalized * normalizer)
                 if norm_pixels > RESIDUAL_PIXEL_CUTOFF:
-                    to_skip[shot_id].add(j)
+                    to_skip[shot_id].add(lm_id)
                     continue
                 average_error_pixels += norm_pixels
                 all_errors_pixels.append(norm_pixels)
@@ -328,8 +328,8 @@ def _projection_error(
             i, pymap.ErrorType.Normalized, rec_shots[i]
         )
         for shot_id, shot_errors in errors_normalized.items():
-            for j, error_normalized in enumerate(shot_errors.values()):
-                if j in to_skip[shot_id]:
+            for lm_id, error_normalized in shot_errors.items():
+                if lm_id in to_skip[shot_id]:
                     continue
                 norm_normalized = _norm2d(error_normalized)
                 average_error_normalized += norm_normalized
@@ -352,9 +352,9 @@ def _projection_error(
             i, pymap.ErrorType.Angular, rec_shots[i]
         )
         for shot_id, shot_errors in errors_angular.items():
-            for j, error_angular in enumerate(shot_errors.values()):
+            for lm_id, error_angular in shot_errors.items():
                 norm_angle = error_angular[0]
-                if math.isnan(norm_angle) or j in to_skip[shot_id]:
+                if math.isnan(norm_angle) or lm_id in to_skip[shot_id]:
                     continue
                 average_error_angular += norm_angle
                 all_errors_angular.append(norm_angle)
@@ -1230,7 +1230,7 @@ def save_residual_grids(
             shot_ids, min(max_shots, len(shot_ids))))
 
         valid_observations = _get_valid_observations(
-            reconstructions, tracks_manager)(i)
+            reconstructions, tracks_manager)(i, ramdom_shot_ids)
         errors_scaled = _compute_errors(reconstructions, tracks_manager)(
             i, pymap.ErrorType.Normalized, ramdom_shot_ids
         )

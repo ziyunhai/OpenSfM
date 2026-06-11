@@ -532,7 +532,8 @@ Map::ComputeReprojectionErrors(const TracksManager& tracks_manager,
                                const Map::ErrorType& error_type,
                                const std::vector<ShotId>& shot_ids) const {
   std::unordered_map<ShotId, std::unordered_map<LandmarkId, Vec2d> > errors;
-  const std::vector<ShotId>& shots_to_eval = shot_ids.empty() ? tracks_manager.GetShotIds() : shot_ids;
+  const std::vector<ShotId> shots_to_eval =
+      shot_ids.empty() ? tracks_manager.GetShotIds() : shot_ids;
   for (const auto& shot_id : shots_to_eval) {
     const auto find_shot = shots_.find(shot_id);
     if (find_shot == shots_.end()) {
@@ -578,7 +579,8 @@ Map::GetValidObservations(const TracksManager& tracks_manager,
                           const std::vector<ShotId>& shot_ids) const {
   std::unordered_map<ShotId, std::unordered_map<LandmarkId, Observation> >
       observations;
-  const std::vector<ShotId>& shots_to_eval = shot_ids.empty() ? tracks_manager.GetShotIds() : shot_ids;
+  const std::vector<ShotId> shots_to_eval =
+      shot_ids.empty() ? tracks_manager.GetShotIds() : shot_ids;
   for (const auto& shot_id : shots_to_eval) {
     const auto find_shot = shots_.find(shot_id);
     if (find_shot == shots_.end()) {
