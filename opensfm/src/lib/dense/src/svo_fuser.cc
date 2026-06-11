@@ -42,6 +42,10 @@ void SVOFuser::SetRelativeMinWeight(float w) {
   relative_min_weight_ = std::max(0.0f, w);
 }
 
+void SVOFuser::SetDSMWallCullNz(float nz) {
+  dsm_wall_cull_nz_ = std::min(std::max(0.0f, nz), 1.0f);
+}
+
 void SVOFuser::SetBBox(const Eigen::Vector3f& min_world,
                        const Eigen::Vector3f& max_world) {
   has_bbox_ = true;
@@ -715,8 +719,8 @@ void SVOFuser::RenderDSMOrtho(float origin_x, float origin_y, float gsd,
         "SVOFuser::RenderDSMOrtho: must call Fuse() first");
   }
   integrator_->RenderDSMOrtho(origin_x, origin_y, gsd, width, height, z_min,
-                              z_max, voxel_size_, min_weight_, dsm_out,
-                              ortho_out, normals_out);
+                              z_max, voxel_size_, min_weight_, dsm_wall_cull_nz_,
+                              dsm_out, ortho_out, normals_out);
 }
 
 }  // namespace dense

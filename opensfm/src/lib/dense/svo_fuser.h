@@ -35,6 +35,10 @@ class SVOFuser {
   void SetEdgeThreshold(float t);
   void SetMinCount(int n);
   void SetRelativeMinWeight(float w);
+  // Min |cos| of a DSM mesh triangle's surface normal from vertical for it to
+  // be rasterized; steeper (wall-like) patches are dropped to keep roof edges
+  // sharp.  0 = rasterize everything (no wall cull).
+  void SetDSMWallCullNz(float nz);
   void SetBBox(const Eigen::Vector3f& min_world,
                const Eigen::Vector3f& max_world);
   static bool IsGPUAvailable();
@@ -125,6 +129,7 @@ class SVOFuser {
   float edge_threshold_ = 0.15f;      // normal divergence threshold for "edge"
   int min_count_ = 2;                 // min observation count for extraction
   float relative_min_weight_ = 0.0f;  // local adaptive threshold (0=off)
+  float dsm_wall_cull_nz_ = 0.3f;     // DSM wall-cull min |normal_z| (0=off)
   int num_levels_ = 1;                // Multi-level fill: 1 = fine only
   int device_idx_ = 0;                // OpenCL device index
   uint32_t last_voxel_count_ = 0;     // cached from CountVoxels()

@@ -25,6 +25,7 @@ PYBIND11_MODULE(pydense, m) {
       .def("set_min_count", &dense::SVOFuserWrapper::SetMinCount)
       .def("set_relative_min_weight",
            &dense::SVOFuserWrapper::SetRelativeMinWeight)
+      .def("set_dsm_wall_cull_nz", &dense::SVOFuserWrapper::SetDSMWallCullNz)
       .def("set_bbox", &dense::SVOFuserWrapper::SetBBox, py::arg("min_world"),
            py::arg("max_world"))
       .def_static("is_gpu_available", &dense::SVOFuserWrapper::IsGPUAvailable)
@@ -139,5 +140,14 @@ PYBIND11_MODULE(pydense, m) {
       .def("diffuse", &dense::GPUDiffuserWrapper::Diffuse, py::arg("guide"),
            py::arg("iterations"), py::arg("kappa"), py::arg("dt"))
       .def("upload_grid", &dense::GPUDiffuserWrapper::UploadGrid,
-           py::arg("grid"));
+           py::arg("grid"))
+      .def("snap_edges", &dense::GPUDiffuserWrapper::SnapEdges, py::arg("dsm"),
+           py::arg("guide"), py::arg("iterations"), py::arg("radius"),
+           py::arg("sigma_spatial"), py::arg("sigma_range"))
+      .def("shock_filter", &dense::GPUDiffuserWrapper::ShockFilter,
+           py::arg("dsm"), py::arg("iterations"), py::arg("win"),
+           py::arg("dt"), py::arg("coherence"), py::arg("gsd"),
+           py::arg("edge_slope"))
+      .def("gated_median", &dense::GPUDiffuserWrapper::GatedMedian,
+           py::arg("ortho"), py::arg("valid"), py::arg("threshold"));
 }

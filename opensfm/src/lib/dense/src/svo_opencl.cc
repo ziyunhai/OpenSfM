@@ -1496,7 +1496,7 @@ void SVOIntegratorCL::ClearVotes() {
 void SVOIntegratorCL::RenderDSMOrtho(float origin_x, float origin_y, float gsd,
                                      int width, int height, float z_min,
                                      float /*z_max*/, float voxel_size,
-                                     float min_weight,
+                                     float min_weight, float wall_cull_nz,
                                      std::vector<float>* dsm_out,
                                      std::vector<uint8_t>* ortho_out,
                                      std::vector<float>* normals_out) {
@@ -1544,6 +1544,7 @@ void SVOIntegratorCL::RenderDSMOrtho(float origin_x, float origin_y, float gsd,
       k.setArg(9, height);
       k.setArg(10, z_min);
       k.setArg(11, max_tri_cells);
+      k.setArg(12, wall_cull_nz);
       queue.enqueueNDRangeKernel(k, cl::NullRange, cl::NDRange(g),
                                  cl::NDRange(256));
     }

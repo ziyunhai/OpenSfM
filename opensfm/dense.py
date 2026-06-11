@@ -1527,6 +1527,7 @@ def _fill_holes_2pass(
     diffuse_iters: int,
     kappa: float,
     dt: float,
+    large_area_max: Optional[int] = None,
     device: int = 0,
 ) -> NDArray:
     """Two-stage hole fill on a float grid (post-process).
@@ -1542,6 +1543,12 @@ def _fill_holes_2pass(
     ``hole_mask``   : bool ``(H,W)``, cells to fill.  Cells that are neither a
                       sample nor a hole are left untouched (never used as a
                       sample, never frozen).
+    ``large_area_max``: if set, a large component is treated as un-fillable
+                      no-data BACKGROUND only when it BOTH touches the grid
+                      border AND exceeds this many cells (everything else is
+                      interpolated).  ``None`` fills every component (used for
+                      the ortho, where the background is already excluded by
+                      ``has_dsm``).
     Returns a filled copy (float32).
     """
     out = values.astype(np.float32, copy=True)
@@ -1555,18 +1562,27 @@ def _fill_holes_2pass(
     comp_size = np.bincount(labels.ravel())
     small_mask = hole_mask & (comp_size[labels] <= small_area_max)
 
-    # Large components that touch the grid border are the no-data "background"
-    # (margins + un-reconstructed area outside the surface), NOT real holes —
-    # interpolating across them would invent a fake surface, so leave them NaN.
-    # Only ENCLOSED large components are genuine holes worth filling.
+    # The no-data "background" (margins + un-reconstructed area outside the
+    # surface) is the only thing we must NOT interpolate across.  It is the
+    # component that BOTH touches the grid border AND is huge; every other hole
+    # — enclosed at any size, or border-touching but smaller than
+    # ``large_area_max`` — is a genuine hole worth filling.
     border_labels = np.unique(
         np.concatenate(
             (labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1])
         )
     )
+
+    def _drop_background(ids: NDArray) -> NDArray:
+        if large_area_max is None or ids.size == 0:
+            return ids
+        is_border = np.isin(ids, border_labels)
+        too_big = comp_size[ids] > large_area_max
+        return ids[~(is_border & too_big)]
+
     large_ids = np.nonzero(comp_size > small_area_max)[0]
     large_ids = large_ids[large_ids != 0]  # drop background label 0
-    enclosed_large = large_ids[~np.isin(large_ids, border_labels)]
+    fillable_large = _drop_background(large_ids)
 
     multichannel = out.ndim == 3
     nchan = out.shape[2] if multichannel else 1
@@ -1598,12 +1614,12 @@ def _fill_holes_2pass(
     # Stage 2: per-component linear interpolation for enclosed large holes
     # (and enclosed tiny holes too if the diffusion pass was unavailable).
     if diffuse_ok:
-        stage2_ids = enclosed_large
+        stage2_ids = fillable_large
         stage2_valid = sample_valid | small_mask  # tiny holes now hold values
     else:
         all_ids = np.nonzero(comp_size != 0)[0]
         all_ids = all_ids[all_ids != 0]
-        stage2_ids = all_ids[~np.isin(all_ids, border_labels)]
+        stage2_ids = _drop_background(all_ids)
         stage2_valid = sample_valid
 
     n_tiny = int(small_mask.sum()) if diffuse_ok else 0
@@ -1634,6 +1650,7 @@ def _fill_dsm_holes(dsm_grid: NDArray, config: Dict[str, Any]) -> NDArray:
         diffuse_iters=config["hole_fill_diffuse_iters"],
         kappa=0.5,  # metres: large steps (building edges) stop diffusion
         dt=0.2,
+        large_area_max=int(config["hole_fill_large_area_max"]),
     )
 
 
@@ -1660,11 +1677,92 @@ def _fill_ortho_holes(
     return np.clip(filled, 0, 255).astype(ortho_grid.dtype)
 
 
+def _ortho_gated_median(
+    ortho_grid: NDArray, dsm_grid: NDArray, config: Dict[str, Any]
+) -> NDArray:
+    """Gated 3x3 GPU median despeckle of the ortho.
+
+    Replaces a pixel with its local median only when it differs by more than
+    ``ortho_median_threshold`` (per channel), removing isolated speckle while
+    preserving real texture/edges.  No-data cells (DSM NaN) are ignored.
+    """
+    threshold = float(config["ortho_median_threshold"])
+    if threshold <= 0.0:
+        return ortho_grid
+    valid = (~np.isnan(dsm_grid)).astype(np.uint8)
+    ortho_f = np.ascontiguousarray(ortho_grid, dtype=np.float32)
+    try:
+        f = pydense.GPUDiffuser()
+        f.set_device(0)
+        out = f.gated_median(ortho_f, valid, threshold)
+        return np.clip(out, 0, 255).astype(ortho_grid.dtype)
+    except Exception as e:
+        logger.warning(f"Ortho gated median unavailable ({e}); skipping")
+        return ortho_grid
+
+
+def _shock_dsm_edges(
+    dsm_grid: NDArray, gsd: float, config: Dict[str, Any]
+) -> NDArray:
+    """Sharpen DSM edges with a coherence-enhancing shock filter (GPU).
+
+    Steepens fattened roof/ground height ramps into steps using only the DSM
+    (no ortho → breaks the bake↔DSM chicken-and-egg).  Steered by a local
+    structure tensor so the resulting edges are sharp and straight, and gated by
+    local slope so smooth gradients are not terraced into staircases.  No-data
+    (NaN) cells are preserved.
+    """
+    iters = int(config["dsm_shock_iterations"])
+    if iters <= 0:
+        return dsm_grid
+    win = int(config["dsm_shock_window"])
+    dt = float(config["dsm_shock_dt"])
+    coherence = float(config["dsm_shock_coherence"])
+    edge_slope = float(config["dsm_shock_edge_slope"])
+    dsm_in = np.ascontiguousarray(dsm_grid, dtype=np.float32)
+    try:
+        f = pydense.GPUDiffuser()
+        f.set_device(0)
+        out = f.shock_filter(
+            dsm_in, iters, win, dt, coherence, float(gsd), edge_slope
+        )
+        return np.asarray(out, dtype=np.float32)
+    except Exception as e:
+        logger.warning(f"DSM shock filter unavailable ({e}); skipping")
+        return dsm_grid
+
+
+def _dsm_point_normals(
+    dsm: NDArray, rows: NDArray, cols: NDArray, gsd: float
+) -> NDArray:
+    """Per-point up-facing surface normals from DSM central differences.
+
+    Used to colour-bake the corrected DSM cells (Pass 2).  Cells whose
+    neighbours are no-data fall back to a flat (0, 0, 1) normal.
+    """
+    h, w = dsm.shape
+    cl = np.maximum(cols - 1, 0)
+    cr = np.minimum(cols + 1, w - 1)
+    ru = np.maximum(rows - 1, 0)
+    rd = np.minimum(rows + 1, h - 1)
+    dzdx = (dsm[rows, cr] - dsm[rows, cl]) / (2.0 * gsd)
+    dzdy = (dsm[rd, cols] - dsm[ru, cols]) / (2.0 * gsd)
+    nx = np.where(np.isnan(dzdx), 0.0, -dzdx).astype(np.float32)
+    ny = np.where(np.isnan(dzdy), 0.0, -dzdy).astype(np.float32)
+    norm = np.sqrt(nx * nx + ny * ny + 1.0).astype(np.float32)
+    out = np.empty((len(rows), 3), dtype=np.float32)
+    out[:, 0] = nx / norm
+    out[:, 1] = ny / norm
+    out[:, 2] = 1.0 / norm
+    return out
+
+
 def _render_dsm_patch_from_sv(
     fuser: "pydense.SVOFuser",
     sv: "_SubVolume",
     dsm_grid: NDArray,
-    ortho_grid: Optional[NDArray],
+    owner_grid: NDArray,
+    leaf_idx: int,
     origin_x: float,
     origin_y: float,
     gsd: float,
@@ -1672,13 +1770,12 @@ def _render_dsm_patch_from_sv(
     grid_h: int,
     z_min: float,
     z_max: float,
-    config: Dict[str, Any],
 ) -> None:
-    """Render DSM + color ortho for a sub-volume's core XY footprint.
+    """Render the DSM for a leaf's core XY footprint and composite (MAX-z).
 
-    Renders only the cells that overlap with ``sv.core_min[:2]`` to
-    ``sv.core_max[:2]``, then composites into the global grids using
-    MAX-z (highest surface wins).
+    Records per-cell ownership (``owner_grid`` = ``leaf_idx`` where this leaf
+    won the height) so Pass 2 can bake the ortho from the post-processed DSM
+    using exactly the views that produced each cell.  No colour is baked here.
     """
     # Compute the sub-grid pixel range corresponding to this sub-volume's core.
     col_start = max(0, int(np.floor((sv.core_min[0] - origin_x) / gsd)))
@@ -1694,56 +1791,26 @@ def _render_dsm_patch_from_sv(
     patch_origin_x = origin_x + col_start * gsd
     patch_origin_y = origin_y + row_start * gsd
 
-    # Render DSM + hillshade + normals for this patch.
-    dsm_patch, _hillshade, normals_patch = fuser.render_dsm_ortho(
+    # Render the DSM for this patch (colour is baked later, in Pass 2).
+    dsm_patch, _hillshade, _normals = fuser.render_dsm_ortho(
         patch_origin_x, patch_origin_y, gsd,
         patch_w, patch_h, z_min, z_max,
     )
     dsm_patch = np.asarray(dsm_patch, dtype=np.float32)
-    normals_patch = np.asarray(normals_patch, dtype=np.float32)
 
-    # Composite DSM: MAX-z (highest surface wins).
+    # Composite DSM: MAX-z (highest surface wins) and record ownership.
     valid = ~np.isnan(dsm_patch)
     dst_slice = dsm_grid[row_start:row_end, col_start:col_end]
     higher = valid & (
         np.isnan(dst_slice) | (dsm_patch > dst_slice)
     )
     dst_slice[higher] = dsm_patch[higher]
+    owner_grid[row_start:row_end, col_start:col_end][higher] = leaf_idx
 
-    # Bake real photo colors onto the valid DSM cells.
-    if ortho_grid is not None and np.any(higher):
-        # Build 3D points for cells where we updated the DSM.
-        rows_idx, cols_idx = np.where(higher)
-        n_pts = len(rows_idx)
-        points = np.empty((n_pts, 3), dtype=np.float32)
-        points[:, 0] = patch_origin_x + (cols_idx + 0.5) * gsd
-        points[:, 1] = patch_origin_y + (rows_idx + 0.5) * gsd
-        points[:, 2] = dsm_patch[rows_idx, cols_idx]
-
-        # Use real surface normals from the raycast.
-        nrm = normals_patch.reshape(patch_h, patch_w, 3)
-        pts_normals = nrm[rows_idx, cols_idx, :]
-
-        # Bake colors from source images: robust consensus gate + top-N
-        # sharpest-view linear blend (see svo_bake_colors kernel).
-        colors = fuser.bake_colors(
-            points.astype(np.float32, copy=False),
-            pts_normals.astype(np.float32, copy=False),
-            n_final=int(config["ortho_bake_n_final_views"]),
-            irls_iters=int(config["ortho_bake_irls_iterations"]),
-        )
-        colors = np.asarray(colors, dtype=np.uint8)
-
-        # Write into global ortho grid.
-        ortho_grid[
-            row_start + rows_idx, col_start + cols_idx, :
-        ] = colors
-
-    n_valid = int(np.count_nonzero(valid))
-    n_updated = int(np.count_nonzero(higher))
     logger.info(
         f"    DSM patch {patch_w}×{patch_h}: "
-        f"{n_valid} valid, {n_updated} updated"
+        f"{int(np.count_nonzero(valid))} valid, "
+        f"{int(np.count_nonzero(higher))} updated"
     )
 
 
@@ -1912,6 +1979,11 @@ def _fuse_per_cluster(
         all_points: List[NDArray] = []
         all_normals: List[NDArray] = []
         all_colors: List[NDArray] = []
+        # Leaf sub-volumes actually fused (post-split), for the Pass 2 ortho
+        # bake; owner_grid[cell] = index into `leaves` of the leaf that won the
+        # cell's height (MAX-z), so each cell is re-coloured by the views that
+        # produced it.
+        leaves: List["_SubVolume"] = []
 
         # --- DSM/ortho grid (populated per sub-volume if svo method) ---
         dsm_enabled = config.get("dsm_method", "triangles") == "svo"
@@ -1920,6 +1992,7 @@ def _fuse_per_cluster(
             dsm_gsd = voxel_size
         dsm_grid: Optional[NDArray] = None
         ortho_grid: Optional[NDArray] = None
+        owner_grid: Optional[NDArray] = None
         dsm_origin_x: float = 0.0
         dsm_origin_y: float = 0.0
         dsm_z_min: float = 0.0
@@ -1952,6 +2025,9 @@ def _fuse_per_cluster(
             ortho_grid = np.zeros(
                 (dsm_h, dsm_w, 3), dtype=np.uint8
             )
+            owner_grid = np.full(
+                (dsm_h, dsm_w), -1, dtype=np.int32
+            )
             logger.info(
                 f"Cluster {batch_num}: DSM grid {dsm_w}×{dsm_h}, "
                 f"GSD={dsm_gsd:.4f}, Z=[{dsm_z_min:.2f}, {dsm_z_max:.2f}]"
@@ -1963,35 +2039,28 @@ def _fuse_per_cluster(
             f"Cluster {batch_num}: loaded {len(view_cache)} views"
         )
 
-        def _fuse_subvolume(sv: _SubVolume) -> None:
-            """Fuse a single sub-volume, splitting if over budget."""
+        def _build_fuser(
+            sv: "_SubVolume",
+        ) -> Tuple["pydense.SVOFuser", int]:
+            """Create a configured fuser for a sub-volume and load its views."""
             fuser = pydense.SVOFuser()
             fuser.set_voxel_size(voxel_size)
             fuser.set_trunc_factor(trunc_factor_cfg)
-            fuser.set_min_weight(
-                config["depthmap_fusion_svo_min_weight"]
-            )
-            fuser.set_num_levels(
-                config["depthmap_fusion_svo_num_levels"]
-            )
-            fuser.set_decimate_flat(
-                config["depthmap_fusion_svo_decimate_flat"]
-            )
+            fuser.set_min_weight(config["depthmap_fusion_svo_min_weight"])
+            fuser.set_num_levels(config["depthmap_fusion_svo_num_levels"])
+            fuser.set_decimate_flat(config["depthmap_fusion_svo_decimate_flat"])
             fuser.set_edge_threshold(
                 config["depthmap_fusion_svo_edge_threshold"]
             )
-            fuser.set_min_count(
-                config["depthmap_fusion_svo_min_count"]
-            )
+            fuser.set_min_count(config["depthmap_fusion_svo_min_count"])
             fuser.set_relative_min_weight(
                 config["depthmap_fusion_svo_relative_min_weight"]
             )
+            fuser.set_dsm_wall_cull_nz(config["dsm_wall_cull_nz"])
             fuser.set_device(0)
             fuser.set_bbox(sv.ext_min, sv.ext_max)
-
-            sv_views = sorted(sv.view_ids)
             n_loaded = 0
-            for sid in sv_views:
+            for sid in sorted(sv.view_ids):
                 result = view_cache.get(sid)
                 if result is None:
                     continue
@@ -2001,6 +2070,15 @@ def _fuse_per_cluster(
                     confidence=conf, name=sid,
                 )
                 n_loaded += 1
+            return fuser, n_loaded
+
+        def _fuse_subvolume(sv: _SubVolume) -> None:
+            """Fuse a sub-volume (geometry only), splitting if over budget.
+
+            Renders the DSM patch and records per-cell ownership; the ortho is
+            baked later (Pass 2) from the post-processed DSM.
+            """
+            fuser, n_loaded = _build_fuser(sv)
 
             logger.info(
                 f"  Sub-volume ({n_loaded} views), core "
@@ -2077,7 +2155,7 @@ def _fuse_per_cluster(
                 fuser.fuse_only()
                 refine_nbrs = {
                     sid: [s.id for s in best_neighbors.get(sid, [])]
-                    for sid in sv_views
+                    for sid in sorted(sv.view_ids)
                 }
                 fuser.refine_geometry(
                     iters=config[
@@ -2091,13 +2169,15 @@ def _fuse_per_cluster(
             else:
                 fuser.fuse_only()
 
-            # --- Render DSM patch for this sub-volume's core footprint ---
-            if dsm_grid is not None:
+            # --- Render DSM patch (geometry) for this leaf's core footprint;
+            #     the ortho is baked in Pass 2 from the corrected DSM. ---
+            if dsm_grid is not None and owner_grid is not None:
+                leaf_idx = len(leaves)
+                leaves.append(sv)
                 _render_dsm_patch_from_sv(
-                    fuser, sv, dsm_grid, ortho_grid,
+                    fuser, sv, dsm_grid, owner_grid, leaf_idx,
                     dsm_origin_x, dsm_origin_y, dsm_gsd,
                     dsm_w, dsm_h, dsm_z_min, dsm_z_max,
-                    config,
                 )
 
             # Always bake colors (voxels no longer store color).
@@ -2125,19 +2205,18 @@ def _fuse_per_cluster(
 
             del fuser
 
+        # --- Pass 1: build the global DSM geometry (no colour yet). ---
         for sv in subvolumes:
             _fuse_subvolume(sv)
             gc.collect()
 
-        view_cache.clear()
-
-        # --- Save DSM + ortho if enabled ---
-        # The Surface Nets mesh rasterization produces a clean, speckle-free
-        # DSM directly, but leaves no-data holes wherever the surface had no
-        # coverage.  Post-process both grids with a two-stage hole fill: tiny
-        # holes via bounded GPU diffusion, large holes via linear (Delaunay)
-        # interpolation.  The DSM is filled first so the ortho can reuse the
-        # completed surface mask.
+        # --- Finalize DSM, then bake the ortho from the CORRECTED DSM. ---
+        # Pass 1 produced the raw composited DSM + per-cell ownership.  We first
+        # post-process the DSM (fill no-data holes, then sharpen building edges
+        # with the shock filter), and only THEN bake the ortho (Pass 2): each
+        # leaf re-fuses its views and colours the cells it owns by projecting
+        # the FINAL heights into its images.  This keeps DSM↔ortho consistent
+        # and gives the ortho the sharpened edges (no bake↔DSM chicken-and-egg).
         if dsm_grid is not None:
             valid_count = int(np.count_nonzero(~np.isnan(dsm_grid)))
             logger.info(
@@ -2148,10 +2227,51 @@ def _fuse_per_cluster(
             dsm_grid = _fill_dsm_holes(dsm_grid, config)
             logger.info("  Filled DSM holes (diffuse tiny + linear large)")
 
-            if ortho_grid is not None:
+            dsm_grid = _shock_dsm_edges(dsm_grid, dsm_gsd, config)
+            logger.info("  Sharpened DSM edges (shock filter)")
+
+            # --- Pass 2: bake the ortho from the corrected DSM. ---
+            if ortho_grid is not None and owner_grid is not None:
+                n_final = int(config["ortho_bake_n_final_views"])
+                irls_iters = int(config["ortho_bake_irls_iterations"])
+                for leaf_idx, leaf_sv in enumerate(leaves):
+                    cell_mask = (owner_grid == leaf_idx) & ~np.isnan(dsm_grid)
+                    if not cell_mask.any():
+                        continue
+                    rows_idx, cols_idx = np.where(cell_mask)
+                    pts = np.empty((len(rows_idx), 3), dtype=np.float32)
+                    pts[:, 0] = dsm_origin_x + (cols_idx + 0.5) * dsm_gsd
+                    pts[:, 1] = dsm_origin_y + (rows_idx + 0.5) * dsm_gsd
+                    pts[:, 2] = dsm_grid[rows_idx, cols_idx]
+                    nrm = _dsm_point_normals(
+                        dsm_grid, rows_idx, cols_idx, dsm_gsd
+                    )
+                    baker, n_loaded = _build_fuser(leaf_sv)
+                    if n_loaded == 0:
+                        del baker
+                        continue
+                    baker.count_voxels()
+                    baker.fuse_only()
+                    colors = np.asarray(
+                        baker.bake_colors(
+                            pts, nrm, n_final=n_final, irls_iters=irls_iters
+                        ),
+                        dtype=np.uint8,
+                    )
+                    ortho_grid[rows_idx, cols_idx, :] = colors
+                    del baker
+                    gc.collect()
+                logger.info(
+                    f"  Baked ortho from corrected DSM ({len(leaves)} leaves)"
+                )
                 ortho_grid = _fill_ortho_holes(ortho_grid, dsm_grid, config)
                 logger.info(
                     "  Filled ortho holes (diffuse tiny + linear large)")
+
+                ortho_grid = _ortho_gated_median(ortho_grid, dsm_grid, config)
+                logger.info("  Despeckled ortho (gated 3x3 median)")
+
+            view_cache.clear()
 
             reference = reconstruction.reference
             data.save_dsm(
@@ -2160,11 +2280,16 @@ def _fuse_per_cluster(
             )
             logger.info(f"DSM saved to {data.dsm_file()}")
             if ortho_grid is not None:
+                # No-data (transparent) wherever the DSM has no surface, so the
+                # ortho's background is distinguishable from genuine black.
                 data.save_ortho(
                     ortho_grid, dsm_origin_x, dsm_origin_y,
                     dsm_gsd, reference,
+                    nodata_mask=np.isnan(dsm_grid),
                 )
                 logger.info(f"Ortho saved to {data.ortho_file()}")
+        else:
+            view_cache.clear()
 
         # Concatenate all sub-volume results.
         if all_points:

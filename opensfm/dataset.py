@@ -1104,8 +1104,9 @@ class UndistortedDataSet:
         origin_y: float,
         gsd: float,
         reference: Optional["geo.TopocentricConverter"] = None,
+        nodata_mask: Optional[NDArray] = None,
     ) -> None:
-        """Save an ortho image as a 3-band GeoTIFF (uint8 RGB).
+        """Save an ortho image as a GeoTIFF (uint8 RGB, optional alpha).
 
         Args:
             image: (H, W, 3) uint8 array.
@@ -1113,6 +1114,10 @@ class UndistortedDataSet:
             origin_y: Y coordinate of the bottom edge.
             gsd: ground sample distance.
             reference: topocentric reference for CRS.
+            nodata_mask: optional (H, W) bool, True where there is no surface.
+                When given, a 4th alpha band is written (0 = no-data /
+                transparent, 255 = valid) so no-data is distinguishable from a
+                genuine black pixel and GIS tools can fill it.
         """
         from osgeo import gdal, osr
 
@@ -1120,8 +1125,9 @@ class UndistortedDataSet:
         path = self.ortho_file()
         h, w = image.shape[:2]
 
+        n_bands = 4 if nodata_mask is not None else 3
         driver = gdal.GetDriverByName("GTiff")
-        ds = driver.Create(path, w, h, 3, gdal.GDT_Byte)
+        ds = driver.Create(path, w, h, n_bands, gdal.GDT_Byte)
 
         top_left_y = origin_y + h * gsd
         ds.SetGeoTransform((origin_x, gsd, 0.0, top_left_y, 0.0, -gsd))
@@ -1140,6 +1146,13 @@ class UndistortedDataSet:
             band = ds.GetRasterBand(band_idx + 1)
             band.WriteArray(flipped[:, :, band_idx])
             band.FlushCache()
+
+        if nodata_mask is not None:
+            alpha = np.where(np.flipud(nodata_mask), 0, 255).astype(np.uint8)
+            aband = ds.GetRasterBand(4)
+            aband.SetColorInterpretation(gdal.GCI_AlphaBand)
+            aband.WriteArray(alpha)
+            aband.FlushCache()
         ds = None
 
     def raw_depthmap_exists(self, image: str) -> bool:

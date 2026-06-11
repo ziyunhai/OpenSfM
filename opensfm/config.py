@@ -462,7 +462,7 @@ class OpenSfMConfig:
     # Maximum baseline angle (degrees) for neighbor selection.
     depthmap_neighbor_max_angle: float = 60.0
     # SVO voxel size in world units (meters). Smaller = finer but more memory.
-    depthmap_fusion_svo_voxel_size: float = 0.02
+    depthmap_fusion_svo_voxel_size: float = 0.05
     # SVO truncation factor: truncation_distance = factor * voxel_size.
     depthmap_fusion_svo_trunc_factor: float = 8
     # SVO minimum weight for extracting points
@@ -522,10 +522,22 @@ class OpenSfMConfig:
     dsm_method: str = "svo"
     # Ground sample distance in meters/pixel. 0 = auto from voxel size.
     dsm_gsd: float = 0.0
+    # Wall cull for the DSM mesh: a surface-net triangle is rasterized only if
+    # |cos| of its normal from vertical >= this (i.e. it is flatter than
+    # acos(dsm_wall_cull_nz) from horizontal).  Drops near-vertical wall quads
+    # that would otherwise dilate roof outlines by 1-3 px in the max-z buffer.
+    # Higher = more aggressive (sharper edges, but steep roofs lose coverage);
+    # 0 = rasterize everything (no cull).
+    dsm_wall_cull_nz: float = 0.5
     # Orthophoto color baking (svo_bake_colors): number of sharpest inlier views blended for the final color
     ortho_bake_n_final_views: int = 3
     # Tukey-biweight reweighting iterations for the robust color consensus.
     ortho_bake_irls_iterations: int = 5
+    # Gated 3x3 GPU median despeckle of the baked ortho: a pixel is replaced by
+    # the local median only when it differs from it by more than this (per-
+    # channel, 0-255), so isolated speckle is removed while real texture/edges
+    # are preserved.  0 = off.
+    ortho_median_threshold: float = 24.0
     # Post-process hole filling (DSM + ortho).  A hole's connected component
     # is "tiny" when it has <= hole_fill_small_area_max cells: those are filled
     # by bounded GPU Perona-Malik diffusion (hole_fill_diffuse_iters steps).
@@ -533,6 +545,37 @@ class OpenSfMConfig:
     # from their boundary ring.
     hole_fill_diffuse_iters: int = 64
     hole_fill_small_area_max: int = 256
+    # Only the no-data BACKGROUND (the un-reconstructed area outside the scene)
+    # is left unfilled: a DSM hole is treated as background when it BOTH touches
+    # the grid border AND exceeds this many cells.  Every other hole — enclosed
+    # at any size, or border-touching but smaller — is interpolated.  Raise if
+    # genuine large holes near the border are wrongly left as no-data.
+    hole_fill_large_area_max: int = 1_000_000
+    # Coherence-enhancing shock filter on the DSM (post-process, after hole
+    # fill).  Sharpens fattened roof/ground height ramps into steps WITHOUT the
+    # ortho (avoids the ortho<->DSM chicken-and-egg), steered by a local
+    # structure tensor so edges come out sharp AND straight.  0 iterations = off.
+    dsm_shock_iterations: int = 12
+    # Structure-tensor half-window in cells (larger = straighter / more coherent).
+    dsm_shock_window: int = 5
+    # Time step; keep <= 0.5 for stability.
+    dsm_shock_dt: float = 0.5
+    # Along-edge (tangential) diffusion weight; straightens the voxel-jittered
+    # boundary while the shock sharpens across it.  ~0.2-0.3 is the sweet spot;
+    # 0 = sharpen only (stays ragged); > ~0.35 over-sharpens / destabilizes.
+    dsm_shock_coherence: float = 0.2
+    # Edge-strength gate: the shock only fires where the local slope (rise/run =
+    # height gradient / gsd) exceeds this, so smooth gradients / gentle slopes
+    # are NOT terraced into staircases.  Building edges have slope >> 1 even when
+    # fattened; lower to sharpen gentler edges, raise to spare more terrain.
+    dsm_shock_edge_slope: float = 2.0
+    # Image-guided DSM edge snapping (joint-bilateral guided by the ortho).
+    # Superseded by the shock filter above because the baked ortho inherits the
+    # DSM's soft edges (chicken-and-egg); kept for a future SOURCE-image guide.
+    # 0 = off.
+    dsm_edge_snap_iterations: int = 0
+    dsm_edge_snap_radius: int = 4
+    dsm_edge_snap_sigma_range: float = 0.1
 
     ##################################
     # Params for multi-processing/threading

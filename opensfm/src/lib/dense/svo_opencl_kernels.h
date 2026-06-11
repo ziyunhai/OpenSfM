@@ -2082,8 +2082,25 @@ __kernel void svo_dc_vertex(
 // ---- Triangle scan-convert into the atomic max-z buffer --------------
 void dc_raster_tri(__global int* zbuf, int grid_w, int grid_h,
                    float origin_x, float origin_y, float gsd,
-                   float z_min, int max_tri_cells,
+                   float z_min, int max_tri_cells, float min_nz,
                    float3 a, float3 b, float3 c) {
+    // Wall cull: skip near-vertical triangles.  For a top-down 2.5D DSM we
+    // only want horizontal-ish surface patches (roofs/ground).  A near-vertical
+    // wall quad has a ~1-cell XY footprint but its top sits at roof height, so
+    // max-z paints roof height into the cells just outside the true roof
+    // outline -> a 1-3 px dilation / dark ortho halo.  |nz|/|n| is the cosine
+    // of the surface normal from vertical; below min_nz the patch is steeper
+    // than acos(min_nz) from horizontal -> treat as wall and drop it.
+    {
+        float ux = b.x - a.x, uy = b.y - a.y, uz = b.z - a.z;
+        float vx = c.x - a.x, vy = c.y - a.y, vz = c.z - a.z;
+        float nx = uy * vz - uz * vy;
+        float ny = uz * vx - ux * vz;
+        float nz = ux * vy - uy * vx;
+        float nlen = sqrt(nx * nx + ny * ny + nz * nz);
+        if (nlen > 1e-12f && fabs(nz) < min_nz * nlen) return;
+    }
+
     // World XY -> continuous cell coordinates.
     float ax = (a.x - origin_x) / gsd, ay = (a.y - origin_y) / gsd;
     float bx = (b.x - origin_x) / gsd, by = (b.y - origin_y) / gsd;
@@ -2143,7 +2160,8 @@ __kernel void svo_dc_raster(
     const int                 grid_w,
     const int                 grid_h,
     const float               z_min,
-    const int                 max_tri_cells)
+    const int                 max_tri_cells,
+    const float               min_nz)
 {
     uint i = get_global_id(0);
     if (i >= capacity) return;
@@ -2189,9 +2207,9 @@ __kernel void svo_dc_raster(
                               &v11)) continue;
 
         dc_raster_tri(zbuf, grid_w, grid_h, origin_x, origin_y, gsd,
-                      z_min, max_tri_cells, v00, v10, v11);
+                      z_min, max_tri_cells, min_nz, v00, v10, v11);
         dc_raster_tri(zbuf, grid_w, grid_h, origin_x, origin_y, gsd,
-                      z_min, max_tri_cells, v00, v11, v01);
+                      z_min, max_tri_cells, min_nz, v00, v11, v01);
     }
 }
 

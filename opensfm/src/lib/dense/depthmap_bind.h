@@ -264,6 +264,7 @@ class SVOFuserWrapper {
   void SetEdgeThreshold(float t) { sf_.SetEdgeThreshold(t); }
   void SetMinCount(int n) { sf_.SetMinCount(n); }
   void SetRelativeMinWeight(float w) { sf_.SetRelativeMinWeight(w); }
+  void SetDSMWallCullNz(float nz) { sf_.SetDSMWallCullNz(nz); }
   void SetBBox(const Vec3f& min_world, const Vec3f& max_world) {
     sf_.SetBBox(min_world, max_world);
   }
@@ -574,6 +575,210 @@ class GPUDiffuserWrapper {
                          host_valid.data());
   }
 
+  // Image-guided DSM edge snapping: joint (cross) bilateral filter of the DSM
+  // (2D float32, NaN = no-data) guided by the ortho colour (HxWx3 float in
+  // [0,1]).  Collapses fattened roof/ground height ramps onto the photo-sharp
+  // colour edge.  Self-contained (allocates its own buffers); NaN holes are
+  // preserved.  Returns the sharpened DSM (HxW float32).
+  foundation::pyarray_f SnapEdges(
+      const py::array_t<float, py::array::c_style>& dsm_np,
+      const py::array_t<float, py::array::c_style>& guide_np, int iterations,
+      int radius, float sigma_spatial, float sigma_range) {
+    if (dsm_np.ndim() != 2) {
+      throw std::invalid_argument("SnapEdges: dsm must be 2D float32");
+    }
+    const int gh = static_cast<int>(dsm_np.shape(0));
+    const int gw = static_cast<int>(dsm_np.shape(1));
+    const size_t nc = static_cast<size_t>(gh) * gw;
+    if (guide_np.size() != static_cast<ssize_t>(nc * 3)) {
+      throw std::invalid_argument("SnapEdges: guide must be HxWx3 matching dsm");
+    }
+
+    auto& dev = opencl::CLContext::Instance().Device(device_idx_);
+    cl::Program prog =
+        dev.GetOrBuildProgram("diffusion", kDiffusionKernelSource);
+    auto& ctx = dev.context();
+    auto& q = dev.queue();
+
+    // Split NaN -> validity mask (holes pass through, never seed).
+    const float* src = dsm_np.data();
+    std::vector<float> host_dsm(nc);
+    std::vector<uint8_t> host_valid(nc);
+    for (size_t i = 0; i < nc; ++i) {
+      if (std::isnan(src[i])) {
+        host_dsm[i] = NAN;
+        host_valid[i] = 0;
+      } else {
+        host_dsm[i] = src[i];
+        host_valid[i] = 1;
+      }
+    }
+
+    cl::Buffer a(ctx, CL_MEM_READ_WRITE, nc * sizeof(float));
+    cl::Buffer b(ctx, CL_MEM_READ_WRITE, nc * sizeof(float));
+    cl::Buffer cl_valid(ctx, CL_MEM_READ_WRITE, nc * sizeof(uint8_t));
+    cl::Buffer cl_guide(ctx, CL_MEM_READ_ONLY, nc * 3 * sizeof(float));
+    q.enqueueWriteBuffer(a, CL_TRUE, 0, nc * sizeof(float), host_dsm.data());
+    q.enqueueWriteBuffer(cl_valid, CL_TRUE, 0, nc * sizeof(uint8_t),
+                         host_valid.data());
+    q.enqueueWriteBuffer(cl_guide, CL_TRUE, 0, nc * 3 * sizeof(float),
+                         const_cast<float*>(guide_np.data()));
+
+    const float inv_s = 1.0f / (2.0f * sigma_spatial * sigma_spatial);
+    const float inv_r = 1.0f / (2.0f * sigma_range * sigma_range);
+    const size_t gx = ((static_cast<size_t>(gw) + 15) / 16) * 16;
+    const size_t gy = ((static_cast<size_t>(gh) + 15) / 16) * 16;
+
+    cl::Buffer* s = &a;
+    cl::Buffer* d = &b;
+    {
+      py::gil_scoped_release release;
+      for (int it = 0; it < iterations; ++it) {
+        cl::Kernel k(prog, "dsm_joint_bilateral");
+        k.setArg(0, *s);
+        k.setArg(1, *d);
+        k.setArg(2, cl_guide);
+        k.setArg(3, cl_valid);
+        k.setArg(4, gw);
+        k.setArg(5, gh);
+        k.setArg(6, radius);
+        k.setArg(7, inv_s);
+        k.setArg(8, inv_r);
+        q.enqueueNDRangeKernel(k, cl::NullRange, cl::NDRange(gx, gy),
+                               cl::NDRange(16, 16));
+        q.finish();
+        std::swap(s, d);
+      }
+    }
+
+    std::vector<float> out(nc);
+    q.enqueueReadBuffer(*s, CL_TRUE, 0, nc * sizeof(float), out.data());
+    return foundation::py_array_from_data(out.data(), gh, gw);
+  }
+
+  // Coherence-enhancing shock filter of the DSM (2D float32, NaN = no-data).
+  // Sharpens fattened height ramps into steps without any guide (breaks the
+  // ortho<->DSM chicken-and-egg).  Self-contained; NaN cells are preserved.
+  // Returns the sharpened DSM (HxW float32).
+  foundation::pyarray_f ShockFilter(
+      const py::array_t<float, py::array::c_style>& dsm_np, int iterations,
+      int win, float dt, float coherence, float gsd, float edge_slope) {
+    if (dsm_np.ndim() != 2) {
+      throw std::invalid_argument("ShockFilter: dsm must be 2D float32");
+    }
+    const int gh = static_cast<int>(dsm_np.shape(0));
+    const int gw = static_cast<int>(dsm_np.shape(1));
+    const size_t nc = static_cast<size_t>(gh) * gw;
+
+    auto& dev = opencl::CLContext::Instance().Device(device_idx_);
+    cl::Program prog =
+        dev.GetOrBuildProgram("diffusion", kDiffusionKernelSource);
+    auto& ctx = dev.context();
+    auto& q = dev.queue();
+
+    const float* src = dsm_np.data();
+    std::vector<float> host_dsm(nc);
+    std::vector<uint8_t> host_valid(nc);
+    for (size_t i = 0; i < nc; ++i) {
+      if (std::isnan(src[i])) {
+        host_dsm[i] = NAN;
+        host_valid[i] = 0;
+      } else {
+        host_dsm[i] = src[i];
+        host_valid[i] = 1;
+      }
+    }
+
+    cl::Buffer a(ctx, CL_MEM_READ_WRITE, nc * sizeof(float));
+    cl::Buffer b(ctx, CL_MEM_READ_WRITE, nc * sizeof(float));
+    cl::Buffer cl_valid(ctx, CL_MEM_READ_WRITE, nc * sizeof(uint8_t));
+    q.enqueueWriteBuffer(a, CL_TRUE, 0, nc * sizeof(float), host_dsm.data());
+    q.enqueueWriteBuffer(cl_valid, CL_TRUE, 0, nc * sizeof(uint8_t),
+                         host_valid.data());
+
+    const size_t gx = ((static_cast<size_t>(gw) + 15) / 16) * 16;
+    const size_t gy = ((static_cast<size_t>(gh) + 15) / 16) * 16;
+    cl::Buffer* s = &a;
+    cl::Buffer* d = &b;
+    {
+      py::gil_scoped_release release;
+      for (int it = 0; it < iterations; ++it) {
+        cl::Kernel k(prog, "dsm_shock");
+        k.setArg(0, *s);
+        k.setArg(1, *d);
+        k.setArg(2, cl_valid);
+        k.setArg(3, gw);
+        k.setArg(4, gh);
+        k.setArg(5, win);
+        k.setArg(6, dt);
+        k.setArg(7, coherence);
+        k.setArg(8, gsd);
+        k.setArg(9, edge_slope);
+        q.enqueueNDRangeKernel(k, cl::NullRange, cl::NDRange(gx, gy),
+                               cl::NDRange(16, 16));
+        q.finish();
+        std::swap(s, d);
+      }
+    }
+
+    std::vector<float> out(nc);
+    q.enqueueReadBuffer(*s, CL_TRUE, 0, nc * sizeof(float), out.data());
+    return foundation::py_array_from_data(out.data(), gh, gw);
+  }
+
+  // Gated 3x3 median despeckle of an RGB ortho (HxWx3 float, 0-255), guided by
+  // a validity mask (HxW uint8, 0 = no-data passthrough).  Returns the
+  // despeckled ortho (HxWx3 float).
+  py::array_t<float> GatedMedian(
+      const py::array_t<float, py::array::c_style>& ortho_np,
+      const py::array_t<uint8_t, py::array::c_style>& valid_np,
+      float threshold) {
+    if (ortho_np.ndim() != 3 || ortho_np.shape(2) != 3) {
+      throw std::invalid_argument("GatedMedian: ortho must be HxWx3 float32");
+    }
+    const int gh = static_cast<int>(ortho_np.shape(0));
+    const int gw = static_cast<int>(ortho_np.shape(1));
+    const size_t nc = static_cast<size_t>(gh) * gw;
+    if (valid_np.size() != static_cast<ssize_t>(nc)) {
+      throw std::invalid_argument("GatedMedian: valid must be HxW matching ortho");
+    }
+
+    auto& dev = opencl::CLContext::Instance().Device(device_idx_);
+    cl::Program prog =
+        dev.GetOrBuildProgram("diffusion", kDiffusionKernelSource);
+    auto& ctx = dev.context();
+    auto& q = dev.queue();
+
+    cl::Buffer cl_in(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                     nc * 3 * sizeof(float),
+                     const_cast<float*>(ortho_np.data()));
+    cl::Buffer cl_out(ctx, CL_MEM_WRITE_ONLY, nc * 3 * sizeof(float));
+    cl::Buffer cl_valid(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                        nc * sizeof(uint8_t),
+                        const_cast<uint8_t*>(valid_np.data()));
+
+    const size_t gx = ((static_cast<size_t>(gw) + 15) / 16) * 16;
+    const size_t gy = ((static_cast<size_t>(gh) + 15) / 16) * 16;
+    {
+      py::gil_scoped_release release;
+      cl::Kernel k(prog, "ortho_gated_median");
+      k.setArg(0, cl_in);
+      k.setArg(1, cl_out);
+      k.setArg(2, cl_valid);
+      k.setArg(3, gw);
+      k.setArg(4, gh);
+      k.setArg(5, threshold);
+      q.enqueueNDRangeKernel(k, cl::NullRange, cl::NDRange(gx, gy),
+                             cl::NDRange(16, 16));
+      q.finish();
+    }
+
+    py::array_t<float> result({gh, gw, 3});
+    q.enqueueReadBuffer(cl_out, CL_TRUE, 0, nc * 3 * sizeof(float),
+                        result.mutable_data());
+    return result;
+  }
+
  private:
   int device_idx_ = 0;
   size_t ncells_ = 0;
@@ -597,6 +802,21 @@ class GPUDiffuserWrapper {
     throw std::runtime_error("GPUDiffuser: OpenCL not available");
   }
   void UploadGrid(const py::array_t<float, py::array::c_style>&) {
+    throw std::runtime_error("GPUDiffuser: OpenCL not available");
+  }
+  foundation::pyarray_f SnapEdges(
+      const py::array_t<float, py::array::c_style>&,
+      const py::array_t<float, py::array::c_style>&, int, int, float, float) {
+    throw std::runtime_error("GPUDiffuser: OpenCL not available");
+  }
+  foundation::pyarray_f ShockFilter(
+      const py::array_t<float, py::array::c_style>&, int, int, float, float,
+      float, float) {
+    throw std::runtime_error("GPUDiffuser: OpenCL not available");
+  }
+  py::array_t<float> GatedMedian(
+      const py::array_t<float, py::array::c_style>&,
+      const py::array_t<uint8_t, py::array::c_style>&, float) {
     throw std::runtime_error("GPUDiffuser: OpenCL not available");
   }
 };
