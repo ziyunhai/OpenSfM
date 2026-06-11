@@ -3,7 +3,14 @@ set -e
 
 DIR=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
 
-PYTHON=python
+if command -v python &> /dev/null; then
+   PYTHON=python
+elif command -v python3 &> /dev/null; then
+   PYTHON=python3
+else
+   echo "Error: python not found in PATH"
+   exit 1
+fi
 
 if [ "$(uname)" == "Linux" ]; then
    if [ -f "$CONDA_PREFIX/lib/libtcmalloc.so" ]; then
