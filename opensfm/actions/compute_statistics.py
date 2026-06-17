@@ -21,7 +21,8 @@ def run_dataset(data: DataSet, diagram_max_points: int = -1) -> None:
     output_path = os.path.join(data.data_path, "stats")
     data.io_handler.mkdir_p(output_path)
 
-    stats_dict = stats.compute_all_statistics(data, tracks_manager, reconstructions)
+    stats_dict = stats.compute_all_statistics(
+        data, tracks_manager, reconstructions)
 
     stats.save_residual_grids(
         data, tracks_manager, reconstructions, output_path, data.io_handler

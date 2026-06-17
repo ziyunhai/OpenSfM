@@ -243,14 +243,15 @@ def gcp_errors(
 
 def _compute_errors(
     reconstructions: List[types.Reconstruction], tracks_manager: pymap.TracksManager
-) -> Callable[[int, pymap.ErrorType], Dict[str, Dict[str, NDArray]]]:
+) -> Callable[[int, pymap.ErrorType, Optional[Tuple[str, ...]]], Dict[str, Dict[str, NDArray]]]:
     @lru_cache(10)
     def _compute_errors_cached(
-        index: int, error_type: pymap.ErrorType
+        index: int, error_type: pymap.ErrorType, shot_ids: Optional[Tuple[str, ...]] = None
     ) -> Dict[str, Dict[str, NDArray]]:
         return reconstructions[index].map.compute_reprojection_errors(
             tracks_manager,
             error_type,
+            list(shot_ids) if shot_ids is not None else []
         )
 
     return _compute_errors_cached
@@ -258,12 +259,15 @@ def _compute_errors(
 
 def _get_valid_observations(
     reconstructions: List[types.Reconstruction], tracks_manager: pymap.TracksManager
-) -> Callable[[int], Dict[str, Dict[str, pymap.Observation]]]:
+) -> Callable[[int, Optional[Tuple[str, ...]]], Dict[str, Dict[str, pymap.Observation]]]:
     @lru_cache(10)
     def _get_valid_observations_cached(
-        index: int,
+        index: int, shot_ids: Optional[Tuple[str, ...]] = None
     ) -> Dict[str, Dict[str, pymap.Observation]]:
-        return reconstructions[index].map.get_valid_observations(tracks_manager)
+        return reconstructions[index].map.get_valid_observations(
+            tracks_manager,
+            list(shot_ids) if shot_ids is not None else []
+        )
 
     return _get_valid_observations_cached
 
@@ -274,53 +278,105 @@ THist = Tuple[NDArray, NDArray]
 def _projection_error(
     tracks_manager: pymap.TracksManager, reconstructions: List[types.Reconstruction]
 ) -> Tuple[float, float, float, THist, THist, THist]:
-    all_errors_normalized, all_errors_pixels, all_errors_angular = [], [], []
-    average_error_normalized, average_error_pixels, average_error_angular = 0, 0, 0
-    for i in range(len(reconstructions)):
-        errors_normalized = _compute_errors(reconstructions, tracks_manager)(
-            i, pymap.ErrorType.Normalized
-        )
-        errors_unnormalized = _compute_errors(reconstructions, tracks_manager)(
-            i, pymap.ErrorType.Pixel
-        )
-        errors_angular = _compute_errors(reconstructions, tracks_manager)(
-            i, pymap.ErrorType.Angular
-        )
+    max_shots = 4000
 
-        for shot_id, shot_errors_normalized in errors_normalized.items():
+    # Pre-select random shots per reconstruction
+    rec_shots = []
+    for rec in reconstructions:
+        shot_ids = list(rec.shots.keys())
+        if len(shot_ids) > max_shots:
+            shot_ids = random.sample(shot_ids, max_shots)
+        rec_shots.append(tuple(shot_ids))
+
+    bins = 30
+
+    # 1. Pixel errors
+    all_errors_pixels = []
+    to_skip = defaultdict(set)
+    average_error_pixels = 0.0
+    for i in range(len(reconstructions)):
+        if not rec_shots[i]:
+            continue
+        errors_unnormalized = _compute_errors(reconstructions, tracks_manager)(
+            i, pymap.ErrorType.Pixel, rec_shots[i]
+        )
+        for shot_id, shot_errors in errors_unnormalized.items():
             shot = reconstructions[i].get_shot(shot_id)
             normalizer = max(shot.camera.width, shot.camera.height)
-
-            for error_normalized, error_unnormalized, error_angular in zip(
-                shot_errors_normalized.values(),
-                errors_unnormalized[shot_id].values(),
-                errors_angular[shot_id].values(),
-            ):
+            for lm_id, error_unnormalized in shot_errors.items():
                 norm_pixels = _norm2d(error_unnormalized * normalizer)
-                norm_normalized = _norm2d(error_normalized)
-                norm_angle = error_angular[0]
-                if norm_pixels > RESIDUAL_PIXEL_CUTOFF or math.isnan(norm_angle):
+                if norm_pixels > RESIDUAL_PIXEL_CUTOFF:
+                    to_skip[shot_id].add(lm_id)
                     continue
-                average_error_normalized += norm_normalized
                 average_error_pixels += norm_pixels
-                average_error_angular += norm_angle
-                all_errors_normalized.append(norm_normalized)
                 all_errors_pixels.append(norm_pixels)
+
+    error_count_pixels = len(all_errors_pixels)
+    avg_pixels = average_error_pixels / \
+        error_count_pixels if error_count_pixels > 0 else -1.0
+    hist_pixels = np.histogram(all_errors_pixels, bins) if error_count_pixels > 0 else (
+        np.array([]), np.array([]))
+    del all_errors_pixels
+
+    # 2. Normalized errors
+    all_errors_normalized = []
+    average_error_normalized = 0.0
+    for i in range(len(reconstructions)):
+        if not rec_shots[i]:
+            continue
+        errors_normalized = _compute_errors(reconstructions, tracks_manager)(
+            i, pymap.ErrorType.Normalized, rec_shots[i]
+        )
+        for shot_id, shot_errors in errors_normalized.items():
+            for lm_id, error_normalized in shot_errors.items():
+                if lm_id in to_skip[shot_id]:
+                    continue
+                norm_normalized = _norm2d(error_normalized)
+                average_error_normalized += norm_normalized
+                all_errors_normalized.append(norm_normalized)
+
+    error_count_normalized = len(all_errors_normalized)
+    avg_normalized = average_error_normalized / \
+        error_count_normalized if error_count_normalized > 0 else -1.0
+    hist_normalized = np.histogram(
+        all_errors_normalized, bins) if error_count_normalized > 0 else (np.array([]), np.array([]))
+    del all_errors_normalized
+
+    # 3. Angular errors
+    all_errors_angular = []
+    average_error_angular = 0.0
+    for i in range(len(reconstructions)):
+        if not rec_shots[i]:
+            continue
+        errors_angular = _compute_errors(reconstructions, tracks_manager)(
+            i, pymap.ErrorType.Angular, rec_shots[i]
+        )
+        for shot_id, shot_errors in errors_angular.items():
+            for lm_id, error_angular in shot_errors.items():
+                norm_angle = error_angular[0]
+                if math.isnan(norm_angle) or lm_id in to_skip[shot_id]:
+                    continue
+                average_error_angular += norm_angle
                 all_errors_angular.append(norm_angle)
 
-    error_count = len(all_errors_normalized)
-    if error_count == 0:
+    error_count_angular = len(all_errors_angular)
+    avg_angular = average_error_angular / \
+        error_count_angular if error_count_angular > 0 else -1.0
+    hist_angular = np.histogram(all_errors_angular, bins) if error_count_angular > 0 else (
+        np.array([]), np.array([]))
+    del all_errors_angular
+
+    if error_count_normalized == 0 and error_count_pixels == 0 and error_count_angular == 0:
         dummy = (np.array([]), np.array([]))
         return (-1.0, -1.0, -1.0, dummy, dummy, dummy)
 
-    bins = 30
     return (
-        average_error_normalized / error_count,
-        average_error_pixels / error_count,
-        average_error_angular / error_count,
-        np.histogram(all_errors_normalized, bins),
-        np.histogram(all_errors_pixels, bins),
-        np.histogram(all_errors_angular, bins),
+        avg_normalized,
+        avg_pixels,
+        avg_angular,
+        hist_normalized,
+        hist_pixels,
+        hist_angular,
     )
 
 
@@ -1161,20 +1217,25 @@ def save_residual_grids(
     io_handler: io.IoFilesystemBase,
 ) -> None:
     all_errors = {}
-
+    max_shots = 2000
     scaling = 4
+
     for rec in reconstructions:
         for camera_id in rec.cameras:
             all_errors[camera_id] = []
 
     for i in range(len(reconstructions)):
+        shot_ids = list(reconstructions[i].shots.keys())
+        ramdom_shot_ids = tuple(random.sample(
+            shot_ids, min(max_shots, len(shot_ids))))
+
         valid_observations = _get_valid_observations(
-            reconstructions, tracks_manager)(i)
+            reconstructions, tracks_manager)(i, ramdom_shot_ids)
         errors_scaled = _compute_errors(reconstructions, tracks_manager)(
-            i, pymap.ErrorType.Normalized
+            i, pymap.ErrorType.Normalized, ramdom_shot_ids
         )
         errors_unscaled = _compute_errors(reconstructions, tracks_manager)(
-            i, pymap.ErrorType.Pixel
+            i, pymap.ErrorType.Pixel, ramdom_shot_ids
         )
 
         for shot_id, shot_errors in errors_scaled.items():
@@ -1203,6 +1264,9 @@ def save_residual_grids(
 
                 shots_errors.append((x, y, error_scaled))
             all_errors[shot.camera.id] += shots_errors
+
+        del errors_scaled
+        del errors_unscaled
 
     for camera_id, errors in all_errors.items():
         if not errors:
@@ -1363,47 +1427,30 @@ def _compute_shot_footprint(
     return footprint
 
 
-_OVERLAP_GRID_SIZE = 50
-
-
-def _rasterized_overlap_ratio(
-    fp_a: NDArray, fp_b: NDArray, grid_size: int = _OVERLAP_GRID_SIZE
+def _directional_overlap_ratio(
+    fp_a: NDArray, fp_b: NDArray, direction: NDArray
 ) -> float:
-    """Compute overlap ratio by rasterizing two footprints onto a grid.
+    """Compute 1D overlap ratio by projecting footprints onto a direction vector."""
+    proj_a = fp_a @ direction
+    proj_b = fp_b @ direction
 
-    Rasterizes both quadrilateral footprints (4x2) onto a common grid and
-    computes intersection_pixels / min(pixels_a, pixels_b).
-    """
-    # Combined bounding box
-    all_pts = np.vstack([fp_a, fp_b])
-    min_x, min_y = all_pts[:, 0].min(), all_pts[:, 1].min()
-    max_x, max_y = all_pts[:, 0].max(), all_pts[:, 1].max()
-    extent_x = max_x - min_x
-    extent_y = max_y - min_y
-    if extent_x < 1e-9 or extent_y < 1e-9:
+    min_a, max_a = proj_a.min(), proj_a.max()
+    min_b, max_b = proj_b.min(), proj_b.max()
+
+    len_a = max_a - min_a
+    len_b = max_b - min_b
+
+    if len_a < 1e-9 or len_b < 1e-9:
         return 0.0
 
-    # Sample grid cell centers
-    half_dx = extent_x / grid_size / 2.0
-    half_dy = extent_y / grid_size / 2.0
-    xs = np.linspace(min_x + half_dx, max_x - half_dx, grid_size)
-    ys = np.linspace(min_y + half_dy, max_y - half_dy, grid_size)
-    xv, yv = np.meshgrid(xs, ys)
-    grid_points = np.column_stack([xv.ravel(), yv.ravel()])
+    inter_min = max(min_a, min_b)
+    inter_max = min(max_a, max_b)
 
-    path_a = MplPath(fp_a)
-    path_b = MplPath(fp_b)
-    inside_a = path_a.contains_points(grid_points)
-    inside_b = path_b.contains_points(grid_points)
-
-    count_a = int(inside_a.sum())
-    count_b = int(inside_b.sum())
-    count_inter = int((inside_a & inside_b).sum())
-
-    min_count = min(count_a, count_b)
-    if min_count == 0:
+    inter_len = inter_max - inter_min
+    if inter_len <= 0:
         return 0.0
-    return count_inter / min_count
+
+    return float(inter_len / min(len_a, len_b))
 
 
 def _compute_front_overlap(
@@ -1427,15 +1474,22 @@ def _compute_front_overlap(
         sorted_shots = sorted(
             shots_with_time, key=lambda s: s.metadata.capture_time.value
         )
+        n = len(sorted_shots)
 
         # Build list of valid consecutive pairs (both have footprints)
-        n = len(sorted_shots)
-        footprints = [_compute_shot_footprint(
-            s, ground_z) for s in sorted_shots]
+        footprints: Dict[int, NDArray] = {}
+        for i, s in enumerate(sorted_shots):
+            fp = _compute_shot_footprint(s, ground_z)
+            if fp is not None:
+                footprints[i] = fp
+
+        positions = np.array(
+            [sorted_shots[i].pose.get_origin()[:2] for i in range(n)]
+        )
 
         valid_pairs: List[Tuple[int, int]] = []
         for i in range(n - 1):
-            if footprints[i] is not None and footprints[i + 1] is not None:
+            if i in footprints and (i + 1) in footprints:
                 valid_pairs.append((i, i + 1))
 
         # Sample randomly if too many pairs
@@ -1443,8 +1497,13 @@ def _compute_front_overlap(
             valid_pairs = random.sample(valid_pairs, max_samples)
 
         for i, j in valid_pairs:
-            overlaps.append(_rasterized_overlap_ratio(
-                footprints[i], footprints[j]))
+            d = positions[j] - positions[i]
+            norm = math.sqrt(d[0]**2 + d[1]**2)
+            if norm < 1e-9:
+                continue
+            direction = d / norm
+            overlaps.append(_directional_overlap_ratio(
+                footprints[i], footprints[j], direction))
     return overlaps
 
 
@@ -1552,8 +1611,9 @@ def _compute_side_overlap(
                 alignment = abs(fd[0] * to_neighbor[0] +
                                 fd[1] * to_neighbor[1])
                 if alignment < alignment_threshold:
-                    overlap = _rasterized_overlap_ratio(
-                        footprints[idx], footprints[n_idx]
+                    ortho_dir = np.array([-fd[1], fd[0]])
+                    overlap = _directional_overlap_ratio(
+                        footprints[idx], footprints[n_idx], ortho_dir
                     )
                     overlaps.append(overlap)
                     break  # take nearest perpendicular neighbor only

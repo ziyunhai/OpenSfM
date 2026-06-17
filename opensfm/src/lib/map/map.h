@@ -208,9 +208,11 @@ class Map {
   enum ErrorType { Pixel = 0x0, Normalized = 0x1, Angular = 0x2 };
   std::unordered_map<ShotId, std::unordered_map<LandmarkId, Vec2d> >
   ComputeReprojectionErrors(const TracksManager& tracks_manager,
-                            const ErrorType& error_type) const;
+                            const ErrorType& error_type,
+                            const std::vector<ShotId>& shot_ids = std::vector<ShotId>()) const;
   std::unordered_map<ShotId, std::unordered_map<LandmarkId, Observation> >
-  GetValidObservations(const TracksManager& tracks_manager) const;
+  GetValidObservations(const TracksManager& tracks_manager,
+                       const std::vector<ShotId>& shot_ids = std::vector<ShotId>()) const;
 
  private:
   void UpdateShotWithRig(const Shot& other_shot, bool is_panoshot = false);
