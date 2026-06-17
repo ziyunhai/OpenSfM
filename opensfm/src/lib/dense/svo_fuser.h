@@ -5,6 +5,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace dense {
@@ -44,10 +45,24 @@ class SVOFuser {
   static bool IsGPUAvailable();
 
   // ------- Data -------
+  // Register a view for fusion.  The image buffers are *borrowed* via
+  // Eigen::Map (non-owning) — passing a Map copies only its pointer and
+  // dimensions, never the pixels — so the caller must keep the mapped memory
+  // alive until the last CountVoxels()/Fuse()/RefineGeometry()/
+  // PruneByVisibility()/ExtractPoints()/BakeColors()/RenderDSMOrtho() call on
+  // this fuser.  An absent optional buffer is passed as a zero-size map.
+  // Shapes (storage matches numpy C-order):
+  //   depth  : rows×cols                          (required)
+  //   normal : 3×(rows*cols), xyz interleaved      (or empty)
+  //   color  : 3×(rows*cols), rgb interleaved      (or empty)
+  //   mask   : rows×cols                           (or empty)
+  //   weight : rows×cols                           (or empty)
   void AddView(const Mat3d& K, const Mat3d& R, const Vec3d& t,
-               const ImageF& depth, const PixelData3f& normal,
-               const PixelData3u8& color, const ImageU8& mask,
-               const ImageF& weight = ImageF(), const std::string& name = "");
+               Eigen::Map<const ImageF> depth,
+               Eigen::Map<const PixelData3f> normal,
+               Eigen::Map<const PixelData3u8> color,
+               Eigen::Map<const ImageU8> mask, Eigen::Map<const ImageF> weight,
+               const std::string& name = "");
 
   // ------- Run -------
   // Count unique voxels via a GPU counting pass.
@@ -112,15 +127,35 @@ class SVOFuser {
             std::vector<Vec3<uint8_t>>* fused_colors);
 
  private:
-  // Stored views (we keep the Eigen data alive in these buffers).
+  // Stored views.  The pixel buffers are non-owning maps over memory owned by
+  // the caller (typically Python numpy arrays kept alive by the binding
+  // wrapper) — AddView borrows rather than copies, which removes a full
+  // duplicate of the cluster's depth/normal/color/mask/weight from RAM.  A
+  // null buffer maps to a zero-size view; every consumer guards on size() > 0.
   struct StoredView {
+    StoredView(const Mat3d& K_, const Mat3d& R_, const Vec3d& t_,
+               Eigen::Map<const ImageF> depth_,
+               Eigen::Map<const PixelData3f> normal_,
+               Eigen::Map<const PixelData3u8> color_,
+               Eigen::Map<const ImageU8> mask_, Eigen::Map<const ImageF> weight_,
+               std::string name_)
+        : K(K_),
+          R(R_),
+          t(t_),
+          depth(depth_),
+          normal(normal_),
+          color(color_),
+          mask(mask_),
+          weight(weight_),
+          name(std::move(name_)) {}
+
     Mat3d K, R;
     Vec3d t;
-    ImageF depth;
-    PixelData3f normal;
-    PixelData3u8 color;
-    ImageU8 mask;
-    ImageF weight;
+    Eigen::Map<const ImageF> depth;
+    Eigen::Map<const PixelData3f> normal;
+    Eigen::Map<const PixelData3u8> color;
+    Eigen::Map<const ImageU8> mask;
+    Eigen::Map<const ImageF> weight;
     std::string name;
   };
   std::vector<StoredView> views_;

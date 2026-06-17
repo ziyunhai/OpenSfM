@@ -58,20 +58,14 @@ bool SVOFuser::IsGPUAvailable() {
 }
 
 void SVOFuser::AddView(const Mat3d& K, const Mat3d& R, const Vec3d& t,
-                       const ImageF& depth, const PixelData3f& normal,
-                       const PixelData3u8& color, const ImageU8& mask,
-                       const ImageF& weight, const std::string& name) {
-  StoredView sv;
-  sv.K = K;
-  sv.R = R;
-  sv.t = t;
-  sv.depth = depth;
-  sv.normal = normal;
-  sv.color = color;
-  sv.mask = mask;
-  sv.weight = weight;
-  sv.name = name;
-  views_.push_back(std::move(sv));
+                       Eigen::Map<const ImageF> depth,
+                       Eigen::Map<const PixelData3f> normal,
+                       Eigen::Map<const PixelData3u8> color,
+                       Eigen::Map<const ImageU8> mask,
+                       Eigen::Map<const ImageF> weight,
+                       const std::string& name) {
+  // Borrow the caller's buffers (the maps are non-owning); see StoredView.
+  views_.emplace_back(K, R, t, depth, normal, color, mask, weight, name);
 }
 
 uint32_t SVOFuser::CountVoxels() {
@@ -268,43 +262,18 @@ void SVOFuser::RefineGeometry(
     cam._pad[0] = cam._pad[1] = cam._pad[2] = 0.0f;
   }
 
-  // Build packed color images (RGB interleaved, same resolution).
-  const size_t npix = static_cast<size_t>(h0) * w0;
-  std::vector<uint8_t> packed_colors(npix * 3 * n_views, 0);
+  // Borrow per-view color/mask/depth pointers; the integrator streams each
+  // slice straight to the GPU, with no full per-cluster packed copy on the
+  // host.  view_cache (and thus these maps) outlives the call.
+  std::vector<RefineViewSrc> srcs(n_views);
   for (int i = 0; i < n_views; ++i) {
     const auto& sv = views_[i];
-    if (sv.color.size() > 0) {
-      uint8_t* dst = packed_colors.data() + i * npix * 3;
-      for (size_t p = 0; p < npix; ++p) {
-        dst[p * 3 + 0] = sv.color(0, p);
-        dst[p * 3 + 1] = sv.color(1, p);
-        dst[p * 3 + 2] = sv.color(2, p);
-      }
-    }
+    srcs[i].color = (sv.color.size() > 0) ? sv.color.data() : nullptr;
+    srcs[i].mask = (sv.mask.size() > 0) ? sv.mask.data() : nullptr;
+    srcs[i].depth = sv.depth.data();
   }
 
-  // Pack validity masks (uint8, per-view contiguous).
-  std::vector<uint8_t> packed_masks(npix * n_views, 255);
-  for (int i = 0; i < n_views; ++i) {
-    const auto& sv = views_[i];
-    if (sv.mask.size() > 0) {
-      uint8_t* dst = packed_masks.data() + i * npix;
-      std::memcpy(dst, sv.mask.data(), npix);
-    }
-  }
-
-  // Pack clean depth maps (float, row-major, per-view contiguous).
-  std::vector<float> packed_depths(npix * n_views, 0.0f);
-  for (int i = 0; i < n_views; ++i) {
-    const auto& sv = views_[i];
-    float* dst = packed_depths.data() + i * npix;
-    for (size_t p = 0; p < npix; ++p) {
-      dst[p] = sv.depth.data()[p];
-    }
-  }
-
-  integrator_->PrepareRefinement(cameras, packed_colors, packed_masks,
-                                 packed_depths, w0, h0, n_views);
+  integrator_->PrepareRefinement(cameras, srcs, w0, h0, n_views);
 
   constexpr int kMaxRefineNeighbors = 4;
   std::vector<int32_t> neighbor_data;
@@ -377,7 +346,6 @@ void SVOFuser::BakeColors(std::vector<Vec3f>& points,
   const int n_views = static_cast<int>(views_.size());
   const int h0 = static_cast<int>(views_[0].depth.rows());
   const int w0 = static_cast<int>(views_[0].depth.cols());
-  const size_t npix = static_cast<size_t>(h0) * w0;
 
   // Build camera array.
   std::vector<SVOCameraGPU> cameras(n_views);
@@ -408,42 +376,17 @@ void SVOFuser::BakeColors(std::vector<Vec3f>& points,
     cam._pad[0] = cam._pad[1] = cam._pad[2] = 0.0f;
   }
 
-  // Build packed color images.
-  std::vector<uint8_t> packed_colors(npix * 3 * n_views, 0);
+  // Borrow per-view color/mask/depth pointers (streamed per-slice in
+  // PrepareRefinement) — no full per-cluster packed host copy.
+  std::vector<RefineViewSrc> srcs(n_views);
   for (int i = 0; i < n_views; ++i) {
     const auto& sv = views_[i];
-    if (sv.color.size() > 0) {
-      uint8_t* dst = packed_colors.data() + i * npix * 3;
-      for (size_t p = 0; p < npix; ++p) {
-        dst[p * 3 + 0] = sv.color(0, p);
-        dst[p * 3 + 1] = sv.color(1, p);
-        dst[p * 3 + 2] = sv.color(2, p);
-      }
-    }
+    srcs[i].color = (sv.color.size() > 0) ? sv.color.data() : nullptr;
+    srcs[i].mask = (sv.mask.size() > 0) ? sv.mask.data() : nullptr;
+    srcs[i].depth = sv.depth.data();
   }
 
-  // Pack validity masks.
-  std::vector<uint8_t> packed_masks(npix * n_views, 255);
-  for (int i = 0; i < n_views; ++i) {
-    const auto& sv = views_[i];
-    if (sv.mask.size() > 0) {
-      uint8_t* dst = packed_masks.data() + i * npix;
-      std::memcpy(dst, sv.mask.data(), npix);
-    }
-  }
-
-  // Pack clean depth maps for PrepareRefinement.
-  std::vector<float> packed_depths(npix * n_views, 0.0f);
-  for (int i = 0; i < n_views; ++i) {
-    const auto& sv = views_[i];
-    float* dst = packed_depths.data() + i * npix;
-    for (size_t p = 0; p < npix; ++p) {
-      dst[p] = sv.depth.data()[p];
-    }
-  }
-
-  integrator_->PrepareRefinement(cameras, packed_colors, packed_masks,
-                                 packed_depths, w0, h0, n_views);
+  integrator_->PrepareRefinement(cameras, srcs, w0, h0, n_views);
   integrator_->BakeColors(points, normals, colors, n_final, irls_iters,
                           relax_occ);
 }

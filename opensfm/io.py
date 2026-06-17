@@ -1100,17 +1100,31 @@ def point_cloud_from_ply(
     return points, normals, colors, labels
 
 
-def point_cloud_to_ply(
-    points: NDArray,
-    normals: NDArray,
-    colors: NDArray,
-    labels: NDArray,
-    fp: BinaryIO,
-) -> None:
-    header = (
+def read_ply_vertex_count(fp: BinaryIO) -> int:
+    """Read only the header of a PLY stream and return its vertex count.
+
+    Leaves the stream positioned at the start of the binary body, so this
+    is cheap (reads a few header lines, not the point data).
+    """
+    n = 0
+    while True:
+        raw = fp.readline()
+        if not raw:
+            break
+        line = raw.decode("ascii").rstrip("\r\n")
+        if line.startswith("element vertex "):
+            n = int(line.split()[-1])
+        if line == "end_header":
+            break
+    return n
+
+
+def _ply_header(count_vertices: int) -> str:
+    """Binary little-endian PLY header for the dense point-cloud layout."""
+    return (
         "ply\n"
         "format binary_little_endian 1.0\n"
-        f"element vertex {len(points)}\n"
+        f"element vertex {count_vertices}\n"
         "property float x\n"
         "property float y\n"
         "property float z\n"
@@ -1123,22 +1137,45 @@ def point_cloud_to_ply(
         "property uchar class\n"
         "end_header\n"
     )
-    fp.write(header.encode("ascii"))
 
+
+def pack_point_cloud_rows(
+    points: NDArray,
+    normals: NDArray,
+    colors: NDArray,
+    labels: NDArray,
+) -> bytes:
+    """Pack a point cloud into the 28-byte/row binary PLY body layout.
+
+    Each row is 6 floats (xyz + nxnynz) + 4 uint8 (rgb + class).  Returns
+    the raw body bytes (no header).
+    """
     n = len(points)
     if n == 0:
-        return
+        return b""
     pts = np.asarray(points, dtype="<f4")
     nrm = np.asarray(normals, dtype="<f4")
     col = np.asarray(colors, dtype=np.uint8)
     lbl = np.asarray(labels, dtype=np.uint8).reshape(n, 1)
-    # Pack each row: 6 floats (xyz + nxnynz) + 4 bytes (rgb + class)
     row_buf = np.empty(n, dtype=np.dtype([("f", "<f4", 6), ("c", "u1", 4)]))
     row_buf["f"][:, :3] = pts
     row_buf["f"][:, 3:] = nrm
     row_buf["c"][:, :3] = col
     row_buf["c"][:, 3:] = lbl
-    fp.write(row_buf.tobytes())
+    return row_buf.tobytes()
+
+
+def point_cloud_to_ply(
+    points: NDArray,
+    normals: NDArray,
+    colors: NDArray,
+    labels: NDArray,
+    fp: BinaryIO,
+) -> None:
+    fp.write(_ply_header(len(points)).encode("ascii"))
+    if len(points) == 0:
+        return
+    fp.write(pack_point_cloud_rows(points, normals, colors, labels))
 
 
 # Filesystem interaction methods

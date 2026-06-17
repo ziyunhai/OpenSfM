@@ -263,10 +263,18 @@ def compute_depthmaps(
 
     context.log_memory("phase 2 cleaning done")
 
-    # Remove raw depthmaps — no longer needed after cleaning.
-    # for sid in processable:
-    #     data.io_handler.rm_if_exist(data.depthmap_file(sid, "raw.npz"))
-    # logger.info("Removed raw depthmaps")
+    # Reclaim raw depthmaps — they are consumed only by the cleaning phase.
+    # Delete a raw map only once its clean counterpart exists on disk, so a
+    # cluster that failed to clean keeps its raw map for a resumed re-run.
+    if config.get("depthmap_delete_raw_after_clean", True):
+        removed = 0
+        for sid in processable:
+            if data.raw_depthmap_exists(sid) and data.clean_depthmap_exists(sid):
+                data.io_handler.rm_if_exist(data.depthmap_file(sid, "raw.npz"))
+                removed += 1
+        if removed:
+            logger.info(f"Removed {removed} raw depthmap(s) after cleaning")
+        context.log_memory("raw depthmaps reclaimed")
 
     # ── 6.  Phase 3: Per-cluster fusion with N-hop neighbors ──────────
     #   Each cluster loads its cleaned depthmaps from disk on-demand.
@@ -282,6 +290,9 @@ def compute_depthmaps(
     _merge_fusion_batches(data, list(range(len(clusters))))
 
     context.log_memory("phase 4 merge done")
+
+    # Optionally also export the merged cloud as LAS / LAZ (archival/interchange).
+    _export_pointcloud_formats(data, config)
 
     # Build octree tiles for the viewer.
     _export_octree_tiles(data, config)
@@ -1901,20 +1912,34 @@ def _fuse_per_cluster(
 
             # I/O-heavy: load all clean depthmaps in parallel.
             loaded = data.load_clean_depthmaps_parallel(loadable)
+            loaded = [(d, n, c) for (d, n, _s, c) in loaded]
 
             # Load validity masks in parallel.
             vmask_map = data.load_undistorted_validity_masks_parallel(
                 loadable,
             )
 
-            # Load color images in parallel.
-            color_map = data.load_undistorted_images_parallel(loadable)
+            sizes = {
+                sid: (depth.shape[1], depth.shape[0])  # (width, height)
+                for sid, (depth, _n, _c) in zip(loadable, loaded)
+            }
+
+            def _load_scaled_color(sid: str) -> Tuple[str, NDArray]:
+                w, h = sizes[sid]
+                return sid, scale_down_image(
+                    data.load_undistorted_image(sid), w, h
+                )
+
+            with ThreadPoolExecutor(
+                max_workers=data.config["io_processes"]
+            ) as pool:
+                color_map = dict(pool.map(_load_scaled_color, loadable))
 
             result: Dict[str, Tuple[
                 NDArray, NDArray, NDArray, NDArray,
                 NDArray, NDArray, NDArray, Optional[NDArray],
             ]] = {}
-            for sid, (depth, normal, _score, confidence) in zip(
+            for sid, (depth, normal, confidence) in zip(
                 loadable, loaded,
             ):
                 h, w = depth.shape[:2]
@@ -1958,8 +1983,7 @@ def _fuse_per_cluster(
 
                 vmask = (combined.reshape(h, w).astype(np.uint8)) * 255
 
-                color = color_map[sid]
-                color = scale_down_image(color, w, h)
+                color = color_map[sid]  # pre-scaled to (w, h) at load time
 
                 result[sid] = (
                     K, R, t, depth, normal, color, vmask, confidence,
@@ -2019,7 +2043,7 @@ def _fuse_per_cluster(
         leaves: List["_SubVolume"] = []
 
         # --- DSM/ortho grid (populated per sub-volume if svo method) ---
-        dsm_enabled = config.get("dsm_method", "triangles") == "svo"
+        dsm_enabled = config["dsm_enabled"]
         dsm_gsd: float = config.get("dsm_gsd", 0.0)
         if dsm_gsd <= 0.0:
             dsm_gsd = voxel_size
@@ -2071,6 +2095,7 @@ def _fuse_per_cluster(
         logger.info(
             f"Cluster {batch_num}: loaded {len(view_cache)} views"
         )
+        context.log_memory(f"cluster {batch_num}: views loaded")
 
         def _build_fuser(
             sv: "_SubVolume",
@@ -2553,69 +2578,85 @@ def _merge_fusion_batches(
     data: UndistortedDataSet,
     batch_nums: List[int],
 ) -> None:
-    """Concatenate all batch PLYs into the final ``fused.ply``.
+    """Stream all batch PLYs into the final ``fused.ply``.
 
-    Batch PLYs are loaded in parallel to overlap I/O.  After
-    concatenation the per-batch arrays are released immediately.
+    Each batch is loaded, appended to the output stream, and released
+    before the next is read, so peak memory is one batch — not the whole
+    merged cloud (which previously had to be held twice across the
+    ``np.concatenate``).  The output is byte-identical to the old path.
+
+    When ``depthmap_delete_fusion_batches`` is set (default), the per-batch
+    PLYs are deleted once the complete ``fused.ply`` has been written; they
+    are fully consumed here and redundant afterwards.
     """
     if not batch_nums:
         logger.warning("No fusion batches to merge.")
         return
 
-    def _load_batch(
-        batch_num: int,
-    ) -> Tuple[int, NDArray, NDArray, NDArray, NDArray] | None:
-        filename = f"fused_batch_{batch_num:04d}.ply"
-        path = data.point_cloud_file(filename)
-        if not data.io_handler.isfile(path):
-            return None
-        p, n, c, lbl = data.load_point_cloud(filename)
-        if len(p) == 0:
-            return None
-        return (batch_num, p, n, c, lbl)
+    def _batch_file(batch_num: int) -> str:
+        return f"fused_batch_{batch_num:04d}.ply"
 
-    # Load batch PLYs in parallel.
-    with ThreadPoolExecutor(
-        max_workers=min(4, len(batch_nums)), thread_name_prefix="merge"
-    ) as pool:
-        results = list(pool.map(_load_batch, sorted(batch_nums)))
+    delete_batches = data.config.get("depthmap_delete_fusion_batches", True)
 
-    all_points: List[NDArray] = []
-    all_normals: List[NDArray] = []
-    all_colors: List[NDArray] = []
-    all_labels: List[NDArray] = []
+    # Resume guard: ``fused.ply`` is only created after a *complete* write,
+    # so if it already exists but some batches are missing we are resuming
+    # an interrupted cleanup — never rebuild the final cloud from a partial
+    # batch set (which would silently drop points).
+    fused_exists = data.io_handler.isfile(data.point_cloud_file("fused.ply"))
+    present = [
+        bn for bn in sorted(batch_nums)
+        if data.io_handler.isfile(data.point_cloud_file(_batch_file(bn)))
+    ]
+    if fused_exists and len(present) < len(batch_nums):
+        logger.info(
+            "fused.ply already complete; skipping rebuild and cleaning up "
+            f"{len(present)} leftover batch PLY(s)"
+        )
+        if delete_batches:
+            for bn in present:
+                data.io_handler.rm_if_exist(
+                    data.point_cloud_file(_batch_file(bn)))
+        return
 
-    for r in results:
-        if r is not None:
-            _, p, n, c, lbl = r
-            all_points.append(p)
-            all_normals.append(n)
-            all_colors.append(c)
-            all_labels.append(lbl)
-    del results
+    # Pass 1: header-only read to get each batch's vertex count → total.
+    batch_files: List[Tuple[str, int]] = []
+    total = 0
+    for bn in present:
+        filename = _batch_file(bn)
+        with data.io_handler.open_rb(data.point_cloud_file(filename)) as fp:
+            n = io.read_ply_vertex_count(fp)
+        if n == 0:
+            continue
+        batch_files.append((filename, n))
+        total += n
 
-    if not all_points:
+    if total == 0:
         logger.warning("No points found in any batch PLY.")
         return
 
-    points = np.concatenate(all_points)
-    del all_points
-    normals_arr = np.concatenate(all_normals)
-    del all_normals
-    colors = np.concatenate(all_colors)
-    del all_colors
-    labels = np.concatenate(all_labels)
-    del all_labels
-    gc.collect()
+    # Pass 2: stream each batch into fused.ply (one batch resident at a time).
+    data.io_handler.mkdir_p(data._depthmap_path())
+    written = 0
+    with data.io_handler.open_wb(data.point_cloud_file("fused.ply")) as out:
+        out.write(io._ply_header(total).encode("ascii"))
+        for filename, _n in batch_files:
+            p, nrm, c, lbl = data.load_point_cloud(filename)
+            if len(p) == 0:
+                continue
+            out.write(io.pack_point_cloud_rows(p, nrm, c, lbl))
+            written += len(p)
+            del p, nrm, c, lbl
+            gc.collect()
 
-    data.save_point_cloud(
-        points, normals_arr, colors, labels, filename="fused.ply"
-    )
     logger.info(
-        f"Merged {len(batch_nums)} batches → fused.ply ({len(points)} points)"
+        f"Merged {len(batch_files)} batches → fused.ply ({written} points)"
     )
-    del points, normals_arr, colors, labels
-    gc.collect()
+
+    # Reclaim the now-redundant per-batch PLYs (only after the full write).
+    if delete_batches:
+        for filename, _n in batch_files:
+            data.io_handler.rm_if_exist(data.point_cloud_file(filename))
+        logger.info(f"Removed {len(batch_files)} merged batch PLY(s)")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2825,6 +2866,62 @@ def depthmap_to_ply(shot: pymap.Shot, depth: NDArray, image: NDArray) -> str:
 # ═══════════════════════════════════════════════════════════════════════
 
 
+def _export_pointcloud_formats(
+    data: UndistortedDataSet,
+    config: Dict[str, Any],
+) -> None:
+    """Stream the merged ``fused.ply`` into LAS and/or LAZ when configured.
+
+    fused.ply stays the canonical product / octree input; these are additional
+    archival/interchange copies. Conversion is chunked (bounded memory) and any
+    failure is logged without aborting the pipeline.
+    """
+    formats = []
+    if config.get("dense_pointcloud_export_las", False):
+        formats.append("las")
+    if config.get("dense_pointcloud_export_laz", False):
+        formats.append("laz")
+    if not formats:
+        return
+
+    src = data.point_cloud_file("fused.ply")
+    if not data.io_handler.isfile(src):
+        logger.warning("No fused.ply found; skipping LAS/LAZ export.")
+        return
+
+    for fmt in formats:
+        out_path = data.point_cloud_file(f"fused.{fmt}")
+        try:
+            reader = pypointcloud.open_reader(src)
+            has_normals, has_colors, has_labels = reader.attributes()
+            header = pypointcloud.PointCloudHeader()
+            header.point_count = reader.total_count
+            header.has_normals = has_normals
+            header.has_colors = has_colors
+            header.has_labels = has_labels
+            writer = pypointcloud.open_writer(out_path, header)
+
+            total = 0
+            while True:
+                chunk = reader.read_chunk(1_000_000)
+                if chunk is None:
+                    break
+                pos, nrm, col, lbl = chunk
+                kwargs: Dict[str, Any] = {}
+                if nrm is not None:
+                    kwargs["normals"] = nrm
+                if col is not None:
+                    kwargs["colors"] = col
+                if lbl is not None:
+                    kwargs["labels"] = lbl
+                writer.write_chunk(pos, **kwargs)
+                total += len(pos)
+            writer.finalize()
+            logger.info(f"Exported {total} points to fused.{fmt}")
+        except Exception:
+            logger.warning(f"Failed to export fused.{fmt}", exc_info=True)
+
+
 def _export_octree_tiles(
     data: UndistortedDataSet,
     config: Dict[str, Any],
@@ -2849,14 +2946,6 @@ def _export_octree_tiles(
 
     logger.info(f"Building octree tiles from {ply_name} …")
 
-    # Load PLY data.
-    with data.io_handler.open_rb(ply_path) as fp:
-        points, normals, colors, labels = io.point_cloud_from_ply(fp)
-
-    if len(points) == 0:
-        logger.warning("Point cloud is empty, skipping octree export.")
-        return
-
     # Output directory: next to the undistorted data, under point_cloud/.
     output_dir = os.path.join(data.data_path, "point_cloud")
     os.makedirs(output_dir, exist_ok=True)
@@ -2872,21 +2961,20 @@ def _export_octree_tiles(
         "octree_lod_sample_count", 10000
     )
 
-    # Ensure float32 contiguous arrays.
-    points = np.ascontiguousarray(points, dtype=np.float32)
-    normals = np.ascontiguousarray(normals, dtype=np.float32)
-    colors = np.ascontiguousarray(colors, dtype=np.uint8)
-
-    # No per-point radii yet — the builder will use the tile spacing.
-    radii = np.array([], dtype=np.float32)
-
-    meta = pypointcloud.build_octree(
-        positions=points,
-        normals=normals,
-        colors=colors,
-        radii=radii,
+    # Out-of-core build: the PLY is memory-mapped and processed in bounded RAM
+    # (independent of the point count), so multi-gigabyte clouds never need to
+    # be loaded into memory. Output tiles are format-identical to before.
+    meta = pypointcloud.build_octree_from_file(
+        cloud_path=ply_path,
         config=builder_config,
+        split_depth=config.get("octree_split_depth", 4),
+        max_bucket_points=config.get("octree_max_bucket_points", 8_000_000),
+        temp_dir=os.path.join(output_dir, "_ooc_tmp"),
     )
+
+    if meta.total_points == 0:
+        logger.warning("Point cloud is empty, skipping octree export.")
+        return
 
     logger.info(
         f"Octree export complete: {meta.total_points} points, depth {meta.max_depth}, {output_dir}"

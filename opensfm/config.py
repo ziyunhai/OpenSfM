@@ -430,6 +430,17 @@ class OpenSfMConfig:
     depthmap_grazing_cos_threshold: float = 0.2
     # Save per-shot raw/clean PLYs and per-cluster debug PLYs (slow, for debugging only).
     depthmap_save_debug_ply: bool = True
+    # ── Disk reclamation (intermediate depthmap/PLY cleanup) ──
+    # Delete each raw depthmap (.raw.npz) once the whole cleaning phase has
+    # produced its clean counterpart. Raw maps are only consumed by cleaning,
+    # so this is lossless; disable to keep raw maps for inspection/re-cleaning.
+    depthmap_delete_raw_after_clean: bool = True
+    # Delete per-cluster fused_batch_*.ply once they are merged into fused.ply.
+    # They are fully consumed by the merge and redundant afterwards.
+    depthmap_delete_fusion_batches: bool = True
+    # Additionally export the merged dense cloud as LAS / LAZ (next to fused.ply).
+    dense_pointcloud_export_las: bool = True
+    dense_pointcloud_export_laz: bool = True
     # Spatial sigma for bilateral NCC weighting
     depthmap_sigma_spatial: float = 1.5
     # Color sigma for bilateral NCC weighting, in normalized [0,1] intensity units.
@@ -446,9 +457,7 @@ class OpenSfMConfig:
     depthmap_gap_max_size: int = 0
     # Depth/normal smoothness weight for PatchMatch
     depthmap_smooth_weight: float = 0.2
-    # Number of views from previous iteration that are forcibly kept in the
-    # view selection (anchoring).  Prevents CDF from narrowing to only views
-    # that validate a potentially wrong hypothesis.  0 = disabled.
+    # Number of views from previous iteration that are forcibly kept in the view selection (anchoring).
     depthmap_anchor_views: int = 2
     # Weight for geometric consistency cost (0 = disabled). Applied per source view.
     depthmap_geom_consistency_weight: float = 0.05
@@ -457,7 +466,6 @@ class OpenSfMConfig:
     # Use SfM points to seed a Delaunay planar prior before PatchMatch iterations
     depthmap_sfm_planar_prior: bool = False
     # Minimum baseline angle (degrees) for neighbor selection.
-    # Views with avg baseline < this are excluded from best-neighbors.
     depthmap_neighbor_min_angle: float = 3.0
     # Maximum baseline angle (degrees) for neighbor selection.
     depthmap_neighbor_max_angle: float = 60.0
@@ -468,35 +476,23 @@ class OpenSfMConfig:
     # SVO minimum weight for extracting points
     depthmap_fusion_svo_min_weight: float = 2.0
     # Number of multi-level fill passes (1=fine only, 3=fine+2 coarser).
-    # Coarser levels fill in holes where the fine grid has no coverage.
     depthmap_fusion_svo_num_levels: int = 3
-    # Flat-surface decimation factor for extraction (1=off, 4=keep 1/4).
-    # Reduces point density on flat surfaces while preserving sharp edges.
+    # Flat-surface decimation factor for extraction (1=off, 4=keep 1/4). Reduces point density on flat surfaces while preserving sharp edges.
     depthmap_fusion_svo_decimate_flat: int = 4
-    # Edge detection threshold for decimation (0-1). Crossings with
-    # normal divergence above this are considered edges and never decimated.
+    # Edge detection threshold for decimation (0-1). Crossings with normal divergence above this are considered edges and never decimated.
     depthmap_fusion_svo_edge_threshold: float = 0.15
     # Minimum observation count for both voxels in a zero-crossing.
-    # Rejects single-view noise when min_weight is set low for recall.
     depthmap_fusion_svo_min_count: int = 2
-    # Local adaptive weight threshold (0=disabled). A crossing is only
-    # extracted if both voxels have weight >= this fraction of the local
-    # 6-neighborhood maximum weight. Allows weak areas to self-calibrate.
+    # Local adaptive weight threshold for extracting surfaces : allows weak areas to self-calibrate.
     depthmap_fusion_svo_relative_min_weight: float = 0.25
-    # Maximum unique voxels per SVO sub-volume.
-    # Clusters are spatially split so each piece stays within this budget.
-    # The GPU hash table is sized to 2x this (50% load factor).
-    # Lower = more sub-volumes but guaranteed GPU memory fit.
+    # Maximum unique voxels per SVO sub-volume : clusters are spatially split so each piece stays within this budget.
     depthmap_fusion_svo_max_voxels: int = 80_000_000
     # Number of extra neighbor shots per cluster shot for fusion augmentation.
     # Adds views from outside the cluster to improve boundary quality.
     depthmap_fusion_svo_augment_neighbors: int = 4
     # Coarse grid cell size multiplier for pre-scan (cell = factor * voxel_size).
     depthmap_fusion_svo_coarse_factor: int = 8
-    # Relative margin added to each side of the per-cluster bounding box
-    depthmap_cluster_bbox_margin: float = 0.01
-    # Photometric TSDF refinement (Pons-Keriven 2007 level-set).
-    # Enable in-place SDF refinement after SVO fusion.
+    # Photometric TSDF refinement
     depthmap_fusion_svo_refine_enabled: bool = True
     # Number of SDF refinement iterations.
     depthmap_fusion_svo_refine_iters: int = 50
@@ -512,72 +508,42 @@ class OpenSfMConfig:
     octree_max_depth: int = 15
     # Number of LOD representative points kept in each inner (non-leaf) tile
     octree_lod_sample_count: int = 10000
+    # Out-of-core octree build: octree depth at which points are bucketed to disk (bucket count <= 8^depth).
+    octree_split_depth: int = 4
+    # Out-of-core octree build: clouds with more points than this are bucketed to disk so peak
+    octree_max_bucket_points: int = 8_000_000
 
     ##################################
-    # Params for DSM (Digital Surface Model) generation
+    # Params for DSM (Digital Surface Model)and ortho generation
     ##################################
-    # DSM + ortho rendering.  "svo" extracts the surface from the fused TSDF
-    # by Surface Nets (dual contouring) and rasterizes it top-down into a
-    # max-z buffer (see svo_dc_* kernels).  Any other value disables it.
-    dsm_method: str = "svo"
+    # Controls DSM + ortho rendering.
+    dsm_enabled: bool = True
     # Ground sample distance in meters/pixel. 0 = auto from voxel size.
     dsm_gsd: float = 0.0
-    # Wall cull for the DSM mesh: a surface-net triangle is rasterized only if
-    # |cos| of its normal from vertical >= this (i.e. it is flatter than
-    # acos(dsm_wall_cull_nz) from horizontal).  Drops near-vertical wall quads
-    # that would otherwise dilate roof outlines by 1-3 px in the max-z buffer.
-    # Higher = more aggressive (sharper edges, but steep roofs lose coverage);
-    # 0 = rasterize everything (no cull).
+    # Wall cull for the DSM mesh: a surface-net triangle is rasterized only if |cos| of its normal from vertical >= this
     dsm_wall_cull_nz: float = 0.5
     # Orthophoto color baking (svo_bake_colors): number of sharpest inlier views blended for the final color
     ortho_bake_n_final_views: int = 3
     # Tukey-biweight reweighting iterations for the robust color consensus.
     ortho_bake_irls_iterations: int = 5
-    # Gated 3x3 GPU median despeckle of the baked ortho: a pixel is replaced by
-    # the local median only when it differs from it by more than this (per-
-    # channel, 0-255), so isolated speckle is removed while real texture/edges
-    # are preserved.  0 = off.
+    # Gated 3x3 median despeckle of the baked ortho: a pixel is replaced by the local median only when it differs from it by more than this
     ortho_median_threshold: float = 24.0
-    # Post-process hole filling (DSM + ortho).  A hole's connected component
-    # is "tiny" when it has <= hole_fill_small_area_max cells: those are filled
-    # by bounded GPU Perona-Malik diffusion (hole_fill_diffuse_iters steps).
-    # Larger holes are filled by per-component linear (Delaunay) interpolation
-    # from their boundary ring.
+    # DSM Post-process hole filling : a hole's connected component is "tiny" when it has <= hole_fill_small_area_max cells
     hole_fill_diffuse_iters: int = 64
+    # DSM Post-process hole filling : when a hole is "tiny", it is filled by diffusion
     hole_fill_small_area_max: int = 256
-    # Boundary handling for the DSM: the no-data EXTERIOR outside the
-    # reconstructed footprint is left as no-data (keeps the ortho transparent
-    # there), while bounded pockets / boundary concavities INSIDE the footprint
-    # are filled.  The footprint is the valid region morphologically closed by
-    # this many cells — bridging ragged-boundary concavity mouths up to ~2x this
-    # wide — then hole-filled.  Larger = fill wider boundary bays; too large
-    # merges across genuine gaps (streets/courtyards open to the exterior).
+    # DSM Post-process hole filling : hole_fill_small_area_max is exceeded, the hole is filled by linear interpolation
     hole_fill_footprint_close: int = 256
-    # Coherence-enhancing shock filter on the DSM (post-process, after hole
-    # fill).  Sharpens fattened roof/ground height ramps into steps WITHOUT the
-    # ortho (avoids the ortho<->DSM chicken-and-egg), steered by a local
-    # structure tensor so edges come out sharp AND straight.  0 iterations = off.
+    # Coherence-enhancing shock filter on the DSM that sharpens edges
     dsm_shock_iterations: int = 6
     # Structure-tensor half-window in cells (larger = straighter / more coherent).
     dsm_shock_window: int = 5
     # Time step; keep <= 0.5 for stability.
     dsm_shock_dt: float = 0.25
-    # Along-edge (tangential) diffusion weight; straightens the voxel-jittered
-    # boundary while the shock sharpens across it.  ~0.2-0.3 is the sweet spot;
-    # 0 = sharpen only (stays ragged); > ~0.35 over-sharpens / destabilizes.
+    # Along-edge (tangential) diffusion weight; straightens the voxel-jittered boundary while the shock sharpens across it.
     dsm_shock_coherence: float = 0.1
-    # Edge-strength gate: the shock only fires where the local slope (rise/run =
-    # height gradient / gsd) exceeds this, so smooth gradients / gentle slopes
-    # are NOT terraced into staircases.  Building edges have slope >> 1 even when
-    # fattened; lower to sharpen gentler edges, raise to spare more terrain.
+    # Edge-strength gate: the shock only fires where the local slope (rise/run = height gradient / gsd) exceeds this
     dsm_shock_edge_slope: float = 2.0
-    # Image-guided DSM edge snapping (joint-bilateral guided by the ortho).
-    # Superseded by the shock filter above because the baked ortho inherits the
-    # DSM's soft edges (chicken-and-egg); kept for a future SOURCE-image guide.
-    # 0 = off.
-    dsm_edge_snap_iterations: int = 0
-    dsm_edge_snap_radius: int = 4
-    dsm_edge_snap_sigma_range: float = 0.1
 
     ##################################
     # Params for multi-processing/threading

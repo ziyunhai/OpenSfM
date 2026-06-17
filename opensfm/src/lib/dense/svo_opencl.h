@@ -46,6 +46,20 @@ struct SVOCameraGPU {
 };
 static_assert(sizeof(SVOCameraGPU) == 144, "SVOCameraGPU must be 144 bytes");
 
+// Borrowed per-view image pointers for PrepareRefinement.  The buffers are
+// owned by the caller (SVOFuser's borrowed view maps) and must stay alive for
+// the duration of the call; the integrator streams each view's slice straight
+// to the GPU, so it never materialises a full per-cluster host copy.  Layout
+// matches the per-view numpy buffers (row-major, same resolution for all):
+//   color: 3*npix bytes (RGB interleaved)        or nullptr → black
+//   mask : npix bytes  (255=valid, 0=invalid)    or nullptr → all-valid
+//   depth: npix floats (row-major)               (required)
+struct RefineViewSrc {
+  const uint8_t* color;
+  const uint8_t* mask;
+  const float* depth;
+};
+
 static constexpr int kFPScale = 32768;
 static constexpr uint32_t kEmptyKey = 0xFFFFFFFFu;
 
@@ -142,14 +156,13 @@ class SVOIntegratorCL {
   // --- Photometric refinement (Pons-Keriven 2007 level-set) ---
 
   // Upload all view color images, masks, and cameras to GPU for refinement.
-  // All images must have the same resolution (img_width × img_height).
-  // packed_masks: per-pixel validity (255=valid, 0=invalid), encoded in RGBA
-  // alpha. Must be called after Initialize() + Integrate() (hash table
-  // populated).
+  // All images must have the same resolution (img_width × img_height).  Each
+  // view's color/mask/depth slice is streamed directly from the caller's
+  // borrowed buffers (see RefineViewSrc) — validity mask is encoded in the
+  // RGBA alpha channel.  Must be called after Initialize() + Integrate()
+  // (hash table populated).
   void PrepareRefinement(const std::vector<SVOCameraGPU>& cameras,
-                         const std::vector<uint8_t>& packed_colors,
-                         const std::vector<uint8_t>& packed_masks,
-                         const std::vector<float>& packed_depths, int img_width,
+                         const std::vector<RefineViewSrc>& views, int img_width,
                          int img_height, int n_views);
 
   // Run SDF-only photometric refinement (bilateral ZNCC gradient + Adam).

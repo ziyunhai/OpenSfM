@@ -1184,8 +1184,10 @@ class UndistortedDataSet:
     ) -> None:
         filepath = self.depthmap_file(image, "raw.npz")
         buf = BytesIO()
-        arrays = dict(depth=depth, plane=plane, score=score,
-                      nghbr=nghbr, nghbrs=nghbrs)
+        # ``score`` (PatchMatch cost), ``nghbr`` and ``nghbrs`` are accepted
+        # for call-site compatibility but not persisted: nothing ever reads
+        # them back (cleaning consumes only depth, plane/normal, confidence).
+        arrays = dict(depth=depth, plane=plane)
         if confidence is not None:
             arrays["confidence"] = confidence
         np.savez(buf, **arrays)
@@ -1200,9 +1202,11 @@ class UndistortedDataSet:
         o = np.load(BytesIO(raw))
         depth = o["depth"]
         plane = o["plane"]
-        score = o["score"]
-        nghbr = o["nghbr"]
-        nghbrs = o["nghbrs"]
+        # score/nghbr/nghbrs are legacy fields no longer written; tolerate
+        # both old files (present) and new ones (absent).
+        score = o["score"] if "score" in o else None
+        nghbr = o["nghbr"] if "nghbr" in o else None
+        nghbrs = o["nghbrs"] if "nghbrs" in o else None
         confidence = o["confidence"] if "confidence" in o else None
         o.close()
         return depth, plane, score, nghbr, nghbrs, confidence

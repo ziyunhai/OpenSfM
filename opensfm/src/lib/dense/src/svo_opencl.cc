@@ -892,9 +892,7 @@ void SVOIntegratorCL::ExtractFill(const cl::Buffer& fine_table,
 
 void SVOIntegratorCL::PrepareRefinement(
     const std::vector<SVOCameraGPU>& cameras,
-    const std::vector<uint8_t>& packed_colors,
-    const std::vector<uint8_t>& packed_masks,
-    const std::vector<float>& packed_depths, int img_width, int img_height,
+    const std::vector<RefineViewSrc>& views, int img_width, int img_height,
     int n_views) {
   if (capacity_ == 0) {
     throw std::runtime_error(
@@ -926,51 +924,69 @@ void SVOIntegratorCL::PrepareRefinement(
       cl::Buffer(ctx, CL_MEM_READ_WRITE, adam_bytes, nullptr, &err);
   opencl::CheckCL(err, "refine adam buffer");
 
-  // Upload color images as image2d_array_t (CL_RGBA CL_UNORM_INT8).
-  // Input packed_colors is RGB (3 bytes/pixel); expand to RGBA (4).
-  // Alpha channel = validity mask (0=invalid, 255=valid).
+  // Upload color + depth as image2d_array_t, streaming each view's slice
+  // straight from the caller's borrowed buffers via enqueueWriteImage.  This
+  // avoids materialising a full per-cluster packed copy on the host (the old
+  // path held ~3 GB of packed_colors/masks/depths + an RGBA expansion); the
+  // only host scratch now is one reused npix*4 RGBA row-block.
   const size_t npix = static_cast<size_t>(img_width) * img_height;
-  const bool has_masks = (packed_masks.size() == npix * n_views);
-  std::vector<uint8_t> rgba_data(npix * 4 * n_views);
-  for (int v = 0; v < n_views; ++v) {
-    const uint8_t* src = packed_colors.data() + v * npix * 3;
-    const uint8_t* mask = has_masks ? packed_masks.data() + v * npix : nullptr;
-    uint8_t* dst = rgba_data.data() + v * npix * 4;
-    for (size_t p = 0; p < npix; ++p) {
-      dst[p * 4 + 0] = src[p * 3 + 0];
-      dst[p * 4 + 1] = src[p * 3 + 1];
-      dst[p * 4 + 2] = src[p * 3 + 2];
-      dst[p * 4 + 3] = mask ? mask[p] : 255;
-    }
-  }
 
+  // Color: CL_RGBA CL_UNORM_INT8, alpha channel = validity mask.
   cl::ImageFormat color_fmt(CL_RGBA, CL_UNORM_INT8);
   cl_color_images_ = cl::Image2DArray(
-      ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, color_fmt,
-      static_cast<size_t>(n_views), static_cast<size_t>(img_width),
-      static_cast<size_t>(img_height), 0, 0, rgba_data.data(), &err);
+      ctx, CL_MEM_READ_ONLY, color_fmt, static_cast<cl::size_type>(n_views),
+      static_cast<cl::size_type>(img_width),
+      static_cast<cl::size_type>(img_height), 0, 0, nullptr, &err);
   opencl::CheckCL(err, "refine color image2d_array");
 
-  // Allocate TSDF-rendered depth image array, pre-filled with clean depths.
-  // The clean depths serve as initial hints for guided narrow-band raycast,
-  // avoiding blind marching from 0.1→100m (~2000 steps vs ~12 steps).
+  // TSDF-rendered depth array, pre-filled with clean depths.  The clean depths
+  // serve as initial hints for guided narrow-band raycast, avoiding blind
+  // marching from 0.1→100m (~2000 steps vs ~12 steps).
   cl::ImageFormat depth_fmt(CL_R, CL_FLOAT);
   cl_tsdf_depths_ = cl::Image2DArray(
-      ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, depth_fmt,
-      static_cast<size_t>(n_views), static_cast<size_t>(img_width),
-      static_cast<size_t>(img_height), 0, 0,
-      const_cast<float*>(packed_depths.data()), &err);
+      ctx, CL_MEM_READ_WRITE, depth_fmt, static_cast<cl::size_type>(n_views),
+      static_cast<cl::size_type>(img_width),
+      static_cast<cl::size_type>(img_height), 0, 0, nullptr, &err);
   opencl::CheckCL(err, "refine tsdf depth image2d_array");
 
   // Immutable copy of clean depths for bake occlusion (not modified by
   // refinement raycasts).  Clean depths represent the front-most surface
   // each camera actually observed — ideal for occlusion testing.
   cl_clean_depths_ = cl::Image2DArray(
-      ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, depth_fmt,
-      static_cast<size_t>(n_views), static_cast<size_t>(img_width),
-      static_cast<size_t>(img_height), 0, 0,
-      const_cast<float*>(packed_depths.data()), &err);
+      ctx, CL_MEM_READ_ONLY, depth_fmt, static_cast<cl::size_type>(n_views),
+      static_cast<cl::size_type>(img_width),
+      static_cast<cl::size_type>(img_height), 0, 0, nullptr, &err);
   opencl::CheckCL(err, "clean depth image2d_array for bake occlusion");
+
+  // One reused RGBA scratch row-block (npix*4 bytes, independent of n_views):
+  // RGB from the view's color (black if absent), alpha from its validity mask
+  // (all-valid if absent) — byte-identical to the old packed→RGBA expansion.
+  std::vector<uint8_t> rgba_slice(npix * 4);
+  const cl::array<cl::size_type, 3> region = {
+      {static_cast<cl::size_type>(img_width),
+       static_cast<cl::size_type>(img_height), 1}};
+  for (int v = 0; v < n_views; ++v) {
+    const cl::array<cl::size_type, 3> origin = {
+        {0, 0, static_cast<cl::size_type>(v)}};
+    const uint8_t* color = views[v].color;
+    const uint8_t* mask = views[v].mask;
+    for (size_t p = 0; p < npix; ++p) {
+      rgba_slice[p * 4 + 0] = color ? color[p * 3 + 0] : 0;
+      rgba_slice[p * 4 + 1] = color ? color[p * 3 + 1] : 0;
+      rgba_slice[p * 4 + 2] = color ? color[p * 3 + 2] : 0;
+      rgba_slice[p * 4 + 3] = mask ? mask[p] : 255;
+    }
+    // Blocking writes (CL_TRUE): the color write must finish before rgba_slice
+    // is overwritten for the next view; depth streams from the (stable)
+    // borrowed buffer into both the mutable and immutable depth arrays.
+    queue.enqueueWriteImage(cl_color_images_, CL_TRUE, origin, region, 0, 0,
+                            rgba_slice.data());
+    float* depth = const_cast<float*>(views[v].depth);
+    queue.enqueueWriteImage(cl_tsdf_depths_, CL_TRUE, origin, region, 0, 0,
+                            depth);
+    queue.enqueueWriteImage(cl_clean_depths_, CL_TRUE, origin, region, 0, 0,
+                            depth);
+  }
 
   // Upload camera array.
   const size_t cam_bytes = static_cast<size_t>(n_views) * sizeof(SVOCameraGPU);

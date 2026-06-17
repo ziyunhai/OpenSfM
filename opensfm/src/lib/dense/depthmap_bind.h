@@ -275,34 +275,71 @@ class SVOFuserWrapper {
     return sf_.CountVoxels();
   }
 
-  void AddView(const Mat3d& K, const Mat3d& R, const Vec3d& t,
-               Eigen::Ref<const ImageF> depth,
-               const py::array_t<float, py::array::c_style>& normal,
-               const py::array_t<uint8_t, py::array::c_style>& color,
-               Eigen::Ref<const ImageU8> mask,
-               const py::object& confidence = py::none(),
-               const std::string& name = "") {
-    const int h = static_cast<int>(depth.rows());
-    const int w = static_cast<int>(depth.cols());
-    if (normal.ndim() != 3 || normal.shape(0) != h || normal.shape(1) != w) {
+  void AddView(
+      const Mat3d& K, const Mat3d& R, const Vec3d& t,
+      const py::array_t<float, py::array::c_style | py::array::forcecast>& depth,
+      const py::array_t<float, py::array::c_style | py::array::forcecast>&
+          normal,
+      const py::array_t<uint8_t, py::array::c_style | py::array::forcecast>&
+          color,
+      const py::array_t<uint8_t, py::array::c_style | py::array::forcecast>&
+          mask,
+      const py::object& confidence = py::none(),
+      const std::string& name = "") {
+    if (depth.ndim() != 2) {
+      throw std::invalid_argument("depth must be a 2-D array.");
+    }
+    const int h = static_cast<int>(depth.shape(0));
+    const int w = static_cast<int>(depth.shape(1));
+    if (normal.ndim() != 3 || normal.shape(0) != h || normal.shape(1) != w ||
+        normal.shape(2) != 3) {
       throw std::invalid_argument(
           "depth and normal must have matching shapes.");
     }
-    if (color.ndim() != 3 || color.shape(0) != h || color.shape(1) != w) {
+    if (color.ndim() != 3 || color.shape(0) != h || color.shape(1) != w ||
+        color.shape(2) != 3) {
       throw std::invalid_argument("depth and color must have matching shapes.");
     }
-    Eigen::Map<const PixelData3f> n_e(normal.data(), 3, h * w);
-    Eigen::Map<const PixelData3u8> c_e(color.data(), 3, h * w);
+    const bool has_mask = mask.size() > 0;
+    if (has_mask &&
+        (mask.ndim() != 2 || mask.shape(0) != h || mask.shape(1) != w)) {
+      throw std::invalid_argument("depth and mask must have matching shapes.");
+    }
 
-    ImageF weight;
+    // Borrow the pixel buffers instead of copying them into the fuser: it keeps
+    // only non-owning Eigen maps over this memory.  Retain a reference to each
+    // array so it outlives every count/fuse/refine/extract/bake/render call on
+    // this fuser, even if the caller releases its own view cache first.  The
+    // c_style|forcecast arrays are already contiguous in the expected dtype (no
+    // copy); if a copy were ever needed, we retain that copy, so the mapped
+    // pointer stays valid either way.  Absent optional buffers map to size 0.
+    retained_.push_back(depth);
+    retained_.push_back(normal);
+    retained_.push_back(color);
+    if (has_mask) {
+      retained_.push_back(mask);
+    }
+
+    const float* weight_ptr = nullptr;
     if (!confidence.is_none()) {
-      auto conf_arr = confidence.cast<py::array_t<float, py::array::c_style>>();
-      if (conf_arr.ndim() == 2 && conf_arr.shape(0) == h &&
-          conf_arr.shape(1) == w) {
-        weight = Eigen::Map<const ImageF>(conf_arr.data(), h, w);
+      auto conf = confidence.cast<
+          py::array_t<float, py::array::c_style | py::array::forcecast>>();
+      if (conf.ndim() == 2 && conf.shape(0) == h && conf.shape(1) == w) {
+        retained_.push_back(conf);
+        weight_ptr = conf.data();
       }
     }
-    sf_.AddView(K, R, t, depth, n_e, c_e, mask, weight, name);
+
+    const Eigen::Index npix = static_cast<Eigen::Index>(h) * w;
+    sf_.AddView(
+        K, R, t, Eigen::Map<const ImageF>(depth.data(), h, w),
+        Eigen::Map<const PixelData3f>(normal.data(), 3, npix),
+        Eigen::Map<const PixelData3u8>(color.data(), 3, npix),
+        Eigen::Map<const ImageU8>(has_mask ? mask.data() : nullptr,
+                                  has_mask ? h : 0, has_mask ? w : 0),
+        Eigen::Map<const ImageF>(weight_ptr, weight_ptr ? h : 0,
+                                 weight_ptr ? w : 0),
+        name);
   }
 
   py::list Fuse() {
@@ -468,6 +505,10 @@ class SVOFuserWrapper {
 
  private:
   SVOFuser sf_;
+  // Keep-alive references to the numpy buffers borrowed by AddView, so they
+  // outlive the fuser (the maps inside sf_ are non-owning).  Released when this
+  // wrapper — i.e. the Python SVOFuser object — is destroyed.
+  std::vector<py::object> retained_;
 };
 
 // ---- DSM rasterizer wrapper (streaming mode-seeking + bilateral) ----

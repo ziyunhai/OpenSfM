@@ -75,4 +75,38 @@ OctreeMetadata buildOctree(const BuilderInput& input,
                            const OctreeBuilderConfig& config,
                            ProgressCallback progress = nullptr);
 
+/// Configuration for the out-of-core (file-based) builder.
+struct OocConfig {
+  /// Octree parameters (max points/tile, max depth, LOD count, output dir).
+  OctreeBuilderConfig base;
+
+  /// Shallow split depth D: points are bucketed to disk by their depth-D
+  /// octree node, then each depth-D subtree is built in-core.  Bucket count
+  /// ≤ 8^D; larger D → more, smaller buckets.
+  uint32_t splitDepth{4};
+
+  /// A bucket whose point count exceeds this is recursively re-bucketed
+  /// (deeper) rather than loaded whole, bounding per-bucket RAM.
+  uint64_t maxBucketPoints{8000000};
+
+  /// Scratch directory for bucket spill files.  Empty → use
+  /// `base.outputDir + "/_ooc_tmp"`.  Removed on completion.
+  std::string tempDir;
+};
+
+/// Build the octree tile set from a point-cloud FILE with RAM bounded
+/// independently of the point count.
+///
+/// Binary PLY is memory-mapped and read by index; LAS/LAZ are streamed (and,
+/// when needed, spilled to a temporary binary for random access).  The output
+/// tiles are format-identical to `buildOctree`.
+///
+/// @param cloudPath  Path to a .ply / .las / .laz point cloud.
+/// @param config     Out-of-core builder configuration.
+/// @param progress   Optional progress callback.
+/// @return The metadata describing the generated octree.
+OctreeMetadata buildOctreeFromFile(const std::string& cloudPath,
+                                   const OocConfig& config,
+                                   ProgressCallback progress = nullptr);
+
 }  // namespace pointcloud
