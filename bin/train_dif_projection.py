@@ -11,7 +11,8 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 
 # Add parent directory to sys.path so opensfm can be imported
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+sys.path.insert(0, os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..")))
 
 from opensfm import context, dataset, log, matching, pairs_selection
 
@@ -43,7 +44,8 @@ def load_datasets_from_json(json_file: str, default_k: int) -> List[Tuple[str, i
     if isinstance(config_data, list):
         for entry in config_data:
             if isinstance(entry, dict) and "path" in entry:
-                datasets_to_process.append((entry["path"], entry.get("k", default_k)))
+                datasets_to_process.append(
+                    (entry["path"], entry.get("k", default_k)))
             elif isinstance(entry, str):
                 datasets_to_process.append((entry, default_k))
     elif isinstance(config_data, dict):
@@ -62,7 +64,8 @@ def main() -> None:
     args = parse_args()
     log.setup()
 
-    datasets_to_process = load_datasets_from_json(args.json_file, args.default_k)
+    datasets_to_process = load_datasets_from_json(
+        args.json_file, args.default_k)
     logger.info(f"Loaded {len(datasets_to_process)} datasets to process.")
 
     processed_datasets = []
@@ -132,7 +135,8 @@ def main() -> None:
             )
 
             if len(pos_d1) == 0:
-                logger.warning(f"No positive pairs collected from dataset {path}")
+                logger.warning(
+                    f"No positive pairs collected from dataset {path}")
                 continue
 
             all_pos_d1.append(pos_d1)
@@ -144,10 +148,12 @@ def main() -> None:
             logger.info(f"Successfully collected training pairs for {path}")
 
         except Exception as e:
-            logger.exception(f"Exception raised while processing dataset {path}: {e}")
+            logger.exception(
+                f"Exception raised while processing dataset {path}: {e}")
 
     if not all_pos_d1:
-        logger.error("No training data was collected from any of the datasets.")
+        logger.error(
+            "No training data was collected from any of the datasets.")
         sys.exit(1)
 
     logger.info("Concatenating descriptors from all datasets...")
@@ -166,7 +172,7 @@ def main() -> None:
     # Train DIF projection
     logger.info("Training joint DIF binary projection...")
     P, t = matching.train_dif_projection(
-        pos_d1_total, pos_d2_total, neg_d1_total, neg_d2_total
+        pos_d1_total, pos_d2_total, neg_d1_total, neg_d2_total, clear_features_cache=True
     )
 
     # Save P and t
@@ -176,7 +182,8 @@ def main() -> None:
     os.makedirs(dif_dir, exist_ok=True)
 
     dataset_count = len(processed_datasets)
-    k_values = [entry[1] for entry in datasets_to_process if entry[0] in processed_datasets]
+    k_values = [entry[1]
+                for entry in datasets_to_process if entry[0] in processed_datasets]
     if len(set(k_values)) == 1:
         K_filename = k_values[0]
     else:

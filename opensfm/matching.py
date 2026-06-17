@@ -1,6 +1,10 @@
 # pyre-strict
+import gc
 import logging
 import time
+import os
+import glob
+
 from concurrent.futures import ThreadPoolExecutor
 
 from timeit import default_timer as timer
@@ -1219,9 +1223,6 @@ def generate_binary_cache(
         exifs: Dict mapping image names to their EXIF metadata.
         poses: Dict mapping image names to their poses.
     """
-    import os
-    import glob
-
     descriptor_used = config.get("feature_type", "HAHOG")
     dif_dir = os.path.join(os.path.dirname(__file__), "data", "dif")
     P, t = None, None
@@ -1246,16 +1247,19 @@ def generate_binary_cache(
             if candidates:
                 candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
                 best_file = candidates[0][2]
-                logger.info("Loading pre-trained DIF projection from %s", best_file)
+                logger.info(
+                    "Loading pre-trained DIF projection from %s", best_file)
                 try:
                     loaded = np.load(best_file)
                     P = loaded["P"]
                     t = loaded["t"]
                 except Exception as e:
-                    logger.error("Failed to load pre-trained binary projection from %s: %s", best_file, str(e))
+                    logger.error(
+                        "Failed to load pre-trained binary projection from %s: %s", best_file, str(e))
 
     if P is None or t is None:
-        logger.info("Pre-trained projection not found or failed to load. Falling back to runtime training.")
+        logger.info(
+            "Pre-trained projection not found or failed to load. Falling back to runtime training.")
         n_sample = min(config.get(
             "binary_training_pairs", 100), len(pairs))
         rng = np.random.RandomState(42)
@@ -1413,6 +1417,7 @@ def train_dif_projection(
     neg_d2: NDArray,
     n_bits: int = 128,
     alpha: float = 10.0,
+    clear_features_cache: bool = False,
 ) -> Tuple[NDArray, NDArray]:
     """Train DIF binary projection from positive and negative descriptor pairs.
 
@@ -1448,6 +1453,16 @@ def train_dif_projection(
     m = sigma_neg - alpha * sigma_pos
     eigenvalues, eigenvectors = np.linalg.eigh(m)
 
+    logger.info(
+        "DIF projection: eigenvalues range [%.4f, %.4f], alpha=%.1f",
+        eigenvalues.min(), eigenvalues.max(), alpha,
+    )
+
+    if clear_features_cache:
+        clear_cache()
+    del sigma_pos, sigma_neg, diff_pos, diff_neg, m
+    gc.collect()
+
     # eigh returns ascending order; take the n_bits largest
     idx = np.argsort(eigenvalues)[::-1][:n_bits]
     P = eigenvectors[:, idx].T.astype(np.float32)  # (n_bits, D)
@@ -1480,9 +1495,15 @@ def optimize_dif_thresholds(
     proj_n1 = (P @ neg_d1.T).astype(np.float64)  # (n_bits, N_neg)
     proj_n2 = (P @ neg_d2.T).astype(np.float64)
 
+    logger.info(
+        "Optimizing DIF thresholds for %d bits using %d bins",
+        n_bits, n_bins,
+    )
+
     t = np.zeros(n_bits, dtype=np.float32)
 
     for i in range(n_bits):
+        logger.info("Optimizing threshold for bit %d/%d", i + 1, n_bits)
         yp1, yp2 = proj_p1[i], proj_p2[i]
         yn1, yn2 = proj_n1[i], proj_n2[i]
 
@@ -1515,6 +1536,7 @@ def optimize_dif_thresholds(
         # at P·x = -t.  So the additive term must be t = -c.
         t[i] = -candidates[np.argmax(score)]
 
+    logger.info("DIF thresholds optimized successfully")
     return t
 
 
