@@ -72,9 +72,12 @@ class SVOFuser {
   // top-n_final, resolution-weighted linear blend of the sharpest inlier
   // views.  Must be called after ExtractPoints() fills points/normals.
   // Mutates colors in-place.
+  // |relax_occ|: optional per-point flags (size M); where non-zero, the
+  // occlusion test is skipped (interpolated filled-DSM cells).
   void BakeColors(std::vector<Vec3f>& points, std::vector<Vec3f>& normals,
                   std::vector<Vec3<uint8_t>>* colors, int n_final = 2,
-                  int irls_iters = 3);
+                  int irls_iters = 3,
+                  const std::vector<uint8_t>* relax_occ = nullptr);
 
   // Visibility-based pruning of the TSDF hash table.
   // Raycasts the hash table from each integrated view, compares with its

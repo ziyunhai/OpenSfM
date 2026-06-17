@@ -422,7 +422,7 @@ class SVOFuserWrapper {
   py::array_t<uint8_t> BakeColorsStandalone(
       const py::array_t<float, py::array::c_style>& points,
       const py::array_t<float, py::array::c_style>& normals, int n_final,
-      int irls_iters) {
+      int irls_iters, const py::object& relax_occlusion) {
     if (points.ndim() != 2 || points.shape(1) != 3) {
       throw std::invalid_argument("points must be (N, 3)");
     }
@@ -440,11 +440,24 @@ class SVOFuserWrapper {
     std::memcpy(pts.data(), points.data(), n * 3 * sizeof(float));
     std::memcpy(nrm.data(), normals.data(), n * 3 * sizeof(float));
 
+    // Optional per-point occlusion-relax flags (1 = skip occlusion test).
+    std::vector<uint8_t> relax;
+    if (!relax_occlusion.is_none()) {
+      auto arr =
+          relax_occlusion.cast<py::array_t<uint8_t, py::array::c_style>>();
+      if (static_cast<int>(arr.size()) != n) {
+        throw std::invalid_argument("relax_occlusion must have length N");
+      }
+      relax.resize(n);
+      std::memcpy(relax.data(), arr.data(), n);
+    }
+
     std::vector<Vec3<uint8_t>> colors(n, Vec3<uint8_t>(128, 128, 128));
 
     {
       py::gil_scoped_release release;
-      sf_.BakeColors(pts, nrm, &colors, n_final, irls_iters);
+      sf_.BakeColors(pts, nrm, &colors, n_final, irls_iters,
+                     relax.empty() ? nullptr : &relax);
     }
 
     py::array_t<uint8_t> colors_arr({n, 3});

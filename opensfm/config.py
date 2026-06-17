@@ -552,20 +552,20 @@ class OpenSfMConfig:
     # this many cells — bridging ragged-boundary concavity mouths up to ~2x this
     # wide — then hole-filled.  Larger = fill wider boundary bays; too large
     # merges across genuine gaps (streets/courtyards open to the exterior).
-    hole_fill_footprint_close: int = 24
+    hole_fill_footprint_close: int = 256
     # Coherence-enhancing shock filter on the DSM (post-process, after hole
     # fill).  Sharpens fattened roof/ground height ramps into steps WITHOUT the
     # ortho (avoids the ortho<->DSM chicken-and-egg), steered by a local
     # structure tensor so edges come out sharp AND straight.  0 iterations = off.
-    dsm_shock_iterations: int = 12
+    dsm_shock_iterations: int = 6
     # Structure-tensor half-window in cells (larger = straighter / more coherent).
     dsm_shock_window: int = 5
     # Time step; keep <= 0.5 for stability.
-    dsm_shock_dt: float = 0.5
+    dsm_shock_dt: float = 0.25
     # Along-edge (tangential) diffusion weight; straightens the voxel-jittered
     # boundary while the shock sharpens across it.  ~0.2-0.3 is the sweet spot;
     # 0 = sharpen only (stays ragged); > ~0.35 over-sharpens / destabilizes.
-    dsm_shock_coherence: float = 0.2
+    dsm_shock_coherence: float = 0.1
     # Edge-strength gate: the shock only fires where the local slope (rise/run =
     # height gradient / gsd) exceeds this, so smooth gradients / gentle slopes
     # are NOT terraced into staircases.  Building edges have slope >> 1 even when

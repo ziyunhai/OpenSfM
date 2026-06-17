@@ -103,7 +103,6 @@ def compute_depthmaps(
         logger.info(
             f"Cluster assignments saved to {data.clusters_file()}")
 
-    clusters = clusters[1:2]
     # ── 1b. Per-cluster bounding boxes ─────────────────────────────────
     cluster_bboxes: List[Tuple[NDArray, NDArray]] = [
         _compute_cluster_bbox(cl, graph, reconstruction) for cl in clusters
@@ -1460,6 +1459,7 @@ def _linear_fill_components(
     fill_ids: NDArray,
     sample_valid: NDArray,
     ring_iters: int = 3,
+    extrap_out: Optional[NDArray] = None,
 ) -> None:
     """Fill large hole components by linear (Delaunay) interpolation.
 
@@ -1469,6 +1469,10 @@ def _linear_fill_components(
     Cells outside the ring's convex hull fall back to nearest-neighbour.
     Works per-component so colours/heights never bleed between holes.
     ``grid`` (``(H,W)`` or ``(H,W,C)`` float) is modified in place.
+
+    ``extrap_out`` (bool ``(H,W)``, optional): set True at cells that fell back
+    to nearest-neighbour (outside the convex hull) — i.e. EXTRAPOLATED, hence
+    geometrically unreliable (typically the open side of boundary concavities).
     """
     from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
 
@@ -1511,6 +1515,8 @@ def _linear_fill_components(
         )
         if np.any(bad):
             filled[bad] = NearestNDInterpolator(pts, vals)(q[bad])
+            if extrap_out is not None:
+                extrap_out[y0:y1, x0:x1][qy[bad], qx[bad]] = True
 
         if multichannel:
             sub_grid[qy, qx, :] = filled.astype(grid.dtype)
@@ -1528,7 +1534,7 @@ def _fill_holes_2pass(
     kappa: float,
     dt: float,
     device: int = 0,
-) -> NDArray:
+) -> Tuple[NDArray, NDArray]:
     """Two-stage hole fill on a float grid (post-process).
 
     Stage 1 — tiny holes (connected components <= ``small_area_max`` cells):
@@ -1545,15 +1551,17 @@ def _fill_holes_2pass(
                       filled — the caller is responsible for excluding the
                       genuine no-data exterior (DSM: the footprint test; ortho:
                       ``has_dsm``).
-    Returns a filled copy (float32).
+    Returns ``(filled_copy_float32, extrapolated_mask_bool)`` where the second
+    is True at cells filled by nearest-neighbour extrapolation (unreliable).
     """
     out = values.astype(np.float32, copy=True)
+    extrap = np.zeros(values.shape[:2], dtype=bool)
     if not hole_mask.any():
-        return out
+        return out, extrap
 
     labels, n_comp = ndimage.label(hole_mask)
     if n_comp == 0:
-        return out
+        return out, extrap
 
     comp_size = np.bincount(labels.ravel())
     small_mask = hole_mask & (comp_size[labels] <= small_area_max)
@@ -1609,9 +1617,11 @@ def _fill_holes_2pass(
     )
 
     if stage2_ids.size:
-        _linear_fill_components(out, labels, stage2_ids, stage2_valid)
+        _linear_fill_components(
+            out, labels, stage2_ids, stage2_valid, extrap_out=extrap
+        )
 
-    return out
+    return out, extrap
 
 
 def _dsm_footprint(valid: NDArray, close_iters: int) -> NDArray:
@@ -1631,20 +1641,27 @@ def _dsm_footprint(valid: NDArray, close_iters: int) -> NDArray:
     return ndimage.binary_fill_holes(closed)
 
 
-def _fill_dsm_holes(dsm_grid: NDArray, config: Dict[str, Any]) -> NDArray:
+def _fill_dsm_holes(
+    dsm_grid: NDArray, config: Dict[str, Any]
+) -> Tuple[NDArray, NDArray]:
     """Fill DSM no-data holes that lie INSIDE the reconstructed footprint: tiny
     ones by edge-aware GPU diffusion, larger pockets/boundary concavities by
     per-component linear (Delaunay) interpolation.  The no-data EXTERIOR outside
     the footprint is kept as no-data (so the ortho stays transparent there).
+
+    Returns ``(filled_dsm, extrapolated_mask)`` — the mask marks cells filled by
+    nearest-neighbour extrapolation (unreliable geometry, e.g. the open side of
+    boundary concavities); the ortho bake must NOT mask-relax those.
     """
     valid = ~np.isnan(dsm_grid)
+    empty = np.zeros(dsm_grid.shape, dtype=bool)
     if valid.all() or not valid.any():
-        return dsm_grid
+        return dsm_grid, empty
 
     footprint = _dsm_footprint(valid, int(config["hole_fill_footprint_close"]))
     fillable = (~valid) & footprint
     if not fillable.any():
-        return dsm_grid
+        return dsm_grid, empty
 
     return _fill_holes_2pass(
         dsm_grid,
@@ -1657,48 +1674,31 @@ def _fill_dsm_holes(dsm_grid: NDArray, config: Dict[str, Any]) -> NDArray:
     )
 
 
-def _propagate_owner_into_filled(
-    owner_grid: NDArray, dsm_grid: NDArray
-) -> None:
-    """Give the newly-filled (interpolated) DSM cells an owner leaf.
-
-    A filled pocket cell has no owner (``owner_grid < 0``) but now carries a
-    height; assign it to the leaf that owns the nearest reconstructed cell so the
-    Pass-2 ortho bake reprojects real image colour onto it (rather than leaving
-    it for colour-domain interpolation).  ``owner_grid`` is modified in place;
-    work is cropped to the filled region's bounding box.
-    """
-    fill_mask = (owner_grid < 0) & ~np.isnan(dsm_grid)
-    if not fill_mask.any():
-        return
-    ys, xs = np.nonzero(fill_mask)
-    y0, y1 = int(ys.min()), int(ys.max()) + 1
-    x0, x1 = int(xs.min()), int(xs.max()) + 1
-    owner_sub = owner_grid[y0:y1, x0:x1]  # a view → writes propagate
-    have_owner = owner_sub >= 0
-    if not have_owner.any():
-        return
-    _, (iy, ix) = ndimage.distance_transform_edt(
-        ~have_owner, return_indices=True
-    )
-    sub_fill = fill_mask[y0:y1, x0:x1]
-    owner_sub[sub_fill] = owner_sub[iy[sub_fill], ix[sub_fill]]
-
-
 def _fill_ortho_holes(
-    ortho_grid: NDArray, dsm_grid: NDArray, config: Dict[str, Any]
+    ortho_grid: NDArray,
+    dsm_grid: NDArray,
+    config: Dict[str, Any],
+    baked_mask: Optional[NDArray] = None,
 ) -> NDArray:
     """Residual ortho colour fill: cells where a DSM surface exists but the bake
     produced no colour (occluded in every view → black).  Most filled-DSM cells
     are coloured by the Pass-2 reprojection bake; this only mops up the few the
     bake could not see.  Tiny holes by (near-isotropic) GPU diffusion, larger
-    ones by linear interpolation.  Cells with no DSM stay untouched (black)."""
+    ones by linear interpolation.  Cells with no DSM stay untouched (black).
+
+    ``baked_mask`` (if given) marks cells that received a real bake; only the
+    complement (DSM but not baked) is filled, and the fill is seeded from the
+    baked cells — so a successfully-baked cell is never overwritten, even a
+    legitimately dark one.  Falls back to ``ortho.sum > 0`` when not provided."""
     has_dsm = ~np.isnan(dsm_grid)
-    has_color = has_dsm & (ortho_grid.sum(axis=2) > 0)
+    if baked_mask is not None:
+        has_color = has_dsm & baked_mask
+    else:
+        has_color = has_dsm & (ortho_grid.sum(axis=2) > 0)
     fillable = has_dsm & ~has_color
     if not fillable.any():
         return ortho_grid
-    filled = _fill_holes_2pass(
+    filled, _extrap = _fill_holes_2pass(
         ortho_grid,
         sample_valid=has_color,  # only real colour seeds the fill
         hole_mask=fillable,
@@ -2081,7 +2081,8 @@ def _fuse_per_cluster(
             fuser.set_trunc_factor(trunc_factor_cfg)
             fuser.set_min_weight(config["depthmap_fusion_svo_min_weight"])
             fuser.set_num_levels(config["depthmap_fusion_svo_num_levels"])
-            fuser.set_decimate_flat(config["depthmap_fusion_svo_decimate_flat"])
+            fuser.set_decimate_flat(
+                config["depthmap_fusion_svo_decimate_flat"])
             fuser.set_edge_threshold(
                 config["depthmap_fusion_svo_edge_threshold"]
             )
@@ -2257,7 +2258,7 @@ def _fuse_per_cluster(
                 f"{valid_count}/{dsm_grid.size} valid cells"
             )
 
-            dsm_grid = _fill_dsm_holes(dsm_grid, config)
+            dsm_grid, dsm_extrap = _fill_dsm_holes(dsm_grid, config)
             logger.info(
                 "  Filled DSM footprint holes (diffuse tiny + Delaunay pockets)"
             )
@@ -2265,20 +2266,54 @@ def _fuse_per_cluster(
             dsm_grid = _shock_dsm_edges(dsm_grid, dsm_gsd, config)
             logger.info("  Sharpened DSM edges (shock filter)")
 
-            # Hand the newly-filled (interpolated) cells to the leaf that owns the
-            # nearest surface, so Pass 2 bakes real reprojected colour onto them.
-            if owner_grid is not None:
-                _propagate_owner_into_filled(owner_grid, dsm_grid)
-
             # --- Pass 2: bake the ortho from the corrected DSM. ---
+            # Every cell that carries a height — reconstructed OR hole-filled — is
+            # coloured by REPROJECTING its final DSM height into source images and
+            # taking the best-resolution inlier views (real multi-view baking, NOT
+            # colour interpolation).  A reconstructed cell is baked by the leaf
+            # that won its height (max-z); a filled hole, which has no owner, is
+            # baked by the leaf whose CORE XY footprint covers it — that leaf
+            # holds exactly the views that see the region.  In a no-MVS hole
+            # interior the clean depth is 0, so the bake is not occlusion-culled
+            # and samples the true image colour.
             if ortho_grid is not None and owner_grid is not None:
                 n_final = int(config["ortho_bake_n_final_views"])
                 irls_iters = int(config["ortho_bake_irls_iterations"])
+                valid = ~np.isnan(dsm_grid)
+                # Cells that received a REAL (non-black) bake.  A cell is baked
+                # by exactly one leaf (its owner, or — for a filled hole — its
+                # footprint leaf, claimed below), so no leaf can overwrite
+                # another's colour; this only records WHICH cells got colour, so
+                # the residual fill touches strictly the never-baked remainder.
+                baked_mask = np.zeros((dsm_h, dsm_w), dtype=bool)
+                n_filled_tot = 0  # diagnostics: filled cells + how many baked
+                n_filled_black = 0  # filled cells the bake still left black
+                n_owned_black = 0  # reconstructed cells left black
                 for leaf_idx, leaf_sv in enumerate(leaves):
-                    cell_mask = (owner_grid == leaf_idx) & ~np.isnan(dsm_grid)
-                    if not cell_mask.any():
+                    # This leaf's core cell footprint (same formula as Pass 1).
+                    cs = max(0, int(np.floor(
+                        (leaf_sv.core_min[0] - dsm_origin_x) / dsm_gsd)))
+                    ce = min(dsm_w, int(np.ceil(
+                        (leaf_sv.core_max[0] - dsm_origin_x) / dsm_gsd)))
+                    rs = max(0, int(np.floor(
+                        (leaf_sv.core_min[1] - dsm_origin_y) / dsm_gsd)))
+                    re_ = min(dsm_h, int(np.ceil(
+                        (leaf_sv.core_max[1] - dsm_origin_y) / dsm_gsd)))
+                    if ce <= cs or re_ <= rs:
                         continue
-                    rows_idx, cols_idx = np.where(cell_mask)
+                    # view → writes back
+                    sub_owner = owner_grid[rs:re_, cs:ce]
+                    sub_valid = valid[rs:re_, cs:ce]
+                    # Cells this leaf bakes: the ones it won, plus still-unowned
+                    # filled holes inside its footprint (owner < 0 & has height).
+                    fill_local = (sub_owner < 0) & sub_valid
+                    sub_mask = ((sub_owner == leaf_idx)
+                                | fill_local) & sub_valid
+                    if not sub_mask.any():
+                        continue
+                    lr, lc = np.where(sub_mask)
+                    rows_idx = lr + rs
+                    cols_idx = lc + cs
                     pts = np.empty((len(rows_idx), 3), dtype=np.float32)
                     pts[:, 0] = dsm_origin_x + (cols_idx + 0.5) * dsm_gsd
                     pts[:, 1] = dsm_origin_y + (rows_idx + 0.5) * dsm_gsd
@@ -2286,6 +2321,20 @@ def _fuse_per_cluster(
                     nrm = _dsm_point_normals(
                         dsm_grid, rows_idx, cols_idx, dsm_gsd
                     )
+                    # Filled holes carry interpolated geometry: bake them with a
+                    # flat up-normal (no false grazing rejects), and for the
+                    # RELIABLY-interpolated ones relax the depth-validity mask so
+                    # they sample real image colour (their projection lands on
+                    # masked no-depth pixels in every view).  EXTRAPOLATED filled
+                    # cells (nearest-neighbour, outside the Delaunay hull — the
+                    # open side of boundary concavities) keep the strict mask, so
+                    # their unreliable geometry can't sample spurious colour.
+                    is_filled = fill_local[lr, lc]
+                    if is_filled.any():
+                        nrm[is_filled] = (0.0, 0.0, 1.0)
+                    relax = (
+                        is_filled & ~dsm_extrap[rows_idx, cols_idx]
+                    ).astype(np.uint8)
                     baker, n_loaded = _build_fuser(leaf_sv)
                     if n_loaded == 0:
                         del baker
@@ -2294,19 +2343,40 @@ def _fuse_per_cluster(
                     baker.fuse_only()
                     colors = np.asarray(
                         baker.bake_colors(
-                            pts, nrm, n_final=n_final, irls_iters=irls_iters
+                            pts, nrm, n_final=n_final, irls_iters=irls_iters,
+                            relax_occlusion=relax,
                         ),
                         dtype=np.uint8,
                     )
                     ortho_grid[rows_idx, cols_idx, :] = colors
+                    # A cell is "really baked" iff the kernel found >=1 view
+                    # (n_valid==0 emits pure black); record that, not sum>0 on
+                    # the final ortho (which a legitimately-dark bake would fail).
+                    ok = colors.any(axis=1)
+                    baked_mask[rows_idx, cols_idx] = ok
+                    n_filled_tot += int(is_filled.sum())
+                    n_filled_black += int((is_filled & ~ok).sum())
+                    n_owned_black += int((~is_filled & ~ok).sum())
+                    # Claim the filled holes so a neighbour leaf (footprints can
+                    # overlap by ~1 cell) does not re-bake them.
+                    sub_owner[fill_local] = leaf_idx
                     del baker
                     gc.collect()
+                n_unbaked = int((valid & ~baked_mask).sum())
                 logger.info(
-                    f"  Baked ortho from corrected DSM ({len(leaves)} leaves)"
+                    f"  Baked ortho from corrected DSM ({len(leaves)} leaves); "
+                    f"{n_unbaked} cell(s) saw no view → residual fill"
                 )
-                ortho_grid = _fill_ortho_holes(ortho_grid, dsm_grid, config)
                 logger.info(
-                    "  Filled residual ortho holes (bake-occluded cells)")
+                    f"    of which filled-cell black: {n_filled_black}/"
+                    f"{n_filled_tot} filled, reconstructed black: "
+                    f"{n_owned_black}"
+                )
+                ortho_grid = _fill_ortho_holes(
+                    ortho_grid, dsm_grid, config, baked_mask=baked_mask
+                )
+                logger.info(
+                    "  Filled residual ortho holes (occluded in every view)")
 
                 ortho_grid = _ortho_gated_median(ortho_grid, dsm_grid, config)
                 logger.info("  Despeckled ortho (gated 3x3 median)")

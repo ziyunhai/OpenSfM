@@ -166,10 +166,13 @@ class SVOIntegratorCL {
   // |out_colors|: M×3 uint8_t RGB output.
   // |n_final|: number of sharpest inlier views to blend (1 or 2).
   // |irls_iters|: Tukey reweighting iterations for the consensus.
+  // |relax_occ|: optional per-point flags (size M); where non-zero, the
+  // occlusion test is skipped (used for interpolated filled-DSM cells).
   void BakeColors(const std::vector<Vec3f>& points,
                   const std::vector<Vec3f>& normals,
                   std::vector<Vec3<uint8_t>>* out_colors, int n_final = 2,
-                  int irls_iters = 3);
+                  int irls_iters = 3,
+                  const std::vector<uint8_t>* relax_occ = nullptr);
 
   // --- Visibility pruning ---
   // Initialize carve/support vote buffers (same capacity as hash table).

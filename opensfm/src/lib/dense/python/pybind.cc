@@ -51,7 +51,7 @@ PYBIND11_MODULE(pydense, m) {
            py::arg("z_max"))
       .def("bake_colors", &dense::SVOFuserWrapper::BakeColorsStandalone,
            py::arg("points"), py::arg("normals"), py::arg("n_final") = 2,
-           py::arg("irls_iters") = 3);
+           py::arg("irls_iters") = 3, py::arg("relax_occlusion") = py::none());
 
   py::class_<dense::DepthmapClusterEstimatorWrapper>(m,
                                                      "DepthmapClusterEstimator")

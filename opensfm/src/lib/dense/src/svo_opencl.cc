@@ -1221,7 +1221,8 @@ void SVOIntegratorCL::RefineGeometry(int iters, float lambda_reg,
 void SVOIntegratorCL::BakeColors(const std::vector<Vec3f>& points,
                                  const std::vector<Vec3f>& normals,
                                  std::vector<Vec3<uint8_t>>* out_colors,
-                                 int n_final, int irls_iters) {
+                                 int n_final, int irls_iters,
+                                 const std::vector<uint8_t>* relax_occ) {
   if (!refine_prepared_) {
     throw std::runtime_error(
         "SVOIntegratorCL::BakeColors: PrepareRefinement() not called");
@@ -1250,6 +1251,20 @@ void SVOIntegratorCL::BakeColors(const std::vector<Vec3f>& points,
       const_cast<float*>(reinterpret_cast<const float*>(normals.data())), &err);
   opencl::CheckCL(err, "bake normals buffer");
 
+  // Optional per-point occlusion-relax flags (1 = skip the occlusion test for
+  // that point — used for interpolated filled-DSM cells).
+  const bool has_relax = relax_occ && relax_occ->size() == M;
+  cl::Buffer cl_relax;
+  if (has_relax) {
+    cl_relax = cl::Buffer(
+        ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, M,
+        const_cast<uint8_t*>(relax_occ->data()), &err);
+    opencl::CheckCL(err, "bake relax buffer");
+  } else {
+    cl_relax = cl::Buffer(ctx, CL_MEM_READ_ONLY, 1, nullptr, &err);
+    opencl::CheckCL(err, "bake relax dummy buffer");
+  }
+
   // Output color buffer.
   const size_t color_bytes = M * 3;
   cl::Buffer cl_out(ctx, CL_MEM_WRITE_ONLY, color_bytes, nullptr, &err);
@@ -1277,6 +1292,9 @@ void SVOIntegratorCL::BakeColors(const std::vector<Vec3f>& points,
     k_bake_colors_.setArg(arg++, occlusion_margin);
     k_bake_colors_.setArg(arg++, static_cast<cl_int>(n_final));
     k_bake_colors_.setArg(arg++, static_cast<cl_int>(irls_iters));
+    k_bake_colors_.setArg(arg++, cl_relax);
+    k_bake_colors_.setArg(arg++, static_cast<cl_int>(has_relax ? 1 : 0));
+    k_bake_colors_.setArg(arg++, static_cast<cl_int>(M));
 
     const size_t global = ((M + 255) / 256) * 256;
     queue.enqueueNDRangeKernel(k_bake_colors_, cl::NullRange,

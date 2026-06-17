@@ -1505,9 +1505,22 @@ __kernel void svo_bake_colors(
     int                      img_height,
     float                    occlusion_margin,  // absolute depth margin
     int                      n_final,           // # sharpest views to blend
-    int                      irls_iters)        // Tukey reweight iterations
+    int                      irls_iters,        // Tukey reweight iterations
+    __global const uchar*    relax_occ,         // per-point: 1 = skip occlusion
+    int                      has_relax,         // relax_occ buffer provided?
+    int                      n_points)          // bound guard (M)
 {
     uint gid = get_global_id(0);
+    if (gid >= (uint)n_points) return;   // dispatch is padded to 256
+
+    // Reliably-interpolated filled-DSM cells live where NO view got depth (that
+    // is why they were holes), so their projection lands on masked (alpha=0)
+    // pixels in every view.  For them, relax (skip) the depth-validity MASK gate
+    // so the real image colour — which exists in the colour image even where the
+    // cleaned depth does not — is still sampled.  Occlusion stays strict (it is
+    // a no-op for true holes, where clean_d==0, but rejects badly-placed
+    // geometry elsewhere); the flag is NOT set for extrapolated boundary cells.
+    int relax_pt = has_relax && (relax_occ[gid] != 0);
 
     float3 x = (float3)(points[gid*3], points[gid*3+1], points[gid*3+2]);
     float3 norm = (float3)(normals[gid*3], normals[gid*3+1], normals[gid*3+2]);
@@ -1551,7 +1564,9 @@ __kernel void svo_bake_colors(
         // Validity mask check: alpha channel at nearest pixel.
         float4 rgba_nn = read_imagef(color_images, nn_samp,
                              (float4)(px + 0.5f, py + 0.5f, (float)j, 0.0f));
-        if (rgba_nn.w < 0.5f) continue;  // masked pixel (alpha=0)
+        // Masked pixel (alpha=0 = no cleaned depth here).  Filled cells relax
+        // this: their colour exists in the image even where depth does not.
+        if (rgba_nn.w < 0.5f && !relax_pt) continue;
 
         // Occlusion check: absolute depth margin (not relative!).
         // If this view's clean surface is in front of our point, skip.
