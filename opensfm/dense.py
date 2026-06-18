@@ -49,6 +49,14 @@ logger: logging.Logger = logging.getLogger(__name__)
 # Maximum concurrent clusters running on a single device.
 _MAX_PARALLEL_PER_DEVICE: int = 1
 
+# GPU memory model for SVO-fuser retention budgeting — mirrors the C++ layout in svo_opencl.{h,cc}.
+# sizeof(GPUVoxelSlot); see svo_opencl.h static_assert
+_SVO_SLOT_BYTES: int = 36
+# Refine images kept resident for BakeColors, per pixel per view: color RGBA8 (4) + TSDF-rendered depth f32 (4) + clean depth f32 (4).
+_SVO_REFINE_IMG_BYTES_PX_VIEW: int = 12
+# Transient refine scratch, per slot: grad (4) + grad_w (4) + adam m/v (8).
+_SVO_REFINE_SCRATCH_BYTES_SLOT: int = 16
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Entry point
@@ -1284,6 +1292,9 @@ def _prescan_coarse_grid(
     voxel_size: float,
     coarse_factor: int,
     subsample: int = 8,
+    clean_cache: Optional[
+        Dict[str, Tuple[NDArray, NDArray, Optional[NDArray]]]
+    ] = None,
 ) -> Dict[Tuple[int, int, int], Set[int]]:
     """CPU pre-scan: subsample cleaned depthmaps, project to world, bucket.
 
@@ -1308,9 +1319,15 @@ def _prescan_coarse_grid(
     grid: Dict[Tuple[int, int, int], Set[int]] = defaultdict(set)
 
     for view_idx, sid in enumerate(view_ids):
-        if not data.clean_depthmap_exists(sid):
-            continue
-        depth, _normal, _score, _conf = data.load_clean_depthmap(sid)
+        if clean_cache is not None:
+            cached = clean_cache.get(sid)
+            if cached is None:
+                continue
+            depth = cached[0]
+        else:
+            if not data.clean_depthmap_exists(sid):
+                continue
+            depth, _normal, _score, _conf = data.load_clean_depthmap(sid)
         h, w = depth.shape
 
         # Subsample pixel coordinates.
@@ -1894,6 +1911,7 @@ def _fuse_per_cluster(
         # ── Batch-preload helper ──────────────────────────────────────
         def _prepare_views(
             view_ids: List[str],
+            clean_cache: Dict[str, Tuple[NDArray, NDArray, Optional[NDArray]]],
         ) -> Dict[str, Tuple[
             NDArray, NDArray, NDArray, NDArray,
             NDArray, NDArray, NDArray, Optional[NDArray],
@@ -1903,16 +1921,13 @@ def _fuse_per_cluster(
             Returns a dict mapping shot id → (K, R, t, depth, normal,
             color, vmask, confidence) for every successfully loaded view.
             """
-            loadable = [
-                sid for sid in view_ids
-                if data.clean_depthmap_exists(sid)
-            ]
+            loadable = [sid for sid in view_ids if sid in clean_cache]
             if not loadable:
                 return {}
 
-            # I/O-heavy: load all clean depthmaps in parallel.
-            loaded = data.load_clean_depthmaps_parallel(loadable)
-            loaded = [(d, n, c) for (d, n, _s, c) in loaded]
+            # Depthmaps were already decompressed once (shared with the
+            # pre-scan); reuse them here instead of loading a second time.
+            loaded = [clean_cache[sid] for sid in loadable]
 
             # Load validity masks in parallel.
             vmask_map = data.load_undistorted_validity_masks_parallel(
@@ -2008,10 +2023,19 @@ def _fuse_per_cluster(
             f"{n_extra} augmented = {len(augmented)} total"
         )
 
+        # Decompress each augmented view's cleaned depthmap ONCE (parallel)
+        loadable_aug = [s for s in augmented if data.clean_depthmap_exists(s)]
+        _loaded_dm = data.load_clean_depthmaps_parallel(loadable_aug)
+        clean_cache: Dict[str, Tuple[NDArray, NDArray, Optional[NDArray]]] = {
+            sid: (d, n, c)
+            for sid, (d, n, _s, c) in zip(loadable_aug, _loaded_dm)
+        }
+        del _loaded_dm
+
         # Step 2: Pre-scan on CPU (subsampled depth projection).
         grid = _prescan_coarse_grid(
             data, augmented, reconstruction,
-            voxel_size, coarse_factor,
+            voxel_size, coarse_factor, clean_cache=clean_cache,
         )
         coarse_size = voxel_size * coarse_factor
         logger.info(
@@ -2040,7 +2064,19 @@ def _fuse_per_cluster(
         # bake; owner_grid[cell] = index into `leaves` of the leaf that won the
         # cell's height (MAX-z), so each cell is re-coloured by the views that
         # produced it.
+
         leaves: List["_SubVolume"] = []
+        # Pass-1 fusers kept alive (bounded) for the Pass-2 ortho bake.
+        leaf_fusers: List[Optional["pydense.SVOFuser"]] = []
+        max_reuse_fusers = config[
+            "depthmap_fusion_svo_bake_reuse_max_fusers"
+        ]
+        # VRAM-aware retention budget: a retained fuser keeps its GPU hash table (capacity * slot) plus the refine images BakeColors needs resident
+        reuse_vram_budget = int(
+            pydense.DepthmapClusterEstimator.device_memory_bytes(0)
+            * config["depthmap_fusion_svo_bake_reuse_vram_fraction"]
+        )
+        retained_gpu_bytes = 0  # running sum of retained fusers' resident bytes
 
         # --- DSM/ortho grid (populated per sub-volume if svo method) ---
         dsm_enabled = config["dsm_enabled"]
@@ -2091,7 +2127,7 @@ def _fuse_per_cluster(
             )
 
         # Batch-load all views upfront (parallel I/O).
-        view_cache = _prepare_views(augmented)
+        view_cache = _prepare_views(augmented, clean_cache)
         logger.info(
             f"Cluster {batch_num}: loaded {len(view_cache)} views"
         )
@@ -2137,6 +2173,7 @@ def _fuse_per_cluster(
             Renders the DSM patch and records per-cell ownership; the ortho is
             baked later (Pass 2) from the post-processed DSM.
             """
+            nonlocal retained_gpu_bytes
             fuser, n_loaded = _build_fuser(sv)
 
             logger.info(
@@ -2230,6 +2267,7 @@ def _fuse_per_cluster(
 
             # --- Render DSM patch (geometry) for this leaf's core footprint;
             #     the ortho is baked in Pass 2 from the corrected DSM. ---
+            keep_for_bake = False
             if dsm_grid is not None and owner_grid is not None:
                 leaf_idx = len(leaves)
                 leaves.append(sv)
@@ -2238,6 +2276,41 @@ def _fuse_per_cluster(
                     dsm_origin_x, dsm_origin_y, dsm_gsd,
                     dsm_w, dsm_h, dsm_z_min, dsm_z_max,
                 )
+                # Retain this leaf's fuser for the Pass-2 ortho bake, bounded by BOTH a hard count cap and the live VRAM budget.
+                cap = fuser.capacity()
+                # Refine images are at depth resolution, uniform across a leaf's views; read W*H off any one of them.
+                sample = next(
+                    (view_cache[s] for s in sv.view_ids if s in view_cache),
+                    None,
+                )
+                img_px = (
+                    int(sample[3].shape[0]) * int(sample[3].shape[1])
+                    if sample is not None
+                    else 0
+                )
+                table_b = cap * _SVO_SLOT_BYTES
+                img_b = n_loaded * img_px * _SVO_REFINE_IMG_BYTES_PX_VIEW
+                scratch_b = cap * _SVO_REFINE_SCRATCH_BYTES_SLOT
+                retained_cost = table_b  # table only after release
+                next_active_peak = table_b + img_b + scratch_b
+                n_retained = sum(f is not None for f in leaf_fusers)
+                fits_vram = (
+                    retained_gpu_bytes + retained_cost + next_active_peak
+                    <= reuse_vram_budget
+                )
+                keep_for_bake = n_retained < max_reuse_fusers and fits_vram
+                if keep_for_bake:
+                    retained_gpu_bytes += retained_cost
+                elif n_retained < max_reuse_fusers and not fits_vram:
+                    logger.info(
+                        f"  Pass-2 reuse throttled by VRAM: "
+                        f"{retained_gpu_bytes / 1e9:.1f} GB tables retained + "
+                        f"{retained_cost / 1e9:.1f} GB this table + "
+                        f"{next_active_peak / 1e9:.1f} GB next-leaf peak > "
+                        f"{reuse_vram_budget / 1e9:.1f} GB budget → "
+                        f"rebuilding this leaf's fuser in Pass 2"
+                    )
+                leaf_fusers.append(fuser if keep_for_bake else None)
 
             # Always bake colors (voxels no longer store color).
             pts_arr, nrm_arr, clr_arr = fuser.extract_and_bake()
@@ -2262,7 +2335,11 @@ def _fuse_per_cluster(
                     f"    → {len(pts)} points extracted"
                 )
 
-            del fuser
+            if not keep_for_bake:
+                del fuser
+            else:
+                # Strip the retained fuser to its hash table only — the refine images + grad/adam are dead weight between passes
+                fuser.release_refine_buffers()
 
         # --- Pass 1: build the global DSM geometry (no colour yet). ---
         for sv in subvolumes:
@@ -2360,12 +2437,16 @@ def _fuse_per_cluster(
                     relax = (
                         is_filled & ~dsm_extrap[rows_idx, cols_idx]
                     ).astype(np.uint8)
-                    baker, n_loaded = _build_fuser(leaf_sv)
-                    if n_loaded == 0:
-                        del baker
-                        continue
-                    baker.count_voxels()
-                    baker.fuse_only()
+                    baker = leaf_fusers[leaf_idx]
+                    if baker is None:
+                        # Not retained from Pass 1 (over the GPU cap) — rebuild
+                        # and re-fuse, as before.
+                        baker, n_loaded = _build_fuser(leaf_sv)
+                        if n_loaded == 0:
+                            del baker
+                            continue
+                        baker.count_voxels()
+                        baker.fuse_only()
                     colors = np.asarray(
                         baker.bake_colors(
                             pts, nrm, n_final=n_final, irls_iters=irls_iters,
@@ -2386,6 +2467,8 @@ def _fuse_per_cluster(
                     # overlap by ~1 cell) does not re-bake them.
                     sub_owner[fill_local] = leaf_idx
                     del baker
+                    # release the retained GPU fuser
+                    leaf_fusers[leaf_idx] = None
                     gc.collect()
                 n_unbaked = int((valid & ~baked_mask).sum())
                 logger.info(
@@ -2406,6 +2489,9 @@ def _fuse_per_cluster(
                 ortho_grid = _ortho_gated_median(ortho_grid, dsm_grid, config)
                 logger.info("  Despeckled ortho (gated 3x3 median)")
 
+            # Release any Pass-1 fusers still held (skipped leaves, or ortho
+            # disabled) before clearing the view cache they borrow from.
+            leaf_fusers = []
             view_cache.clear()
 
             reference = reconstruction.reference

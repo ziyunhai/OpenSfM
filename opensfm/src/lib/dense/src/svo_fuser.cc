@@ -28,6 +28,16 @@ void SVOFuser::SetMinWeight(float w) { min_weight_ = std::max(0.0f, w); }
 
 void SVOFuser::SetDevice(int device_idx) { device_idx_ = device_idx; }
 
+uint32_t SVOFuser::Capacity() const {
+  return integrator_ ? integrator_->capacity() : 0u;
+}
+
+void SVOFuser::ReleaseRefineBuffers() {
+  if (integrator_) {
+    integrator_->ReleaseRefineBuffers();
+  }
+}
+
 void SVOFuser::SetNumLevels(int n) { num_levels_ = std::max(1, n); }
 
 void SVOFuser::SetDecimateFat(uint32_t n) { decimate_flat_ = std::max(1u, n); }

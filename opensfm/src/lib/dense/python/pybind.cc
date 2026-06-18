@@ -29,6 +29,9 @@ PYBIND11_MODULE(pydense, m) {
       .def("set_bbox", &dense::SVOFuserWrapper::SetBBox, py::arg("min_world"),
            py::arg("max_world"))
       .def_static("is_gpu_available", &dense::SVOFuserWrapper::IsGPUAvailable)
+      .def("capacity", &dense::SVOFuserWrapper::Capacity)
+      .def("release_refine_buffers",
+           &dense::SVOFuserWrapper::ReleaseRefineBuffers)
       .def("count_voxels", &dense::SVOFuserWrapper::CountVoxels)
       .def("add_view", &dense::SVOFuserWrapper::AddView, py::arg("K"),
            py::arg("R"), py::arg("t"), py::arg("depth"), py::arg("normal"),

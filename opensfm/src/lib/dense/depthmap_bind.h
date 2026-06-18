@@ -270,6 +270,15 @@ class SVOFuserWrapper {
   }
   static bool IsGPUAvailable() { return SVOFuser::IsGPUAvailable(); }
 
+  // GPU hash-table capacity (slots) currently allocated; 0 if not yet fused.
+  uint32_t Capacity() const { return sf_.Capacity(); }
+
+  // Free refine images + grad/adam, keep the hash table (for Pass-2 reuse).
+  void ReleaseRefineBuffers() {
+    py::gil_scoped_release release;
+    sf_.ReleaseRefineBuffers();
+  }
+
   uint32_t CountVoxels() {
     py::gil_scoped_release release;
     return sf_.CountVoxels();

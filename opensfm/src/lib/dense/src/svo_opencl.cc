@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <sstream>
@@ -909,6 +910,12 @@ void SVOIntegratorCL::PrepareRefinement(
   refine_img_width_ = img_width;
   refine_img_height_ = img_height;
 
+  // Free any prior refinement working set before reallocating
+  cl_color_images_ = cl::Image2DArray();
+  cl_tsdf_depths_ = cl::Image2DArray();
+  cl_clean_depths_ = cl::Image2DArray();
+  cl_cameras_array_ = cl::Buffer();
+
   // Allocate gradient buffer: 1 float per slot.
   const size_t grad_bytes = static_cast<size_t>(capacity_) * sizeof(float);
   cl_refine_grad_ =
@@ -965,27 +972,56 @@ void SVOIntegratorCL::PrepareRefinement(
   const cl::array<cl::size_type, 3> region = {
       {static_cast<cl::size_type>(img_width),
        static_cast<cl::size_type>(img_height), 1}};
-  for (int v = 0; v < n_views; ++v) {
-    const cl::array<cl::size_type, 3> origin = {
-        {0, 0, static_cast<cl::size_type>(v)}};
-    const uint8_t* color = views[v].color;
-    const uint8_t* mask = views[v].mask;
-    for (size_t p = 0; p < npix; ++p) {
-      rgba_slice[p * 4 + 0] = color ? color[p * 3 + 0] : 0;
-      rgba_slice[p * 4 + 1] = color ? color[p * 3 + 1] : 0;
-      rgba_slice[p * 4 + 2] = color ? color[p * 3 + 2] : 0;
-      rgba_slice[p * 4 + 3] = mask ? mask[p] : 255;
+  int upload_v = -1;  // last view attempted (for error reporting)
+  try {
+    for (int v = 0; v < n_views; ++v) {
+      upload_v = v;
+      const cl::array<cl::size_type, 3> origin = {
+          {0, 0, static_cast<cl::size_type>(v)}};
+      const uint8_t* color = views[v].color;
+      const uint8_t* mask = views[v].mask;
+      const float* depth = views[v].depth;
+      if (depth == nullptr) {
+        throw std::runtime_error(
+            "PrepareRefinement: view " + std::to_string(v) +
+            " has a null depth buffer (every view must carry a depth map)");
+      }
+      for (size_t p = 0; p < npix; ++p) {
+        rgba_slice[p * 4 + 0] = color ? color[p * 3 + 0] : 0;
+        rgba_slice[p * 4 + 1] = color ? color[p * 3 + 1] : 0;
+        rgba_slice[p * 4 + 2] = color ? color[p * 3 + 2] : 0;
+        rgba_slice[p * 4 + 3] = mask ? mask[p] : 255;
+      }
+      // Blocking writes (CL_TRUE): the color write must finish before
+      // rgba_slice is overwritten for the next view; depth streams from the
+      // (stable) borrowed buffer into both the mutable and immutable depth
+      // arrays.
+      queue.enqueueWriteImage(cl_color_images_, CL_TRUE, origin, region, 0, 0,
+                              rgba_slice.data());
+      queue.enqueueWriteImage(cl_tsdf_depths_, CL_TRUE, origin, region, 0, 0,
+                              const_cast<float*>(depth));
+      queue.enqueueWriteImage(cl_clean_depths_, CL_TRUE, origin, region, 0, 0,
+                              const_cast<float*>(depth));
     }
-    // Blocking writes (CL_TRUE): the color write must finish before rgba_slice
-    // is overwritten for the next view; depth streams from the (stable)
-    // borrowed buffer into both the mutable and immutable depth arrays.
-    queue.enqueueWriteImage(cl_color_images_, CL_TRUE, origin, region, 0, 0,
-                            rgba_slice.data());
-    float* depth = const_cast<float*>(views[v].depth);
-    queue.enqueueWriteImage(cl_tsdf_depths_, CL_TRUE, origin, region, 0, 0,
-                            depth);
-    queue.enqueueWriteImage(cl_clean_depths_, CL_TRUE, origin, region, 0, 0,
-                            depth);
+  } catch (const cl::Error& e) {
+    // The bare cl2.hpp message is just the API name ("clEnqueueWriteImage").
+    // Most drivers defer image-array allocation to first use, so an
+    // out-of-memory condition surfaces here rather than at creation — decode
+    // the code and report the requested vs available GPU memory so the cause
+    // (OOM vs invalid argument) is unambiguous.
+    const size_t per_array_bytes = static_cast<size_t>(n_views) * npix * 4;
+    std::ostringstream oss;
+    oss << "PrepareRefinement image upload failed at view " << upload_v << "/"
+        << n_views << " (" << img_width << "x" << img_height
+        << "): " << e.what() << " (CL code " << e.err()
+        << "). Requested GPU: " << ((3 * per_array_bytes) >> 20)
+        << " MB images (color+2×depth) + "
+        << ((grad_bytes * 2 + adam_bytes) >> 20) << " MB grad/adam; device "
+        << dev.name() << " has " << (dev.GlobalMemSize() >> 20) << " MB total, "
+        << (dev.AvailableMemory() >> 20)
+        << " MB tracked-free. CL codes: -4=MEM_OBJECT_ALLOCATION_FAILURE, "
+           "-5=OUT_OF_RESOURCES, -6=OUT_OF_HOST_MEMORY, -30=INVALID_VALUE.";
+    throw std::runtime_error(oss.str());
   }
 
   // Upload camera array.
@@ -1020,6 +1056,20 @@ void SVOIntegratorCL::PrepareRefinement(
   }
 
   refine_prepared_ = true;
+}
+
+void SVOIntegratorCL::ReleaseRefineBuffers() {
+  cl_refine_grad_ = cl::Buffer();
+  cl_refine_grad_w_ = cl::Buffer();
+  cl_refine_adam_ = cl::Buffer();
+  cl_color_images_ = cl::Image2DArray();
+  cl_tsdf_depths_ = cl::Image2DArray();
+  cl_clean_depths_ = cl::Image2DArray();
+  cl_cameras_array_ = cl::Buffer();
+  n_refine_views_ = 0;
+  refine_img_width_ = 0;
+  refine_img_height_ = 0;
+  refine_prepared_ = false;
 }
 
 void SVOIntegratorCL::RefineGeometry(int iters, float lambda_reg,
@@ -1080,6 +1130,19 @@ void SVOIntegratorCL::RefineGeometry(int iters, float lambda_reg,
   cl::Buffer cl_neighbors(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                           nb_bytes, neighbor_data_work.data(), &err);
   opencl::CheckCL(err, "refine neighbor buffer");
+
+  // Per-iteration convergence instrumentation (opt-in, env-gated so it costs
+  // nothing in production): when OPENSFM_REFINE_LOG_STATS is set, read the
+  // accumulated gradient back each iteration and log the descent statistics so
+  // we can judge where the minimisation plateaus and whether early-stopping is
+  // safe.  Read-only — does not perturb the descent.
+  const bool log_stats = std::getenv("OPENSFM_REFINE_LOG_STATS") != nullptr;
+  std::vector<float> grad_cpu, gradw_cpu;
+  if (log_stats) {
+    grad_cpu.resize(capacity_);
+    gradw_cpu.resize(capacity_);
+  }
+  double prev_rms = 0.0;
 
   for (int iter = 0; iter < iters; ++iter) {
     // ---- Step 1: Guided narrow-band raycast for all views ----
@@ -1165,33 +1228,44 @@ void SVOIntegratorCL::RefineGeometry(int iters, float lambda_reg,
     }
     queue.finish();
 
-    // ---- Diagnostic: gradient buffer stats after accumulation ----
-    if (iter == 0) {
-      std::vector<float> grad_cpu(capacity_);
+    // ---- Diagnostic: per-iteration descent statistics (env-gated) ----
+    // Read grad and its per-voxel pixel count BEFORE the update kernel clears
+    // them, and report the per-voxel mean gradient magnitude |grad/grad_w| —
+    // exactly the force the update applies.  As the surface reaches
+    // photo-consistency this decays toward a floor; the rms/prev ratio makes
+    // the plateau (the natural early-stop point) obvious.
+    if (log_stats) {
       queue.enqueueReadBuffer(cl_refine_grad_, CL_TRUE, 0,
                               capacity_ * sizeof(float), grad_cpu.data());
-      int n_nonzero = 0;
+      queue.enqueueReadBuffer(cl_refine_grad_w_, CL_TRUE, 0,
+                              capacity_ * sizeof(float), gradw_cpu.data());
+      int n_active = 0;
       float max_abs = 0.0f;
-      double sum_abs = 0.0;
+      double sum_abs = 0.0, sum_sq = 0.0;
       for (uint32_t gi = 0; gi < capacity_; ++gi) {
-        float gv = grad_cpu[gi];
-        if (gv != 0.0f) {
-          ++n_nonzero;
-          float a = std::abs(gv);
-          if (a > max_abs) {
-            max_abs = a;
-          }
-          sum_abs += a;
+        float w = gradw_cpu[gi];
+        if (w <= 0.0f) {
+          continue;
+        }
+        float g = grad_cpu[gi] / (w + 1e-6f);  // mirror update kernel
+        float a = std::abs(g);
+        ++n_active;
+        sum_abs += a;
+        sum_sq += static_cast<double>(g) * g;
+        if (a > max_abs) {
+          max_abs = a;
         }
       }
-      {
-        std::ostringstream oss;
-        oss << "[SVORefine] iter 0 grad stats: nonzero=" << n_nonzero << "/"
-            << capacity_ << " max_abs=" << max_abs
-            << " mean_abs=" << (n_nonzero > 0 ? sum_abs / n_nonzero : 0.0)
-            << " lr_sdf=" << lr_sdf;
-        foundation::LogDebug("dense", oss.str());
-      }
+      const double mean_abs = n_active > 0 ? sum_abs / n_active : 0.0;
+      const double rms = n_active > 0 ? std::sqrt(sum_sq / n_active) : 0.0;
+      const double ratio = prev_rms > 0.0 ? rms / prev_rms : 1.0;
+      prev_rms = rms;
+      std::ostringstream oss;
+      oss << "[SVORefine] iter " << (iter + 1) << "/" << iters
+          << " grad: nact=" << n_active << " rms=" << rms
+          << " mean=" << mean_abs << " max=" << max_abs
+          << " rms/prev=" << ratio;
+      foundation::LogInfo("dense", oss.str());
     }
 
     // ---- Step 3: Adam update on SDF ----
@@ -1217,13 +1291,11 @@ void SVOIntegratorCL::RefineGeometry(int iters, float lambda_reg,
       queue.finish();
     }
 
-    if ((iter + 1) % 5 == 0 || iter == iters - 1) {
-      {
-        std::ostringstream oss;
-        oss << "[SVOIntegratorCL] RefineGeometry iter " << (iter + 1) << "/"
-            << iters;
-        foundation::LogInfo("dense", oss.str());
-      }
+    if (!log_stats && ((iter + 1) % 5 == 0 || iter == iters - 1)) {
+      std::ostringstream oss;
+      oss << "[SVOIntegratorCL] RefineGeometry iter " << (iter + 1) << "/"
+          << iters;
+      foundation::LogInfo("dense", oss.str());
     }
   }
 
@@ -1272,9 +1344,8 @@ void SVOIntegratorCL::BakeColors(const std::vector<Vec3f>& points,
   const bool has_relax = relax_occ && relax_occ->size() == M;
   cl::Buffer cl_relax;
   if (has_relax) {
-    cl_relax = cl::Buffer(
-        ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, M,
-        const_cast<uint8_t*>(relax_occ->data()), &err);
+    cl_relax = cl::Buffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, M,
+                          const_cast<uint8_t*>(relax_occ->data()), &err);
     opencl::CheckCL(err, "bake relax buffer");
   } else {
     cl_relax = cl::Buffer(ctx, CL_MEM_READ_ONLY, 1, nullptr, &err);

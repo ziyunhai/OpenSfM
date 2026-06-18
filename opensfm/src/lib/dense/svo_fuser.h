@@ -126,19 +126,25 @@ class SVOFuser {
   void Fuse(std::vector<Vec3f>* fused_points, std::vector<Vec3f>* fused_normals,
             std::vector<Vec3<uint8_t>>* fused_colors);
 
+  // GPU hash-table capacity (number of slots) currently allocated by the
+  // integrator, or 0 if not yet fused.
+  uint32_t Capacity() const;
+
+  // Free the refinement working set (images + grad/adam) while keeping the hash
+  // table resident
+  void ReleaseRefineBuffers();
+
  private:
   // Stored views.  The pixel buffers are non-owning maps over memory owned by
   // the caller (typically Python numpy arrays kept alive by the binding
-  // wrapper) — AddView borrows rather than copies, which removes a full
-  // duplicate of the cluster's depth/normal/color/mask/weight from RAM.  A
-  // null buffer maps to a zero-size view; every consumer guards on size() > 0.
+  // wrapper)
   struct StoredView {
     StoredView(const Mat3d& K_, const Mat3d& R_, const Vec3d& t_,
                Eigen::Map<const ImageF> depth_,
                Eigen::Map<const PixelData3f> normal_,
                Eigen::Map<const PixelData3u8> color_,
-               Eigen::Map<const ImageU8> mask_, Eigen::Map<const ImageF> weight_,
-               std::string name_)
+               Eigen::Map<const ImageU8> mask_,
+               Eigen::Map<const ImageF> weight_, std::string name_)
         : K(K_),
           R(R_),
           t(t_),

@@ -1493,6 +1493,10 @@ float3 linear_to_srgb(float3 c) {
 // n_final:     number of sharpest inlier views to blend (1 or 2).
 // irls_iters:  Tukey reweighting iterations for the consensus (e.g. 3).
 // =====================================================================
+// Min nadir-ness (cos of view angle from vertical) for a view to colour an
+// interpolated (relaxed) cell.  0.7 ~= within 45deg of nadir.  Higher = stricter
+// (less oblique smear, more cells left to the smooth residual fill).
+#define ORTHO_FILLED_NADIR_COS 0.7f
 __kernel void svo_bake_colors(
     __global const float*    points,
     __global const float*    normals,
@@ -1580,6 +1584,15 @@ __kernel void svo_bake_colors(
         float cos_theta  = dot(norm, view_dir);
         if (cos_theta < 0.2f) continue;  // grazing angle
 
+        // Interpolated (relaxed) cells have UNCERTAIN height — the fill guessed
+        // it.  In an oblique view a height error shifts the projected pixel a
+        // lot (it samples a facade → the smeared look); in a near-nadir view the
+        // pixel barely moves with height.  So for relaxed cells admit only
+        // near-nadir views (norm is flat → cos_theta == view nadir-ness) and
+        // rank them by nadir-ness, not resolution.  If none are near-nadir the
+        // cell goes black → smooth residual fill (better than an oblique smear).
+        if (relax_pt && cos_theta < ORTHO_FILLED_NADIR_COS) continue;
+
         // Sample color with bilinear interpolation.
         float4 rgba = read_imagef(color_images, lin_samp,
                           (float4)(px + 0.5f, py + 0.5f, (float)j, 0.0f));
@@ -1588,7 +1601,8 @@ __kernel void svo_bake_colors(
         obs_g[n_valid]   = rgba.y;
         obs_b[n_valid]   = rgba.z;
         obs_w[n_valid]   = cos_theta * cos_theta;        // geometric prior
-        obs_res[n_valid] = fx_j * cos_theta * inv_zj;    // ~ pixels / world unit
+        obs_res[n_valid] = relax_pt ? cos_theta          // nadir-ness (height-robust)
+                                    : (fx_j * cos_theta * inv_zj);  // ~px/world
         n_valid++;
     }
 

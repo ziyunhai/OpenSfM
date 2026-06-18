@@ -187,6 +187,11 @@ class SVOIntegratorCL {
                   int irls_iters = 3,
                   const std::vector<uint8_t>* relax_occ = nullptr);
 
+  // Free the refinement working set (color/depth image arrays, camera array,
+  // grad/adam scratch) while keeping the hash table (cl_table_/capacity_)
+  // resident.
+  void ReleaseRefineBuffers();
+
   // --- Visibility pruning ---
   // Initialize carve/support vote buffers (same capacity as hash table).
   void InitializeVisibilityPruning();

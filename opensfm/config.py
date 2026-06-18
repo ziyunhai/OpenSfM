@@ -495,9 +495,13 @@ class OpenSfMConfig:
     # Photometric TSDF refinement
     depthmap_fusion_svo_refine_enabled: bool = True
     # Number of SDF refinement iterations.
-    depthmap_fusion_svo_refine_iters: int = 50
+    depthmap_fusion_svo_refine_iters: int = 10
     # Laplacian regularization weight (0 = disabled).
     depthmap_fusion_svo_refine_lambda_reg: float = 0.2
+    # This caps how many fusers are kept alive on the GPU at once (each holds a hash table)
+    depthmap_fusion_svo_bake_reuse_max_fusers: int = 4
+    # Hard ceiling, as a fraction of device VRAM, on the bytes of retained fusers (hash table + refine images) kept resident
+    depthmap_fusion_svo_bake_reuse_vram_fraction: float = 0.5
 
     ##################################
     # Params for octree point cloud tiling (viewer streaming)
