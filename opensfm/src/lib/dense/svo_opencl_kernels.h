@@ -1346,7 +1346,10 @@ __kernel void svo_refine_update(
     float               epsilon,
     int                 iteration,
     int                 n_views,
-    float               edge_k)           // edge-stop threshold (norm. TSDF units)
+    float               edge_k,           // edge-stop threshold (norm. TSDF units)
+    float               lambda_anchor,    // surface-stabilization weight (0 = off)
+    __global float*     step_accum,       // 512 floats: [0..256) Σstep², [256..512) count
+    int                 track_step)       // 1 = accumulate step magnitude (early-stop)
 {
     uint i = get_global_id(0);
     if (i >= capacity) return;
@@ -1363,6 +1366,12 @@ __kernel void svo_refine_update(
     // Only update voxels within the truncation band.
     if (fabs(tsdf) > 4.f) return;
 
+    // Surface-stabilization anchor: on the first iteration, snapshot the fused
+    // TSDF into the otherwise-unused second Adam slot v_d (adam_buf[i*2+1]).
+    // Later iterations pull the refined value back toward it — zero extra
+    // memory (v_d is allocated but never read by the SGD-momentum update).
+    if (lambda_anchor > 0.0f && iteration == 0) adam_buf[i * 2 + 1] = tsdf;
+
     float grad_d = grad_buf[i];
     float grad_w = grad_w_buf[i];
     // Clear for next iteration.
@@ -1370,6 +1379,15 @@ __kernel void svo_refine_update(
     grad_w_buf[i] = 0.0f;
 
     grad_d /= (grad_w + 1e-6f);  // mean gradient if multiple pixels contributed
+
+    // Anchor term: energy μ(φ−φ0)² ⇒ gradient +2μ(φ−φ0); the descent
+    // φ_new = φ − lr·grad then pulls φ back toward the fused value φ0,
+    // bounding drift so the regularizer can't smooth past photo-consistency.
+    // Added before the fast-path gate so an anchored voxel still updates even
+    // when its data gradient is zero.
+    if (lambda_anchor > 0.0f) {
+        grad_d += lambda_anchor * 2.0f * (tsdf - adam_buf[i * 2 + 1]);
+    }
 
     // Fast path: with regularization off, only voxels touched by the data
     // term need updating.  With it on, the diffusion runs on every surface
@@ -1457,6 +1475,17 @@ __kernel void svo_refine_update(
     float delta_d = lr_sdf * m_d;
     float new_tsdf = clamp(tsdf - delta_d, -1.0f, 1.0f);
     table[i].sum_tsdf = (int)(new_tsdf * sw * (float)FP_SCALE);
+
+    // Early-stop signal: accumulate this iteration's actual surface motion
+    // (post-clamp step) into 256 buckets to spread atomic contention.  The
+    // host reduces it to an RMS step per iter; motion decaying toward zero
+    // means the descent has converged.  Skipped entirely when track_step==0.
+    if (track_step) {
+        float actual_step = new_tsdf - tsdf;
+        uint b = i & 255u;
+        atomic_add_f(&step_accum[b], actual_step * actual_step);
+        atomic_add_f(&step_accum[256u + b], 1.0f);
+    }
 }
 
 // =====================================================================

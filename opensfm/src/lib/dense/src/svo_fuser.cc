@@ -220,7 +220,8 @@ void SVOFuser::Fuse() {
 
 void SVOFuser::RefineGeometry(
     int iters, float lambda_reg,
-    const std::map<std::string, std::vector<std::string>>& neighbors) {
+    const std::map<std::string, std::vector<std::string>>& neighbors,
+    float lambda_anchor, float early_stop_rel) {
   if (!integrator_) {
     throw std::runtime_error(
         "SVOFuser::RefineGeometry: Fuse() must be called before "
@@ -328,7 +329,8 @@ void SVOFuser::RefineGeometry(
   foundation::LogInfo("dense", oss.str());
 
   integrator_->RefineGeometry(iters, lambda_reg, voxel_size_, trunc_dist,
-                              min_weight_, neighbor_data, kMaxRefineNeighbors);
+                              min_weight_, neighbor_data, kMaxRefineNeighbors,
+                              lambda_anchor, early_stop_rel);
 
   {
     std::ostringstream oss;
@@ -673,9 +675,9 @@ void SVOFuser::RenderDSMOrtho(float origin_x, float origin_y, float gsd,
     throw std::runtime_error(
         "SVOFuser::RenderDSMOrtho: must call Fuse() first");
   }
-  integrator_->RenderDSMOrtho(origin_x, origin_y, gsd, width, height, z_min,
-                              z_max, voxel_size_, min_weight_, dsm_wall_cull_nz_,
-                              dsm_out, ortho_out, normals_out);
+  integrator_->RenderDSMOrtho(
+      origin_x, origin_y, gsd, width, height, z_min, z_max, voxel_size_,
+      min_weight_, dsm_wall_cull_nz_, dsm_out, ortho_out, normals_out);
 }
 
 }  // namespace dense

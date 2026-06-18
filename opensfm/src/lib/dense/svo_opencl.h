@@ -170,7 +170,8 @@ class SVOIntegratorCL {
   void RefineGeometry(int iters, float lambda_reg, float voxel_size,
                       float trunc_dist, float min_weight,
                       const std::vector<int32_t>& neighbor_data,
-                      int max_neighbors);
+                      int max_neighbors, float lambda_anchor = 0.0f,
+                      float early_stop_rel = 0.0f);
 
   // Bake colors onto extracted surface points: a robust IRLS consensus
   // gate followed by a top-n_final, resolution-weighted linear blend of

@@ -78,10 +78,16 @@ class SVOFuser {
   // All views must have the same resolution.
   // lambda_reg: Laplacian regularization weight (0 = disabled, default).
   // neighbors: optional shot-id → co-visibility neighbor shot-ids map
+  // lambda_anchor: surface-stabilization weight pulling the refined TSDF back
+  //   toward the fused value (0 = off); bounds drift / over-smoothing.
+  //   <1 front-loads smoothing then backs off to preserve fine detail.
+  // early_stop_rel: stop once per-iteration surface motion falls below this
+  //   fraction of its peak (0 = run all iters).
   // Must be called after Fuse().
   void RefineGeometry(
       int iters, float lambda_reg,
-      const std::map<std::string, std::vector<std::string>>& neighbors);
+      const std::map<std::string, std::vector<std::string>>& neighbors,
+      float lambda_anchor = 0.0f, float early_stop_rel = 0.0f);
 
   // Bake colors onto extracted points: robust IRLS consensus gate plus a
   // top-n_final, resolution-weighted linear blend of the sharpest inlier

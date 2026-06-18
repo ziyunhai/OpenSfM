@@ -1076,7 +1076,8 @@ void SVOIntegratorCL::RefineGeometry(int iters, float lambda_reg,
                                      float voxel_size, float trunc_dist,
                                      float min_weight,
                                      const std::vector<int32_t>& neighbor_data,
-                                     int max_neighbors) {
+                                     int max_neighbors, float lambda_anchor,
+                                     float early_stop_rel) {
   if (!refine_prepared_) {
     throw std::runtime_error(
         "SVOIntegratorCL::RefineGeometry: PrepareRefinement() not called");
@@ -1143,6 +1144,20 @@ void SVOIntegratorCL::RefineGeometry(int iters, float lambda_reg,
     gradw_cpu.resize(capacity_);
   }
   double prev_rms = 0.0;
+
+  // Early-stop on surface motion: the update kernel accumulates this
+  // iteration's RMS TSDF step into a 256-bucket buffer; once motion decays
+  // below early_stop_rel × its peak we stop (the descent has converged).
+  // early_stop_rel <= 0 disables it (no readback, no atomics — legacy path).
+  const bool track_step = early_stop_rel > 0.0f;
+  constexpr int kStepBuckets = 256;
+  constexpr int kMinIters =
+      3;  // never stop before this (early steps are noisy)
+  cl::Buffer cl_step_accum(ctx, CL_MEM_READ_WRITE,
+                           2 * kStepBuckets * sizeof(float), nullptr, &err);
+  opencl::CheckCL(err, "refine step accumulator");
+  std::vector<float> step_cpu(2 * kStepBuckets);
+  double peak_rms_step = 0.0;
 
   for (int iter = 0; iter < iters; ++iter) {
     // ---- Step 1: Guided narrow-band raycast for all views ----
@@ -1269,6 +1284,12 @@ void SVOIntegratorCL::RefineGeometry(int iters, float lambda_reg,
     }
 
     // ---- Step 3: Adam update on SDF ----
+    if (track_step) {
+      // Zero this iteration's motion accumulator before the update writes it.
+      const float zero = 0.0f;
+      queue.enqueueFillBuffer(cl_step_accum, zero, 0,
+                              2 * kStepBuckets * sizeof(float));
+    }
     {
       int arg = 0;
       k_refine_update_.setArg(arg++, cl_table_);
@@ -1286,9 +1307,45 @@ void SVOIntegratorCL::RefineGeometry(int iters, float lambda_reg,
       k_refine_update_.setArg(arg++, static_cast<cl_int>(iter));
       k_refine_update_.setArg(arg++, static_cast<cl_int>(n_refine_views_));
       k_refine_update_.setArg(arg++, edge_k);
+      k_refine_update_.setArg(arg++, lambda_anchor);
+      k_refine_update_.setArg(arg++, cl_step_accum);
+      k_refine_update_.setArg(arg++, static_cast<cl_int>(track_step ? 1 : 0));
       queue.enqueueNDRangeKernel(k_refine_update_, cl::NullRange,
                                  cl::NDRange(update_global), cl::NDRange(256));
       queue.finish();
+    }
+
+    // ---- Early-stop check: stop once per-iteration surface motion has
+    //      decayed below early_stop_rel × its peak. ----
+    if (track_step) {
+      queue.enqueueReadBuffer(cl_step_accum, CL_TRUE, 0,
+                              2 * kStepBuckets * sizeof(float),
+                              step_cpu.data());
+      double sum_sq = 0.0, count = 0.0;
+      for (int b = 0; b < kStepBuckets; ++b) {
+        sum_sq += step_cpu[b];
+        count += step_cpu[kStepBuckets + b];
+      }
+      const double rms_step = count > 0.0 ? std::sqrt(sum_sq / count) : 0.0;
+      if (rms_step > peak_rms_step) {
+        peak_rms_step = rms_step;
+      }
+      if (log_stats) {
+        std::ostringstream oss;
+        oss << "[SVORefine] iter " << (iter + 1) << "/" << iters
+            << " rms_step=" << rms_step << " (peak " << peak_rms_step
+            << ", nactive=" << static_cast<long>(count) << ")";
+        foundation::LogInfo("dense", oss.str());
+      }
+      if (iter + 1 >= kMinIters && peak_rms_step > 0.0 &&
+          rms_step < early_stop_rel * peak_rms_step) {
+        std::ostringstream oss;
+        oss << "[SVOIntegratorCL] RefineGeometry early-stop at iter "
+            << (iter + 1) << "/" << iters << ": rms_step " << rms_step << " < "
+            << early_stop_rel << " × peak " << peak_rms_step;
+        foundation::LogInfo("dense", oss.str());
+        break;
+      }
     }
 
     if (!log_stats && ((iter + 1) % 5 == 0 || iter == iters - 1)) {

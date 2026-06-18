@@ -286,15 +286,15 @@ class SVOFuserWrapper {
 
   void AddView(
       const Mat3d& K, const Mat3d& R, const Vec3d& t,
-      const py::array_t<float, py::array::c_style | py::array::forcecast>& depth,
+      const py::array_t<float, py::array::c_style | py::array::forcecast>&
+          depth,
       const py::array_t<float, py::array::c_style | py::array::forcecast>&
           normal,
       const py::array_t<uint8_t, py::array::c_style | py::array::forcecast>&
           color,
       const py::array_t<uint8_t, py::array::c_style | py::array::forcecast>&
           mask,
-      const py::object& confidence = py::none(),
-      const std::string& name = "") {
+      const py::object& confidence = py::none(), const std::string& name = "") {
     if (depth.ndim() != 2) {
       throw std::invalid_argument("depth must be a 2-D array.");
     }
@@ -340,15 +340,14 @@ class SVOFuserWrapper {
     }
 
     const Eigen::Index npix = static_cast<Eigen::Index>(h) * w;
-    sf_.AddView(
-        K, R, t, Eigen::Map<const ImageF>(depth.data(), h, w),
-        Eigen::Map<const PixelData3f>(normal.data(), 3, npix),
-        Eigen::Map<const PixelData3u8>(color.data(), 3, npix),
-        Eigen::Map<const ImageU8>(has_mask ? mask.data() : nullptr,
-                                  has_mask ? h : 0, has_mask ? w : 0),
-        Eigen::Map<const ImageF>(weight_ptr, weight_ptr ? h : 0,
-                                 weight_ptr ? w : 0),
-        name);
+    sf_.AddView(K, R, t, Eigen::Map<const ImageF>(depth.data(), h, w),
+                Eigen::Map<const PixelData3f>(normal.data(), 3, npix),
+                Eigen::Map<const PixelData3u8>(color.data(), 3, npix),
+                Eigen::Map<const ImageU8>(has_mask ? mask.data() : nullptr,
+                                          has_mask ? h : 0, has_mask ? w : 0),
+                Eigen::Map<const ImageF>(weight_ptr, weight_ptr ? h : 0,
+                                         weight_ptr ? w : 0),
+                name);
   }
 
   py::list Fuse() {
@@ -377,9 +376,11 @@ class SVOFuserWrapper {
 
   void RefineGeometry(
       int iters, float lambda_reg,
-      const std::map<std::string, std::vector<std::string>>& neighbors) {
+      const std::map<std::string, std::vector<std::string>>& neighbors,
+      float lambda_anchor, float early_stop_rel) {
     py::gil_scoped_release release;
-    sf_.RefineGeometry(iters, lambda_reg, neighbors);
+    sf_.RefineGeometry(iters, lambda_reg, neighbors, lambda_anchor,
+                       early_stop_rel);
   }
 
   // Extract surface points and bake colors from images in one call.
@@ -654,7 +655,8 @@ class GPUDiffuserWrapper {
     const int gw = static_cast<int>(dsm_np.shape(1));
     const size_t nc = static_cast<size_t>(gh) * gw;
     if (guide_np.size() != static_cast<ssize_t>(nc * 3)) {
-      throw std::invalid_argument("SnapEdges: guide must be HxWx3 matching dsm");
+      throw std::invalid_argument(
+          "SnapEdges: guide must be HxWx3 matching dsm");
     }
 
     auto& dev = opencl::CLContext::Instance().Device(device_idx_);
@@ -803,7 +805,8 @@ class GPUDiffuserWrapper {
     const int gw = static_cast<int>(ortho_np.shape(1));
     const size_t nc = static_cast<size_t>(gh) * gw;
     if (valid_np.size() != static_cast<ssize_t>(nc)) {
-      throw std::invalid_argument("GatedMedian: valid must be HxW matching ortho");
+      throw std::invalid_argument(
+          "GatedMedian: valid must be HxW matching ortho");
     }
 
     auto& dev = opencl::CLContext::Instance().Device(device_idx_);
@@ -867,9 +870,9 @@ class GPUDiffuserWrapper {
   void UploadGrid(const py::array_t<float, py::array::c_style>&) {
     throw std::runtime_error("GPUDiffuser: OpenCL not available");
   }
-  foundation::pyarray_f SnapEdges(
-      const py::array_t<float, py::array::c_style>&,
-      const py::array_t<float, py::array::c_style>&, int, int, float, float) {
+  foundation::pyarray_f SnapEdges(const py::array_t<float, py::array::c_style>&,
+                                  const py::array_t<float, py::array::c_style>&,
+                                  int, int, float, float) {
     throw std::runtime_error("GPUDiffuser: OpenCL not available");
   }
   foundation::pyarray_f ShockFilter(

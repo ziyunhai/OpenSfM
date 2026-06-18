@@ -42,7 +42,8 @@ PYBIND11_MODULE(pydense, m) {
       .def("refine_geometry", &dense::SVOFuserWrapper::RefineGeometry,
            py::arg("iters"), py::arg("lambda_reg"),
            py::arg("neighbors") =
-               std::map<std::string, std::vector<std::string>>())
+               std::map<std::string, std::vector<std::string>>(),
+           py::arg("lambda_anchor") = 0.0f, py::arg("early_stop_rel") = 0.0f)
       .def("extract_and_bake", &dense::SVOFuserWrapper::ExtractAndBake)
       .def("prune_by_visibility", &dense::SVOFuserWrapper::PruneByVisibility,
            py::arg("iterations"), py::arg("carve_margin"),
@@ -148,9 +149,8 @@ PYBIND11_MODULE(pydense, m) {
            py::arg("guide"), py::arg("iterations"), py::arg("radius"),
            py::arg("sigma_spatial"), py::arg("sigma_range"))
       .def("shock_filter", &dense::GPUDiffuserWrapper::ShockFilter,
-           py::arg("dsm"), py::arg("iterations"), py::arg("win"),
-           py::arg("dt"), py::arg("coherence"), py::arg("gsd"),
-           py::arg("edge_slope"))
+           py::arg("dsm"), py::arg("iterations"), py::arg("win"), py::arg("dt"),
+           py::arg("coherence"), py::arg("gsd"), py::arg("edge_slope"))
       .def("gated_median", &dense::GPUDiffuserWrapper::GatedMedian,
            py::arg("ortho"), py::arg("valid"), py::arg("threshold"));
 }

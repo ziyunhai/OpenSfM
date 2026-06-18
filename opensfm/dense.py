@@ -2261,6 +2261,12 @@ def _fuse_per_cluster(
                         "depthmap_fusion_svo_refine_lambda_reg"
                     ],
                     neighbors=refine_nbrs,
+                    lambda_anchor=config[
+                        "depthmap_fusion_svo_refine_lambda_anchor"
+                    ],
+                    early_stop_rel=config[
+                        "depthmap_fusion_svo_refine_early_stop_rel"
+                    ],
                 )
             else:
                 fuser.fuse_only()
