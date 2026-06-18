@@ -3,13 +3,15 @@ set -e
 
 DIR=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
 
-if command -v python &> /dev/null; then
-   PYTHON=python
-elif command -v python3 &> /dev/null; then
-   PYTHON=python3
+if [ -n "$CONDA_PREFIX" ] && [ -x "$CONDA_PREFIX/bin/python" ]; then
+    PYTHON="$CONDA_PREFIX/bin/python"
+elif [ -x "$(command -v python)" ]; then
+    PYTHON=python
+elif [ -x "$(command -v python3)" ]; then
+    PYTHON=python3
 else
-   echo "Error: python not found in PATH"
-   exit 1
+    echo "Could not find a Python interpreter." >&2
+    exit 1
 fi
 
 if [ "$(uname)" == "Linux" ]; then
