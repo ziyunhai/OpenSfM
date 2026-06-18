@@ -61,16 +61,6 @@ if(UNIX AND NOT APPLE)
     endif()
 endif()
 
-# Ceres2 exposes Ceres::ceres target.
-# Ceres1 exposes just ceres.
-# - if there's no such target, cmake will convert it into -lceres
-# and the linker will fail
-if(Ceres_ceres_FOUND)
-    set(CERES_LIBRARIES Ceres::ceres)
-else()
-    set(CERES_LIBRARIES ceres)
-endif()
-
 # Only link against the OpenCV components we actually need
 # This avoids pulling in unnecessary dependencies like viz (which requires VTK)
 # OpenCV's OpenCVConfig will enforce imgcodecs for < 3.0
@@ -108,6 +98,9 @@ set_target_properties(simdjson PROPERTIES
 target_compile_options(simdjson PRIVATE -w)
 
 include_directories(third_party/vlfeat)
+if (CERES_FOUND)
+    include_directories(${CERES_INCLUDE_DIR})
+endif()
 
 ####### Debugging #######
 if (CMAKE_BUILD_TYPE MATCHES DEBUG)
