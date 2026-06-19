@@ -262,6 +262,7 @@ class SVOIntegratorCL {
 
   // Refinement kernels and buffers.
   cl::Kernel k_refine_clear_;
+  cl::Kernel k_make_luma_;
   cl::Kernel k_refine_accumulate_;
   cl::Kernel k_refine_update_;
   cl::Kernel k_bake_colors_;
@@ -270,6 +271,7 @@ class SVOIntegratorCL {
   cl::Buffer cl_refine_grad_w_;       // 1 float/slot
   cl::Buffer cl_refine_adam_;         // 2 floats/slot: m_d, v_d
   cl::Image2DArray cl_color_images_;  // CL_RGBA CL_UNORM_INT8 [n_views × H × W]
+  cl::Image2DArray cl_luma_images_;   // CL_R CL_UNORM_INT8 [n_views × H × W] (gray)
   cl::Image2DArray cl_tsdf_depths_;   // CL_R CL_FLOAT [n_views × H × W]
   cl::Image2DArray cl_clean_depths_;  // CL_R CL_FLOAT [n_views × H × W]
                                       // (immutable, for bake occlusion)

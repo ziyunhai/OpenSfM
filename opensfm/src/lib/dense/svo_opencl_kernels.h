@@ -341,14 +341,12 @@ __kernel void svo_integrate(
             ((float)kz + 0.5f) * voxel_size);
 
         // Project voxel centre into camera frame → get its depth.
-        float3 p_cam_v;
-        p_cam_v.x = cam->R[0]*center.x + cam->R[1]*center.y + cam->R[2]*center.z + cam->t[0];
-        p_cam_v.y = cam->R[3]*center.x + cam->R[4]*center.y + cam->R[5]*center.z + cam->t[1];
-        p_cam_v.z = cam->R[6]*center.x + cam->R[7]*center.y + cam->R[8]*center.z + cam->t[2];
+        // Only the camera-frame z (depth) is used, so skip the x/y rows.
+        float p_cam_z = cam->R[6]*center.x + cam->R[7]*center.y + cam->R[8]*center.z + cam->t[2];
 
-        if (p_cam_v.z <= 0.0f) continue;
+        if (p_cam_z <= 0.0f) continue;
 
-        float sdf = d - p_cam_v.z;
+        float sdf = d - p_cam_z;
         if (sdf < -trunc) continue;
 
         float tsdf = fmin(sdf / trunc, 1.0f);
@@ -513,14 +511,12 @@ __kernel void svo_count(
             ((float)kz + 0.5f) * voxel_size);
 
         // Project voxel centre into camera frame.
-        float3 p_cam_v;
-        p_cam_v.x = cam->R[0]*center.x + cam->R[1]*center.y + cam->R[2]*center.z + cam->t[0];
-        p_cam_v.y = cam->R[3]*center.x + cam->R[4]*center.y + cam->R[5]*center.z + cam->t[1];
-        p_cam_v.z = cam->R[6]*center.x + cam->R[7]*center.y + cam->R[8]*center.z + cam->t[2];
+        // Only the camera-frame z (depth) is used, so skip the x/y rows.
+        float p_cam_z = cam->R[6]*center.x + cam->R[7]*center.y + cam->R[8]*center.z + cam->t[2];
 
-        if (p_cam_v.z <= 0.0f) continue;
+        if (p_cam_z <= 0.0f) continue;
 
-        float sdf = d - p_cam_v.z;
+        float sdf = d - p_cam_z;
         if (sdf < -trunc) continue;
 
         count_hash_insert(table, capacity_mask, counter, overflow_counter, kx, ky, kz);
@@ -994,6 +990,17 @@ float gray_from_array(read_only image2d_array_t images,
     return (c.x + c.y + c.z) * 0.333333f;
 }
 
+// Grayscale from a precomputed single-channel luma image array (built by
+// svo_refine_make_luma).  Same bilinear sampler as gray_from_array but reads
+// one channel instead of RGBA (≈¼ the texture bandwidth + cache footprint).
+float gray_from_luma(read_only image2d_array_t luma,
+                     const sampler_t samp,
+                     float u, float v, int layer)
+{
+    return read_imagef(luma, samp,
+                       (float4)(u + 0.5f, v + 0.5f, (float)layer, 0.0f)).x;
+}
+
 // Color (rgb) from image array layer.
 float3 color_from_array(read_only image2d_array_t images,
                         const sampler_t samp,
@@ -1028,6 +1035,172 @@ float2 image_grad_array(read_only image2d_array_t images,
 //               = w_center × (ref_norm_center - NCC×src_norm_center) / (σ_src × Σw)
 //   var_r,var_s = windowed patch variances (texture/contrast confidence)
 // Returns (-1,0,0,0) when either patch variance < 1.5e-6 (flat/uniform region).
+// Patch geometry cached per work-item by svo_refine_accumulate.  Must cover
+// the half_patch the host uses (keep in sync with svo_opencl.cc: refine
+// half_patch = 5 -> 11x11 = 121 samples).
+#ifndef SVO_ZNCC_MAX_HALF_PATCH
+#define SVO_ZNCC_MAX_HALF_PATCH 5
+#endif
+#define SVO_ZNCC_MAX_SAMPLES \
+    ((2 * SVO_ZNCC_MAX_HALF_PATCH + 1) * (2 * SVO_ZNCC_MAX_HALF_PATCH + 1))
+// Spatial weights depend only on ix²+iy² (radius²), which ranges over
+// [0, 2·half_patch²] — so a small LUT replaces the per-sample weight array.
+#define SVO_ZNCC_W_LUT_SIZE \
+    (2 * SVO_ZNCC_MAX_HALF_PATCH * SVO_ZNCC_MAX_HALF_PATCH + 1)
+
+// Reference side of the bilateral ZNCC patch.  The reference texture reads,
+// the spatial weights and the reference moments depend ONLY on the reference
+// view/pixel, so they are identical for every neighbor view a surface point
+// is compared against.  compute_zncc_ref fills this once per work-item and
+// compute_zncc_src reuses it for each neighbor, removing the redundant
+// per-neighbor reference reads and exp() weights.  Every accumulation keeps
+// the original loop order, so the result is bit-for-bit unchanged.
+typedef struct {
+    int   valid;        // 0 when Σw or var_r fail (every neighbor -> ncc = -1)
+    float sum_w;
+    float inv_w;
+    float mean_r;
+    float var_r;
+    float sigma_r;
+    float ref_norm_c;   // -mean_r / sigma_r
+    float w_center;
+    float w_lut[SVO_ZNCC_W_LUT_SIZE];  // spatial weight by radius² (ix²+iy²)
+    float wr[SVO_ZNCC_MAX_SAMPLES];    // per-sample w * r (iy then ix)
+} ZnccRef;
+
+// Precompute the reference side of the ZNCC patch for a pixel (see ZnccRef).
+void compute_zncc_ref(
+    read_only image2d_array_t luma,
+    int ref_layer, float ref_cx, float ref_cy,
+    int half_patch,
+    float inv_sigma_s2,
+    ZnccRef *rp)
+{
+    const sampler_t samp = CLK_NORMALIZED_COORDS_FALSE |
+                           CLK_ADDRESS_CLAMP_TO_EDGE |
+                           CLK_FILTER_LINEAR;
+
+    float ref_center = gray_from_luma(luma, samp, ref_cx, ref_cy, ref_layer);
+
+    float sum_w  = 0.0f;
+    float sum_r  = 0.0f, sum_rr = 0.0f;
+    float w_center = 0.0f;
+
+    // Spatial weight LUT: w(ix,iy) = exp(inv_sigma_s2·(ix²+iy²)) depends only on
+    // the integer radius², so build the ≤51-entry table once (instead of one
+    // exp() per sample) and index it by ix²+iy² below.  (float)(ix²+iy²) equals
+    // fdx²+fdy² exactly for |ix|,|iy| ≤ half_patch, so this is bit-identical.
+    for (int q = 0; q < SVO_ZNCC_W_LUT_SIZE; q++)
+        rp->w_lut[q] = exp(inv_sigma_s2 * (float)q);
+
+    int p = 0;
+    for (int iy = -half_patch; iy <= half_patch; iy++) {
+        for (int ix = -half_patch; ix <= half_patch; ix++) {
+            float fdx = (float)ix, fdy = (float)iy;
+            float ref_g = gray_from_luma(luma, samp, ref_cx + fdx, ref_cy + fdy, ref_layer);
+
+            float r = ref_g - ref_center;            // centered at ref_center
+            float w = rp->w_lut[ix*ix + iy*iy];
+
+            sum_r  += w * r;
+            sum_rr += w * r * r;
+            sum_w  += w;
+            if (ix == 0 && iy == 0) w_center = w;
+
+            rp->wr[p] = w * r;
+            p++;
+        }
+    }
+
+    rp->valid    = 0;
+    rp->sum_w    = sum_w;
+    rp->w_center = w_center;
+    if (sum_w < 1e-6f) return;
+
+    float inv_w  = 1.0f / sum_w;
+    float mean_r = sum_r * inv_w;
+    float var_r  = sum_rr * inv_w - mean_r * mean_r;
+    if (var_r < 1.5e-6f) return;
+
+    rp->inv_w      = inv_w;
+    rp->mean_r     = mean_r;
+    rp->var_r      = var_r;
+    rp->sigma_r    = sqrt(var_r);
+    rp->ref_norm_c = -mean_r / rp->sigma_r;
+    rp->valid      = 1;
+}
+
+// Source side of the bilateral ZNCC against neighbor view src_layer, reusing
+// the precomputed reference patch.  Returns (ncc, d2ncc, var_r, var_s) exactly
+// as the original compute_zncc_array did, and additionally writes the central
+// image gradient at (src_cx, src_cy) to *grad_out — captured from the very
+// patch taps it already reads, so no extra texture fetches are issued.
+float4 compute_zncc_src(
+    read_only image2d_array_t luma,
+    int src_layer, float src_cx, float src_cy,
+    int half_patch,
+    const ZnccRef *rp,
+    float2 *grad_out)
+{
+    *grad_out = (float2)(0.0f, 0.0f);
+    if (!rp->valid) return (float4)(-1.0f, 0.0f, 0.0f, 0.0f);
+
+    const sampler_t samp = CLK_NORMALIZED_COORDS_FALSE |
+                           CLK_ADDRESS_CLAMP_TO_EDGE |
+                           CLK_FILTER_LINEAR;
+
+    float src_center = gray_from_luma(luma, samp, src_cx, src_cy, src_layer);
+
+    float sum_s  = 0.0f, sum_ss = 0.0f, sum_rs = 0.0f;
+    float g_xp = 0.0f, g_xm = 0.0f, g_yp = 0.0f, g_ym = 0.0f;
+
+    int p = 0;
+    for (int iy = -half_patch; iy <= half_patch; iy++) {
+        for (int ix = -half_patch; ix <= half_patch; ix++) {
+            float fdx = (float)ix, fdy = (float)iy;
+            float src_g = gray_from_luma(luma, samp, src_cx + fdx, src_cy + fdy, src_layer);
+
+            float w  = rp->w_lut[ix*ix + iy*iy];
+            float wr = rp->wr[p];
+            p++;
+
+            float s = src_g - src_center;  // centered at src_center
+            sum_s  += w * s;
+            sum_ss += w * s * s;
+            sum_rs += wr * s;
+
+            // Capture the 4 central-difference taps for the image gradient —
+            // identical reads to image_grad_array with the same LINEAR sampler.
+            if (iy == 0) {
+                if (ix ==  1)      g_xp = src_g;
+                else if (ix == -1) g_xm = src_g;
+            }
+            if (ix == 0) {
+                if (iy ==  1)      g_yp = src_g;
+                else if (iy == -1) g_ym = src_g;
+            }
+        }
+    }
+
+    *grad_out = (float2)((g_xp - g_xm) * 0.5f, (g_yp - g_ym) * 0.5f);
+
+    float mean_s = sum_s * rp->inv_w;
+    float var_s  = sum_ss * rp->inv_w - mean_s * mean_s;
+    if (var_s < 1.5e-6f) return (float4)(-1.0f, 0.0f, 0.0f, 0.0f);
+
+    float sigma_s = sqrt(var_s);
+    float covar   = sum_rs * rp->inv_w - rp->mean_r * mean_s;
+    float ncc     = covar / (rp->sigma_r * sigma_s);
+
+    float src_norm_c = -mean_s / sigma_s;
+    float d2ncc = rp->w_center * (rp->ref_norm_c - ncc * src_norm_c) / (sigma_s * rp->sum_w);
+
+    return (float4)(ncc, d2ncc, rp->var_r, var_s);
+}
+
+// NOTE: compute_zncc_array (below) and image_grad_array are now superseded by
+// the compute_zncc_ref / compute_zncc_src split above and are no longer
+// called.  Left in place for this focused pass; safe to delete.
 float4 compute_zncc_array(
     read_only image2d_array_t images,
     int ref_layer, float ref_cx, float ref_cy,
@@ -1101,6 +1274,29 @@ float4 compute_zncc_array(
 // =====================================================================
 // svo_refine_clear — zero gradient (1 float/slot) + Adam (2 floats/slot)
 // =====================================================================
+// =====================================================================
+// svo_refine_make_luma — precompute single-channel luma from the RGBA color
+// image array so the ZNCC patch sampling reads 1 channel instead of 4
+// (≈¼ the texture bandwidth + cache footprint).  gray = (r+g+b)/3, matching
+// gray_from_array exactly.  Run once per PrepareRefinement.
+// global = (width, height, n_views).
+// =====================================================================
+__kernel void svo_refine_make_luma(
+    read_only  image2d_array_t color_images,   // CL_RGBA UNORM_INT8
+    write_only image2d_array_t luma_images,    // CL_R    UNORM_INT8
+    int width, int height, int n_views)
+{
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    int v = get_global_id(2);
+    if (x >= width || y >= height || v >= n_views) return;
+    // Sampler-less integer read of the exact texel, then the same gray as
+    // gray_from_array.  Hardware quantizes g to the luma image's 8-bit format.
+    float4 c = read_imagef(color_images, (int4)(x, y, v, 0));
+    float g = (c.x + c.y + c.z) * 0.333333f;
+    write_imagef(luma_images, (int4)(x, y, v, 0), (float4)(g, 0.0f, 0.0f, 0.0f));
+}
+
 __kernel void svo_refine_clear(
     __global float* grad_buf,   // 1 float per slot
     __global float* grad_w_buf, // 1 float per slot
@@ -1135,7 +1331,8 @@ __kernel void svo_refine_accumulate(
     uint                      capacity_mask,
     __global float*           grad_buf,          // 1 float per slot
     __global float*           grad_w_buf,        // 1 float per slot
-    read_only image2d_array_t color_images,      // CL_RGBA UNORM_INT8
+    read_only image2d_array_t color_images,      // CL_RGBA UNORM_INT8 (alpha = validity)
+    read_only image2d_array_t luma_images,       // CL_R UNORM_INT8 (precomputed gray)
     read_only image2d_array_t tsdf_depths,       // CL_R FLOAT
     __constant SVOCamera*     cameras,
     __global const int*       neighbor_buf,      // n_views × max_neighbors
@@ -1211,6 +1408,15 @@ __kernel void svo_refine_accumulate(
     float total_grad_d = 0.0f;
     float total_w      = 0.0f;  // sum of texture-confidence weights
 
+    // The reference side of the ZNCC patch is identical for every neighbor —
+    // build it once here instead of inside each neighbor's compute_zncc call.
+    // A flat/uniform reference patch (var_r below threshold) makes every
+    // neighbor's NCC fail, so nothing would be deposited: bail out early.
+    ZnccRef zref;
+    compute_zncc_ref(luma_images, src_view, (float)col, (float)row,
+                     half_patch, inv_sigma_s2, &zref);
+    if (!zref.valid) return;
+
     const int nb_offset = src_view * max_neighbors;
     for (int k = 0; k < max_neighbors; k++) {
         int j = neighbor_buf[nb_offset + k];
@@ -1254,11 +1460,11 @@ __kernel void svo_refine_accumulate(
         if (cos_angle < 0.15f) continue;
 
         // ---- Bilateral ZNCC between source and target views ----
-        float4 zncc_result = compute_zncc_array(
-            color_images,
-            src_view, (float)col, (float)row,
-            j, px, py,
-            half_patch, inv_sigma_s2);
+        // Reuses the precomputed reference patch and captures the projected
+        // image gradient (ig) from the same source reads — no extra fetches.
+        float2 ig;
+        float4 zncc_result = compute_zncc_src(
+            luma_images, j, px, py, half_patch, &zref, &ig);
 
         float ncc   = zncc_result.x;
         float d2ncc = zncc_result.y;
@@ -1283,11 +1489,8 @@ __kernel void svo_refine_accumulate(
         float du_dn = inv_zj * (fx_j * n_cam_x - (px - cx_j) * n_cam_z);
         float dv_dn = inv_zj * (fy_j * n_cam_y - (py - cy_j) * n_cam_z);
 
-        // Image gradient ∇I_j at projected point.
-        const sampler_t lin_samp = CLK_NORMALIZED_COORDS_FALSE |
-                                   CLK_ADDRESS_CLAMP_TO_EDGE |
-                                   CLK_FILTER_LINEAR;
-        float2 ig = image_grad_array(color_images, lin_samp, px, py, j);
+        // Image gradient ∇I_j at the projected point (ig) was captured by
+        // compute_zncc_src above, from the same patch reads.
 
         // Chain rule: ∂E/∂φ = d2ncc × ∇I_j·(du_dn,dv_dn) × cos_angle / |∇φ|
         // where E = 1 - NCC. Update kernel does φ_new = φ - lr*grad → descent.
@@ -2234,6 +2437,14 @@ __kernel void svo_dc_raster(
     int wA;
     dc_tsdf(table, i, &tA, &wA);  // present: this slot owns a vertex
 
+    // Cube A's own vertex lives in this slot (i).  It was already proven to
+    // exist by the NaN check above, and hash_lookup(kx,ky,kz) would simply
+    // return i, so read it directly once instead of re-looking it up on
+    // every axis iteration.
+    float3 v00 = (float3)(vert_pos[i * 3 + 0],
+                          vert_pos[i * 3 + 1],
+                          vert_pos[i * 3 + 2]);
+
     for (int axis = 0; axis < 3; axis++) {
         int bx = kx, by = ky, bz = kz;
         if (axis == 0) bx++;
@@ -2253,9 +2464,8 @@ __kernel void svo_dc_raster(
         else                { Px = 1; Py = 0; Pz = 0; Qx = 0; Qy = 1; Qz = 0; }
 
         // 4 cubes sharing the edge: A, A-P, A-Q, A-P-Q (by min-corner).
-        float3 v00, v10, v01, v11;
-        if (!dc_vertex_lookup(table, capacity_mask, vert_pos,
-                              kx, ky, kz, &v00)) continue;
+        // v00 (cube A's own vertex) was read once above the loop.
+        float3 v10, v01, v11;
         if (!dc_vertex_lookup(table, capacity_mask, vert_pos,
                               kx - Px, ky - Py, kz - Pz, &v10)) continue;
         if (!dc_vertex_lookup(table, capacity_mask, vert_pos,

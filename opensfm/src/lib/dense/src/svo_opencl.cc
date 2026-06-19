@@ -46,6 +46,9 @@ void SVOIntegratorCL::BuildKernels() {
   k_refine_clear_ = cl::Kernel(program_, "svo_refine_clear", &err);
   opencl::CheckCL(err, "kernel svo_refine_clear");
 
+  k_make_luma_ = cl::Kernel(program_, "svo_refine_make_luma", &err);
+  opencl::CheckCL(err, "kernel svo_refine_make_luma");
+
   k_refine_accumulate_ = cl::Kernel(program_, "svo_refine_accumulate", &err);
   opencl::CheckCL(err, "kernel svo_refine_accumulate");
 
@@ -912,6 +915,7 @@ void SVOIntegratorCL::PrepareRefinement(
 
   // Free any prior refinement working set before reallocating
   cl_color_images_ = cl::Image2DArray();
+  cl_luma_images_ = cl::Image2DArray();
   cl_tsdf_depths_ = cl::Image2DArray();
   cl_clean_depths_ = cl::Image2DArray();
   cl_cameras_array_ = cl::Buffer();
@@ -945,6 +949,17 @@ void SVOIntegratorCL::PrepareRefinement(
       static_cast<cl::size_type>(img_width),
       static_cast<cl::size_type>(img_height), 0, 0, nullptr, &err);
   opencl::CheckCL(err, "refine color image2d_array");
+
+  // Luma: CL_R CL_UNORM_INT8, gray = (r+g+b)/3, filled once by
+  // svo_refine_make_luma below.  The ZNCC patch sampling reads this single
+  // channel instead of the RGBA color image (~1/4 the texture bandwidth and
+  // cache footprint).  READ_WRITE: written by make_luma, sampled by accumulate.
+  cl::ImageFormat luma_fmt(CL_R, CL_UNORM_INT8);
+  cl_luma_images_ = cl::Image2DArray(
+      ctx, CL_MEM_READ_WRITE, luma_fmt, static_cast<cl::size_type>(n_views),
+      static_cast<cl::size_type>(img_width),
+      static_cast<cl::size_type>(img_height), 0, 0, nullptr, &err);
+  opencl::CheckCL(err, "refine luma image2d_array");
 
   // TSDF-rendered depth array, pre-filled with clean depths.  The clean depths
   // serve as initial hints for guided narrow-band raycast, avoiding blind
@@ -1032,6 +1047,22 @@ void SVOIntegratorCL::PrepareRefinement(
   queue.enqueueWriteBuffer(cl_cameras_array_, CL_FALSE, 0, cam_bytes,
                            cameras.data());
 
+  // Build the single-channel luma image from the uploaded color images (the
+  // color writes above were blocking, so they are complete).  Done once here;
+  // refinement then samples luma instead of RGBA in the ZNCC inner loop.
+  {
+    k_make_luma_.setArg(0, cl_color_images_);
+    k_make_luma_.setArg(1, cl_luma_images_);
+    k_make_luma_.setArg(2, static_cast<cl_int>(img_width));
+    k_make_luma_.setArg(3, static_cast<cl_int>(img_height));
+    k_make_luma_.setArg(4, static_cast<cl_int>(n_views));
+    const cl::NDRange luma_global(static_cast<size_t>(img_width),
+                                  static_cast<size_t>(img_height),
+                                  static_cast<size_t>(n_views));
+    queue.enqueueNDRangeKernel(k_make_luma_, cl::NullRange, luma_global,
+                               cl::NullRange);
+  }
+
   // Clear gradient and Adam buffers.
   queue.finish();
   {
@@ -1063,6 +1094,7 @@ void SVOIntegratorCL::ReleaseRefineBuffers() {
   cl_refine_grad_w_ = cl::Buffer();
   cl_refine_adam_ = cl::Buffer();
   cl_color_images_ = cl::Image2DArray();
+  cl_luma_images_ = cl::Image2DArray();
   cl_tsdf_depths_ = cl::Image2DArray();
   cl_clean_depths_ = cl::Image2DArray();
   cl_cameras_array_ = cl::Buffer();
@@ -1220,6 +1252,7 @@ void SVOIntegratorCL::RefineGeometry(int iters, float lambda_reg,
       k_refine_accumulate_.setArg(arg++, cl_refine_grad_);
       k_refine_accumulate_.setArg(arg++, cl_refine_grad_w_);
       k_refine_accumulate_.setArg(arg++, cl_color_images_);
+      k_refine_accumulate_.setArg(arg++, cl_luma_images_);
       k_refine_accumulate_.setArg(arg++, cl_tsdf_depths_);
       k_refine_accumulate_.setArg(arg++, cl_cameras_array_);
       k_refine_accumulate_.setArg(arg++, cl_neighbors);

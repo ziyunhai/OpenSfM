@@ -259,7 +259,14 @@ void DepthmapEstimator::RunLevel(int level, int total_levels,
 // =====================================================================
 void DepthmapEstimator::BuildKernels() {
   auto& dev = opencl::CLContext::Instance().Device(device_idx_);
-  program_ = dev.GetOrBuildProgram("patchmatch", kPatchMatchKernelSource);
+  // Bake the patch half-size into the program (-DPM_HALF_PATCH) so the
+  // per-pixel reference-patch cache in the kernel is sized exactly, and key
+  // the program cache by it so distinct patch sizes get their own build.
+  const int half_patch = params_.patch_size / 2;
+  const std::string pm_opts = " -DPM_HALF_PATCH=" + std::to_string(half_patch);
+  program_ = dev.GetOrBuildProgram(
+      "patchmatch_hp" + std::to_string(half_patch), kPatchMatchKernelSource,
+      pm_opts);
 
   cl_int err;
   k_random_init_ = cl::Kernel(program_, "acmmp_random_init", &err);

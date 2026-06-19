@@ -25,6 +25,29 @@ inline const char* kPatchMatchKernelSource =
 // Maximum number of source images the kernels support.
 #define MAX_SOURCES 8
 
+// Patch half-size, baked in at build time (-DPM_HALF_PATCH=patch_size/2) so
+// the reference-patch cache below can be sized exactly.  Falls back to the
+// default 5x5 window (half_patch=2) when the define is not supplied.
+#ifndef PM_HALF_PATCH
+#define PM_HALF_PATCH 2
+#endif
+#define PM_PATCH_SAMPLES ((2 * PM_HALF_PATCH + 1) * (2 * PM_HALF_PATCH + 1))
+
+// Reference-side NCC patch.  The reference reads, bilateral weights and
+// reference moments depend ONLY on the reference image and (x, y) — they are
+// identical for every plane hypothesis tested at a pixel.  compute_ref_patch
+// fills this once per work-item and every compute_cost_vector call reuses it,
+// eliminating the redundant reference texture reads and exp() weights
+// (~14/15 of them on the acmmp_patchmatch hot path).
+typedef struct {
+  float ref_center;            // reference value at the patch centre
+  float sum_w;                 // Σ w     (bilateral weights)
+  float sum_wr;                // Σ w·r
+  float sum_wrr;               // Σ w·r·r
+  float w[PM_PATCH_SAMPLES];   // per-sample weight, row-major (iy then ix)
+  float wr[PM_PATCH_SAMPLES];  // per-sample w·r, same order
+} RefPatch;
+
 
 // Nearest-neighbor sampler for reading planes/costs from image2d_t.
 // Used to leverage the texture cache for scattered neighbor reads.
@@ -292,6 +315,57 @@ float compute_census_inner(
 }
 
 // =====================================================================
+// Precompute the reference-side patch for a pixel: the centre value, the
+// per-sample bilateral weights w / w·r and the moments Σw, Σw·r, Σw·r².
+//
+// All of these depend ONLY on the reference image and (x, y), so they are
+// the SAME for every plane hypothesis evaluated at this pixel.  Computing
+// them once here (instead of inside every compute_cost_vector call) removes
+// the redundant reference texture reads and exp() evaluations on the hot
+// path.  The accumulation order is identical to the original fused loop, so
+// the resulting moments are bit-for-bit unchanged.
+// =====================================================================
+void compute_ref_patch(
+    read_only image2d_t ref_img,
+    int x, int y,
+    int half_patch,
+    float spatial_factor,
+    float color_factor,
+    RefPatch *rp
+) {
+  const sampler_t samp = CLK_NORMALIZED_COORDS_FALSE |
+                         CLK_ADDRESS_CLAMP_TO_EDGE |
+                         CLK_FILTER_LINEAR;
+
+  float ref_center = read_imagef(ref_img, samp, (float2)(x + 0.5f, y + 0.5f)).x;
+
+  float sum_w = 0.0f, sum_wr = 0.0f, sum_wrr = 0.0f;
+  int p = 0;
+  for (int iy = -half_patch; iy <= half_patch; iy++) {
+    float ry = (float)(y + iy);
+    for (int ix = -half_patch; ix <= half_patch; ix++) {
+      float rx = (float)(x + ix);
+      float ref_val = read_imagef(ref_img, samp, (float2)(rx + 0.5f, ry + 0.5f)).x;
+      float r = ref_val - ref_center;
+      float w = exp(spatial_factor * (float)(ix*ix + iy*iy)
+                  + color_factor * r * r);
+      sum_w += w;
+      float wr = w * r;
+      sum_wr += wr;
+      sum_wrr += wr * r;
+      rp->w[p]  = w;
+      rp->wr[p] = wr;
+      p++;
+    }
+  }
+
+  rp->ref_center = ref_center;
+  rp->sum_w   = sum_w;
+  rp->sum_wr  = sum_wr;
+  rp->sum_wrr = sum_wrr;
+}
+
+// =====================================================================
 // Compute per-view cost vector: one cost per source image.
 // Returns the number of valid costs written.
 //
@@ -314,6 +388,7 @@ int compute_cost_vector(
     float sigma_spatial,
     float sigma_color,
     float census_weight,
+    const RefPatch *rp,
     float *out_costs,
     read_only image2d_array_t src_images
 ) {
@@ -340,7 +415,9 @@ int compute_cost_vector(
   float3 world_dx = backproject((float)(x+1), (float)y, depth_dx, &cameras[0]);
   float3 world_dy = backproject((float)x, (float)(y+1), depth_dy, &cameras[0]);
 
-  float ref_center = read_imagef(ref_img, samp, (float2)(x + 0.5f, y + 0.5f)).x;
+  // Reference centre + bilateral weights were precomputed once for this
+  // pixel (identical for every hypothesis) — reuse the cached patch.
+  float ref_center = rp->ref_center;
 
   float spatial_factor = -1.0f / (2.0f * sigma_spatial * sigma_spatial);
   float color_factor = -1.0f / (2.0f * sigma_color * sigma_color);
@@ -383,18 +460,15 @@ int compute_cost_vector(
     src_valid[i] = 1;
   }
 
-  // ---- FUSED NCC at stride=1: one exp() per sample for all sources ----
-  // Shared reference-side accumulators:
-  float sum_w = 0.0f, sum_wr = 0.0f, sum_wrr = 0.0f;
+  // ---- FUSED NCC at stride=1: reference weights come from the cache ----
   // Per-source accumulators:
   float sum_ws[MAX_SOURCES], sum_wss[MAX_SOURCES], sum_wrs[MAX_SOURCES];
   for (int i = 0; i < MAX_SOURCES; i++) {
     sum_ws[i] = 0.0f; sum_wss[i] = 0.0f; sum_wrs[i] = 0.0f;
   }
 
+  int p = 0;  // running index into the cached reference patch (iy then ix)
   for (int iy = -half_patch; iy <= half_patch; iy++) {
-    float ry = (float)(y + iy);
-
     // Hoist row-constant source base coordinates out of inner loop.
     float base_sx[MAX_SOURCES], base_sy[MAX_SOURCES];
     for (int s = 0; s < n_src; s++) {
@@ -404,18 +478,10 @@ int compute_cost_vector(
     }
 
     for (int ix = -half_patch; ix <= half_patch; ix++) {
-      float rx = (float)(x + ix);
-
-      // --- Reference: read ONCE, compute weight ONCE for all sources ---
-      float ref_val = read_imagef(ref_img, samp, (float2)(rx + 0.5f, ry + 0.5f)).x;
-      float r = ref_val - ref_center;
-      float w = exp(spatial_factor * (float)(ix*ix + iy*iy)
-                  + color_factor * r * r);
-
-      sum_w += w;
-      float wr = w * r;
-      sum_wr += wr;
-      sum_wrr += wr * r;
+      // --- Reference weight + w·r: precomputed once for all hypotheses ---
+      float w  = rp->w[p];
+      float wr = rp->wr[p];
+      p++;
 
       // --- All valid sources: only source-specific work here ---
       for (int s = 0; s < n_src; s++) {
@@ -433,14 +499,14 @@ int compute_cost_vector(
   }
 
   // ---- Compute NCC from accumulated stats; fallback for poor matches ----
-  if (sum_w < 1e-6f) {
+  if (rp->sum_w < 1e-6f) {
     for (int i = 0; i < n_src; i++) out_costs[i] = 2.0f;
     return n_src;
   }
 
-  float inv_w = 1.0f / sum_w;
-  float mean_r = sum_wr * inv_w;
-  float var_ref = sum_wrr * inv_w - mean_r * mean_r;
+  float inv_w = 1.0f / rp->sum_w;
+  float mean_r = rp->sum_wr * inv_w;
+  float var_ref = rp->sum_wrr * inv_w - mean_r * mean_r;
 
   for (int s = 0; s < n_src; s++) {
     if (!src_valid[s]) continue;
@@ -507,6 +573,7 @@ float compute_initial_cost_and_views(
     float sigma_color,
     int top_k,
     float census_weight,
+    const RefPatch *rp,
     uint *out_selected,
     read_only image2d_array_t src_images
 ) {
@@ -520,7 +587,7 @@ float compute_initial_cost_and_views(
 
   compute_cost_vector(ref_img, cameras, num_images, x, y, plane,
                       half_patch, sigma_spatial, sigma_color, census_weight,
-                      cost_vector, src_images);
+                      rp, cost_vector, src_images);
 
   int num_valid = 0;
   for (int i = 0; i < n_src; i++) {
@@ -955,12 +1022,19 @@ __kernel void acmmp_random_init(
   planes[idx] = plane;
   rand_states[idx] = state;
 
+  // Precompute the reference patch once for this pixel (shared by every
+  // hypothesis the cost function evaluates).
+  float spatial_factor = -1.0f / (2.0f * sigma_spatial * sigma_spatial);
+  float color_factor = -1.0f / (2.0f * sigma_color * sigma_color);
+  RefPatch rp;
+  compute_ref_patch(ref_img, x, y, half_patch, spatial_factor, color_factor, &rp);
+
   // Compute initial cost and selected views
   uint sel = 0u;
   costs[idx] = compute_initial_cost_and_views(
       ref_img, cameras, num_images,
       x, y, plane, half_patch, sigma_spatial, sigma_color, top_k,
-      census_weight, &sel, src_images);
+      census_weight, &rp, &sel, src_images);
   selected_views[idx] = sel;
 }
 
@@ -1050,6 +1124,13 @@ __kernel void acmmp_prior_reinit(
     }
   }
 
+  // Precompute the reference patch once for this pixel (shared by both the
+  // bootstrap path and the weighted-cost path below).
+  float spatial_factor = -1.0f / (2.0f * sigma_spatial * sigma_spatial);
+  float color_factor = -1.0f / (2.0f * sigma_color * sigma_color);
+  RefPatch rp;
+  compute_ref_patch(ref_img, x, y, half_patch, spatial_factor, color_factor, &rp);
+
   // If no views are selected yet (e.g. first iteration), fall back to
   // compute_initial_cost_and_views to bootstrap.
   if (weight_norm < 1e-6f) {
@@ -1057,7 +1138,7 @@ __kernel void acmmp_prior_reinit(
     float cost = compute_initial_cost_and_views(
         ref_img, cameras, num_images,
         x, y, plane, half_patch, sigma_spatial, sigma_color, top_k,
-        census_weight, &sel, src_images);
+        census_weight, &rp, &sel, src_images);
 
     if (smooth_weight > 1e-6f) {
       cost += smooth_weight * compute_smoothness_cost(planes_img, &cameras[0],
@@ -1078,7 +1159,7 @@ __kernel void acmmp_prior_reinit(
   for (int i = 0; i < MAX_SOURCES; i++) cost_vec[i] = 2.0f;
   compute_cost_vector(ref_img, cameras, num_images, x, y, plane,
       half_patch, sigma_spatial, sigma_color, census_weight,
-      cost_vec,
+      &rp, cost_vec,
       src_images);
 
   float cost = compute_weighted_cost_geom(cost_vec, view_weights, weight_norm,
@@ -1158,6 +1239,15 @@ __kernel void acmmp_patchmatch(
   int n_src = min(num_images - 1, MAX_SOURCES);
   int npix = width * height;
 
+  // Precompute the reference patch ONCE for this pixel.  Every
+  // compute_cost_vector call below (8 spatial candidates + current pixel +
+  // up to 6 refinement hypotheses) reuses it, so the reference texture
+  // reads and exp() weights are no longer recomputed per hypothesis.
+  float spatial_factor = -1.0f / (2.0f * sigma_spatial * sigma_spatial);
+  float color_factor = -1.0f / (2.0f * sigma_color * sigma_color);
+  RefPatch rp;
+  compute_ref_patch(ref_img, x, y, half_patch, spatial_factor, color_factor, &rp);
+
   // =================================================================
   // Step 1: Identify 8 candidate neighbor positions (adaptive search)
   // =================================================================
@@ -1183,7 +1273,7 @@ __kernel void acmmp_patchmatch(
     PlaneHypothesis best_plane = read_imagef(planes_img, samp_planes, (int2)(x, best_py));
     compute_cost_vector(ref_img, cameras, num_images, x, y,
         best_plane, half_patch, sigma_spatial, sigma_color, census_weight,
-        &cost_array[1 * MAX_SOURCES],
+        &rp, &cost_array[1 * MAX_SOURCES],
         src_images);
   }
 
@@ -1201,7 +1291,7 @@ __kernel void acmmp_patchmatch(
     PlaneHypothesis best_plane = read_imagef(planes_img, samp_planes, (int2)(x, best_py));
     compute_cost_vector(ref_img, cameras, num_images, x, y,
         best_plane, half_patch, sigma_spatial, sigma_color, census_weight,
-        &cost_array[3 * MAX_SOURCES],
+        &rp, &cost_array[3 * MAX_SOURCES],
         src_images);
   }
 
@@ -1219,7 +1309,7 @@ __kernel void acmmp_patchmatch(
     PlaneHypothesis best_plane = read_imagef(planes_img, samp_planes, (int2)(best_px, y));
     compute_cost_vector(ref_img, cameras, num_images, x, y,
         best_plane, half_patch, sigma_spatial, sigma_color, census_weight,
-        &cost_array[5 * MAX_SOURCES],
+        &rp, &cost_array[5 * MAX_SOURCES],
         src_images);
   }
 
@@ -1237,7 +1327,7 @@ __kernel void acmmp_patchmatch(
     PlaneHypothesis best_plane = read_imagef(planes_img, samp_planes, (int2)(best_px, y));
     compute_cost_vector(ref_img, cameras, num_images, x, y,
         best_plane, half_patch, sigma_spatial, sigma_color, census_weight,
-        &cost_array[7 * MAX_SOURCES],
+        &rp, &cost_array[7 * MAX_SOURCES],
         src_images);
   }
 
@@ -1261,7 +1351,7 @@ __kernel void acmmp_patchmatch(
     PlaneHypothesis best_plane = read_imagef(planes_img, samp_planes, (int2)(best_px, best_py));
     compute_cost_vector(ref_img, cameras, num_images, x, y,
         best_plane, half_patch, sigma_spatial, sigma_color, census_weight,
-        &cost_array[0 * MAX_SOURCES],
+        &rp, &cost_array[0 * MAX_SOURCES],
         src_images);
   }
 )CL"
@@ -1287,7 +1377,7 @@ __kernel void acmmp_patchmatch(
     PlaneHypothesis best_plane = read_imagef(planes_img, samp_planes, (int2)(best_px, best_py));
     compute_cost_vector(ref_img, cameras, num_images, x, y,
         best_plane, half_patch, sigma_spatial, sigma_color, census_weight,
-        &cost_array[2 * MAX_SOURCES],
+        &rp, &cost_array[2 * MAX_SOURCES],
         src_images);
   }
 
@@ -1311,7 +1401,7 @@ __kernel void acmmp_patchmatch(
     PlaneHypothesis best_plane = read_imagef(planes_img, samp_planes, (int2)(best_px, best_py));
     compute_cost_vector(ref_img, cameras, num_images, x, y,
         best_plane, half_patch, sigma_spatial, sigma_color, census_weight,
-        &cost_array[4 * MAX_SOURCES],
+        &rp, &cost_array[4 * MAX_SOURCES],
         src_images);
   }
 
@@ -1335,7 +1425,7 @@ __kernel void acmmp_patchmatch(
     PlaneHypothesis best_plane = read_imagef(planes_img, samp_planes, (int2)(best_px, best_py));
     compute_cost_vector(ref_img, cameras, num_images, x, y,
         best_plane, half_patch, sigma_spatial, sigma_color, census_weight,
-        &cost_array[6 * MAX_SOURCES],
+        &rp, &cost_array[6 * MAX_SOURCES],
         src_images);
   }
 
@@ -1516,7 +1606,7 @@ __kernel void acmmp_patchmatch(
   for (int i = 0; i < MAX_SOURCES; i++) cost_vec_now[i] = 2.0f;
   compute_cost_vector(ref_img, cameras, num_images, x, y,
       plane_now, half_patch, sigma_spatial, sigma_color, census_weight,
-      cost_vec_now, src_images);
+      &rp, cost_vec_now, src_images);
   float cost_now = compute_mc_cost(cost_vec_now, view_weights,
       weight_norm, n_src,
       cameras, plane_now, x, y,
@@ -1659,7 +1749,7 @@ __kernel void acmmp_patchmatch(
       for (int ci = 0; ci < MAX_SOURCES; ci++) cv[ci] = 2.0f;
       compute_cost_vector(ref_img, cameras, num_images, x, y, cand,
           half_patch, sigma_spatial, sigma_color, census_weight,
-          cv, src_images);
+          &rp, cv, src_images);
       float temp_cost = compute_mc_cost(cv, view_weights,
           weight_norm, n_src,
           cameras, cand, x, y,
