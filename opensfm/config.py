@@ -462,7 +462,10 @@ class OpenSfMConfig:
     # Weight for geometric consistency cost (0 = disabled). Applied per source view.
     depthmap_geom_consistency_weight: float = 0.05
     # Maximum number of reference views per cluster for geometric consistency.
-    depthmap_cluster_max_size: int = 8
+    # Each ref gets at most depthmap_num_matching_views geom-consistency links,
+    # so a cluster only needs to hold each ref's local neighbours; larger
+    # clusters add no geom benefit and raise peak RAM. ~num_matching_views + margin.
+    depthmap_cluster_max_size: int = 16
     # Use SfM points to seed a Delaunay planar prior before PatchMatch iterations
     depthmap_sfm_planar_prior: bool = False
     # Minimum baseline angle (degrees) for neighbor selection.
@@ -470,7 +473,7 @@ class OpenSfMConfig:
     # Maximum baseline angle (degrees) for neighbor selection.
     depthmap_neighbor_max_angle: float = 60.0
     # SVO voxel size in world units (meters). Smaller = finer but more memory.
-    depthmap_fusion_svo_voxel_size: float = 0.05
+    depthmap_fusion_svo_voxel_size: float = 0.035
     # SVO truncation factor: truncation_distance = factor * voxel_size.
     depthmap_fusion_svo_trunc_factor: float = 8
     # SVO minimum weight for extracting points

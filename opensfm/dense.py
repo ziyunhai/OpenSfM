@@ -313,6 +313,33 @@ def compute_depthmaps(
 # ═══════════════════════════════════════════════════════════════════════
 
 
+def _split_oversized_cluster(
+    shots: List[str],
+    reconstruction: types.Reconstruction,
+    max_size: int,
+) -> List[List[str]]:
+    """Split a cluster into spatially-compact pieces, each <= ``max_size``.
+
+    Used to enforce a hard cap that Leiden's soft ``max_comm_size`` does not
+    guarantee.  Performs a k-way contiguous split (k = ceil(n / max_size))
+    along the longest spatial axis of the camera centres.  Cutting
+    perpendicular to the longest axis severs the fewest spatial neighbours
+    (≈ a min-cut for survey imagery, where spatial proximity tracks
+    covisibility), so geometric-consistency context is largely preserved
+    within each piece.
+    """
+    n = len(shots)
+    if n <= max_size:
+        return [shots]
+    origins = np.array(
+        [reconstruction.shots[s].pose.get_origin() for s in shots]
+    )
+    axis = int(np.argmax(origins.max(axis=0) - origins.min(axis=0)))
+    order = np.argsort(origins[:, axis], kind="stable")
+    k = -(-n // max_size)  # ceil(n / max_size)
+    return [[shots[i] for i in part] for part in np.array_split(order, k)]
+
+
 def cluster_views(
     processable: List[str],
     tracks_manager: pymap.TracksManager,
@@ -411,7 +438,25 @@ def cluster_views(
         f"quality {partition.quality():.1f}, resolution {resolution:.1f}"
     )
 
-    # Absorb tiny clusters into best neighbour.
+    # Enforce the hard size cap.  leidenalg's ``max_comm_size`` is only a soft
+    # constraint — the aggregation phase routinely violates it, so Leiden can
+    # hand back communities several times the cap.  Split any oversized
+    # community into spatially-compact pieces, each <= max_cluster_size.
+    capped: List[List[str]] = []
+    for comm in final:
+        capped.extend(
+            _split_oversized_cluster(comm, reconstruction, int(max_cluster_size))
+        )
+    if len(capped) != len(final):
+        logger.info(
+            f"Hard size-cap split: {len(final)} → {len(capped)} clusters "
+            f"(cap {int(max_cluster_size)} views)"
+        )
+    final = capped
+
+    # Absorb tiny clusters into their best neighbour, but never past the size
+    # cap.  Candidates are restricted to clusters that can take the small one
+    # without exceeding ``max_cluster_size``
     idx_of: Dict[str, int] = {sid: i for i, sid in enumerate(processable)}
     changed = True
     while changed:
@@ -419,14 +464,12 @@ def cluster_views(
         for ci in range(len(final)):
             if len(final[ci]) >= int(max_cluster_size * 0.75):
                 continue
-            logger.info(
-                f"Cluster {ci} is too small (size {len(final[ci])}), "
-                f"absorbing into best neighbour"
-            )
             best_ti = -1
             best_sim_val = -1.0
             for ti in range(len(final)):
                 if ti == ci:
+                    continue
+                if len(final[ti]) + len(final[ci]) > max_cluster_size:
                     continue
                 s = sum(
                     pair_weight.get((idx_of[a], idx_of[b]), 0.0)
@@ -437,7 +480,7 @@ def cluster_views(
                     best_sim_val = s
                     best_ti = ti
             if best_ti < 0:
-                continue
+                continue  # nothing can absorb it without overflow → keep it
             final[best_ti].extend(final[ci])
             logger.info(
                 f"  Absorbed cluster {ci} (size {len(final[ci])}) into cluster {best_ti} (new size {len(final[best_ti])})"
