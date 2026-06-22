@@ -420,7 +420,7 @@ class OpenSfMConfig:
     # Min number of consistent views in clean stage
     depthmap_min_consistent_views: int = 3
     # Relative depth margin for space-carving votes; neighbor sees further by this fraction → carve vote.
-    depthmap_carving_threshold: float = 0.05
+    depthmap_carving_threshold: float = 0.01
     # Max carve votes a pixel can accumulate before being discarded.
     depthmap_max_carved_views: int = 1
     # Two-pass cleaning: pass 1 uses consistency only (no carving) on raw
@@ -466,6 +466,15 @@ class OpenSfMConfig:
     # so a cluster only needs to hold each ref's local neighbours; larger
     # clusters add no geom benefit and raise peak RAM. ~num_matching_views + margin.
     depthmap_cluster_max_size: int = 16
+    # Spatial gate for clustering: drop covisibility edges whose camera baseline
+    # exceeds this factor × the median baseline, so distant cameras that merely
+    # see common ground don't scatter clusters across the scene. 0 disables.
+    depthmap_cluster_edge_max_factor: float = 2.0
+    # Hard cap on the total views (cluster refs + neighbours) loaded per cluster
+    # batch in the cleaning and fusion stages.  Bounds peak RAM regardless of how
+    # spread a cluster is; neighbours are picked by covisibility coverage so the
+    # most shared context is kept.
+    depthmap_max_cluster_views: int = 48
     # Use SfM points to seed a Delaunay planar prior before PatchMatch iterations
     depthmap_sfm_planar_prior: bool = False
     # Minimum baseline angle (degrees) for neighbor selection.
@@ -496,7 +505,7 @@ class OpenSfMConfig:
     # Coarse grid cell size multiplier for pre-scan (cell = factor * voxel_size).
     depthmap_fusion_svo_coarse_factor: int = 8
     # Photometric TSDF refinement
-    depthmap_fusion_svo_refine_enabled: bool = True
+    depthmap_fusion_svo_refine_enabled: bool = False
     # Number of SDF refinement iterations.
     depthmap_fusion_svo_refine_iters: int = 50
     # Laplacian regularization weight (0 = disabled).

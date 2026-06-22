@@ -1,27 +1,22 @@
 # pyre-strict
 import argparse
 
-from opensfm.actions import compute_depthmaps
+from opensfm.actions import fuse_depthmaps
 from opensfm.dataset import DataSet
 
 from . import command
 
 
 class Command(command.CommandBase):
-    name = "compute_depthmaps"
-    help = "Dense stage 2: compute raw + clean depthmaps (needs dense_clustering)"
+    name = "fuse_depthmaps"
+    help = "Dense stage 3: fuse cleaned depthmaps per cluster"
 
     def run_impl(self, dataset: DataSet, args: argparse.Namespace) -> None:
-        compute_depthmaps.run_dataset(dataset, args.subfolder, args.interactive)
+        fuse_depthmaps.run_dataset(dataset, args.subfolder)
 
     def add_arguments_impl(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument(
             "--subfolder",
             help="undistorted subfolder where to load and store data",
             default="undistorted",
-        )
-        parser.add_argument(
-            "--interactive",
-            help="plot results as they are being computed",
-            action="store_true",
         )

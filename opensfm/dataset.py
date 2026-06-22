@@ -989,6 +989,81 @@ class UndistortedDataSet:
                 })
             io.json_dump({"clusters_points": clusters_points_list}, fout)
 
+    def _neighbors_best_file(self) -> str:
+        return os.path.join(self.data_path, "neighbors_best.json")
+
+    def _neighbors_all_file(self) -> str:
+        return os.path.join(self.data_path, "neighbors_all.json")
+
+    def _depth_ranges_file(self) -> str:
+        return os.path.join(self.data_path, "depth_ranges.json")
+
+    def neighbors_exist(self) -> bool:
+        return self.io_handler.isfile(
+            self._neighbors_best_file()
+        ) and self.io_handler.isfile(self._neighbors_all_file())
+
+    def save_neighbors_best(self, neighbors: Dict[str, List[str]]) -> None:
+        with self.io_handler.open_wt(self._neighbors_best_file()) as fout:
+            io.json_dump(neighbors, fout)
+
+    def load_neighbors_best(self) -> Dict[str, List[str]]:
+        with self.io_handler.open_rt(self._neighbors_best_file()) as fin:
+            return io.json_load(fin)
+
+    def save_neighbors_all(self, neighbors: Dict[str, List[str]]) -> None:
+        with self.io_handler.open_wt(self._neighbors_all_file()) as fout:
+            io.json_dump(neighbors, fout)
+
+    def load_neighbors_all(self) -> Dict[str, List[str]]:
+        with self.io_handler.open_rt(self._neighbors_all_file()) as fin:
+            return io.json_load(fin)
+
+    def depth_ranges_exist(self) -> bool:
+        return self.io_handler.isfile(self._depth_ranges_file())
+
+    def save_depth_ranges(
+        self, depth_ranges: Dict[str, Tuple[float, float]]
+    ) -> None:
+        payload = {
+            sid: [float(dr[0]), float(dr[1])]
+            for sid, dr in depth_ranges.items()
+        }
+        with self.io_handler.open_wt(self._depth_ranges_file()) as fout:
+            io.json_dump(payload, fout)
+
+    def load_depth_ranges(self) -> Dict[str, Tuple[float, float]]:
+        with self.io_handler.open_rt(self._depth_ranges_file()) as fin:
+            payload = io.json_load(fin)
+        return {sid: (float(v[0]), float(v[1])) for sid, v in payload.items()}
+
+    def _cluster_bboxes_file(self) -> str:
+        return os.path.join(self.data_path, "cluster_bboxes.json")
+
+    def cluster_bboxes_exist(self) -> bool:
+        return self.io_handler.isfile(self._cluster_bboxes_file())
+
+    def save_cluster_bboxes(
+        self, bboxes: List[Tuple[NDArray, NDArray]]
+    ) -> None:
+        payload = [
+            {"min": np.asarray(mn).tolist(), "max": np.asarray(mx).tolist()}
+            for mn, mx in bboxes
+        ]
+        with self.io_handler.open_wt(self._cluster_bboxes_file()) as fout:
+            io.json_dump({"cluster_bboxes": payload}, fout)
+
+    def load_cluster_bboxes(self) -> List[Tuple[NDArray, NDArray]]:
+        with self.io_handler.open_rt(self._cluster_bboxes_file()) as fin:
+            payload = io.json_load(fin)["cluster_bboxes"]
+        return [
+            (
+                np.array(b["min"], dtype=np.float64),
+                np.array(b["max"], dtype=np.float64),
+            )
+            for b in payload
+        ]
+
     def _depthmap_path(self) -> str:
         return os.path.join(self.data_path, "depthmaps")
 
@@ -1179,7 +1254,7 @@ class UndistortedDataSet:
         footprint carries data, so we crop to the tight bounding box of valid
         (non-NaN) DSM cells and store the row/col offset — a many-cluster
         project must not write that many full-extent rasters to disk.  The
-        tiles are composited back by max-z in ``_merge_dsm_ortho_batches``.
+        tiles are composited back by max-z in ``dense.merge.merge_dsm_ortho_batches``.
         Writes nothing for an empty footprint.
 
         Args:

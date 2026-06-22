@@ -6,7 +6,10 @@ from opensfm.dataset import DataSet
 
 
 def run_dataset(data: DataSet, subfolder: str, interactive: bool) -> None:
-    """Compute depthmap on a dataset with has SfM ran already.
+    """Compute raw + clean depthmaps on a dataset that has SfM ran already.
+
+    Requires the ``dense_clustering`` stage to have run first (clusters,
+    neighbours and depth ranges are loaded from disk).
 
     Args:
         subfolder: dataset's subfolder where to store results
@@ -19,4 +22,4 @@ def run_dataset(data: DataSet, subfolder: str, interactive: bool) -> None:
     udataset.config["interactive"] = interactive
     reconstructions = udataset.load_undistorted_reconstruction()
     tracks_manager = udataset.load_undistorted_tracks_manager()
-    dense.compute_depthmaps(udataset, tracks_manager, reconstructions[0])
+    dense.run_depthmaps(udataset, tracks_manager, reconstructions[0])
