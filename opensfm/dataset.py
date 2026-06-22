@@ -1155,6 +1155,87 @@ class UndistortedDataSet:
             aband.FlushCache()
         ds = None
 
+    # ── Per-cluster DSM/ortho tiles (composited into the final raster) ──
+    def dsm_ortho_batch_file(self, batch_num: int) -> str:
+        return os.path.join(
+            self._depthmap_path(), f"dsm_ortho_batch_{batch_num:04d}.npz"
+        )
+
+    def dsm_ortho_batch_exists(self, batch_num: int) -> bool:
+        return self.io_handler.isfile(self.dsm_ortho_batch_file(batch_num))
+
+    def save_dsm_ortho_batch(
+        self,
+        batch_num: int,
+        dsm_grid: NDArray,
+        ortho_grid: NDArray,
+        origin_x: float,
+        origin_y: float,
+        gsd: float,
+    ) -> None:
+        """Save one cluster's finished DSM+ortho as a compact tile.
+
+        Each cluster's grids span the full global extent but only the cluster's
+        footprint carries data, so we crop to the tight bounding box of valid
+        (non-NaN) DSM cells and store the row/col offset — a many-cluster
+        project must not write that many full-extent rasters to disk.  The
+        tiles are composited back by max-z in ``_merge_dsm_ortho_batches``.
+        Writes nothing for an empty footprint.
+
+        Args:
+            batch_num: cluster index (matches the ``fused_batch`` numbering).
+            dsm_grid: (H, W) float32, NaN = no surface, full global extent.
+            ortho_grid: (H, W, 3) uint8, full global extent.
+            origin_x/origin_y/gsd: global grid georeference (identical across
+                clusters); stored so the merge can write the final GeoTIFF.
+        """
+        self.io_handler.mkdir_p(self._depthmap_path())
+        valid = ~np.isnan(dsm_grid)
+        if not valid.any():
+            return
+        rows = np.where(valid.any(axis=1))[0]
+        cols = np.where(valid.any(axis=0))[0]
+        r0, r1 = int(rows[0]), int(rows[-1]) + 1
+        c0, c1 = int(cols[0]), int(cols[-1]) + 1
+        dsm_win = np.ascontiguousarray(dsm_grid[r0:r1, c0:c1], dtype=np.float32)
+        ortho_win = np.ascontiguousarray(
+            ortho_grid[r0:r1, c0:c1], dtype=np.uint8
+        )
+        buf = BytesIO()
+        np.savez(
+            buf,
+            dsm=dsm_win,
+            ortho=ortho_win,
+            offset=np.array([r0, c0], dtype=np.int64),
+            global_shape=np.array(dsm_grid.shape[:2], dtype=np.int64),
+            geo=np.array([origin_x, origin_y, gsd], dtype=np.float64),
+        )
+        with self.io_handler.open_wb(self.dsm_ortho_batch_file(batch_num)) as f:
+            f.write(lz4_frame.compress(buf.getvalue()))
+
+    def load_dsm_ortho_batch(
+        self, batch_num: int
+    ) -> Tuple[NDArray, NDArray, int, int, Tuple[int, int],
+               Tuple[float, float, float]]:
+        """Load a DSM/ortho tile.
+
+        Returns ``(dsm_win, ortho_win, row0, col0, (global_h, global_w),
+        (origin_x, origin_y, gsd))``.
+        """
+        with self.io_handler.open_rb(
+            self.dsm_ortho_batch_file(batch_num)
+        ) as f:
+            raw = lz4_frame.decompress(f.read())
+        o = np.load(BytesIO(raw))
+        dsm = o["dsm"]
+        ortho = o["ortho"]
+        r0, c0 = int(o["offset"][0]), int(o["offset"][1])
+        gh, gw = int(o["global_shape"][0]), int(o["global_shape"][1])
+        ox, oy, gsd = (float(o["geo"][0]), float(o["geo"][1]),
+                       float(o["geo"][2]))
+        o.close()
+        return dsm, ortho, r0, c0, (gh, gw), (ox, oy, gsd)
+
     def raw_depthmap_exists(self, image: str) -> bool:
         return self.io_handler.isfile(self.depthmap_file(image, "raw.npz"))
 

@@ -297,6 +297,14 @@ def compute_depthmaps(
     context.log_memory("phase 3 fusion done")
     _merge_fusion_batches(data, list(range(len(clusters))))
 
+    # Composite the per-cluster DSM/ortho tiles into the final raster.  Without
+    # this each cluster's save would overwrite dsm.tif / ortho.tif and only the
+    # last cluster processed would appear.
+    if config["dsm_enabled"]:
+        _merge_dsm_ortho_batches(
+            data, list(range(len(clusters))), reconstruction.reference
+        )
+
     context.log_memory("phase 4 merge done")
 
     # Optionally also export the merged cloud as LAS / LAZ (archival/interchange).
@@ -445,7 +453,8 @@ def cluster_views(
     capped: List[List[str]] = []
     for comm in final:
         capped.extend(
-            _split_oversized_cluster(comm, reconstruction, int(max_cluster_size))
+            _split_oversized_cluster(
+                comm, reconstruction, int(max_cluster_size))
         )
     if len(capped) != len(final):
         logger.info(
@@ -2074,6 +2083,7 @@ def _fuse_per_cluster(
             for sid, (d, n, _s, c) in zip(loadable_aug, _loaded_dm)
         }
         del _loaded_dm
+        context.log_memory(f"cluster {batch_num}: preloaded cleaned depthmaps")
 
         # Step 2: Pre-scan on CPU (subsampled depth projection).
         grid = _prescan_coarse_grid(
@@ -2085,6 +2095,7 @@ def _fuse_per_cluster(
             f"Cluster {batch_num}: pre-scan found {len(grid)} "
             f"coarse cells (cell_size={coarse_size:.3f}m)"
         )
+        context.log_memory(f"cluster {batch_num}: pre-scan grid built")
 
         # Step 3: Split into sub-volumes.
         subvolumes = _split_into_subvolumes(
@@ -2168,6 +2179,7 @@ def _fuse_per_cluster(
                 f"Cluster {batch_num}: DSM grid {dsm_w}×{dsm_h}, "
                 f"GSD={dsm_gsd:.4f}, Z=[{dsm_z_min:.2f}, {dsm_z_max:.2f}]"
             )
+            context.log_memory(f"cluster {batch_num}: DSM grid allocated")
 
         # Batch-load all views upfront (parallel I/O).
         view_cache = _prepare_views(augmented, clean_cache)
@@ -2543,21 +2555,23 @@ def _fuse_per_cluster(
             leaf_fusers = []
             view_cache.clear()
 
-            reference = reconstruction.reference
-            data.save_dsm(
-                dsm_grid, dsm_origin_x, dsm_origin_y,
-                dsm_gsd, reference,
+            # Persist this cluster's finished DSM+ortho as a compact tile; the
+            # final dsm.tif / ortho.tif are composited from every cluster's tile
+            # by max-z in Phase 4 (mirrors the fused_batch PLY merge).  Writing
+            # straight to dsm.tif here would let each cluster overwrite the
+            # previous one, so only the last cluster processed would survive.
+            ortho_tile = (
+                ortho_grid if ortho_grid is not None
+                else np.zeros((dsm_h, dsm_w, 3), dtype=np.uint8)
             )
-            logger.info(f"DSM saved to {data.dsm_file()}")
-            if ortho_grid is not None:
-                # No-data (transparent) wherever the DSM has no surface, so the
-                # ortho's background is distinguishable from genuine black.
-                data.save_ortho(
-                    ortho_grid, dsm_origin_x, dsm_origin_y,
-                    dsm_gsd, reference,
-                    nodata_mask=np.isnan(dsm_grid),
-                )
-                logger.info(f"Ortho saved to {data.ortho_file()}")
+            data.save_dsm_ortho_batch(
+                batch_num, dsm_grid, ortho_tile,
+                dsm_origin_x, dsm_origin_y, dsm_gsd,
+            )
+            logger.info(
+                f"Cluster {batch_num}: DSM/ortho tile saved → "
+                f"{data.dsm_ortho_batch_file(batch_num)}"
+            )
         else:
             view_cache.clear()
 
@@ -2792,6 +2806,78 @@ def _merge_fusion_batches(
         for filename, _n in batch_files:
             data.io_handler.rm_if_exist(data.point_cloud_file(filename))
         logger.info(f"Removed {len(batch_files)} merged batch PLY(s)")
+
+
+def _merge_dsm_ortho_batches(
+    data: UndistortedDataSet,
+    batch_nums: List[int],
+    reference: Optional[Any],
+) -> None:
+    """Composite per-cluster DSM/ortho tiles into the final dsm.tif / ortho.tif.
+
+    Each cluster wrote a tight-cropped tile (``save_dsm_ortho_batch``) keyed on
+    its offset into the shared global grid.  We allocate the global grid once
+    and merge every tile by **max-z**: a cell takes a tile's height+colour when
+    the tile has a surface there AND (the global cell is still empty OR the
+    tile's height is greater).  This keeps the higher surface where cluster
+    footprints overlap — the same arbitration used within a cluster.  The ortho
+    colour follows the winning height, so DSM and ortho stay consistent.
+
+    Tiles are deleted afterwards when ``depthmap_delete_fusion_batches`` is set,
+    matching the PLY batch cleanup.
+    """
+    present = [
+        bn for bn in sorted(batch_nums)
+        if data.dsm_ortho_batch_exists(bn)
+    ]
+    if not present:
+        logger.warning("No DSM/ortho tiles to merge.")
+        return
+
+    # Global extent + georeference come from the tiles themselves (identical
+    # across clusters); read the first to size the output grid.
+    _, _, _, _, (gh, gw), (origin_x, origin_y, gsd) = \
+        data.load_dsm_ortho_batch(present[0])
+    dsm = np.full((gh, gw), np.nan, dtype=np.float32)
+    ortho = np.zeros((gh, gw, 3), dtype=np.uint8)
+
+    n_merged = 0
+    for bn in present:
+        d_win, o_win, r0, c0, gshape, _geo = data.load_dsm_ortho_batch(bn)
+        if gshape != (gh, gw):
+            logger.warning(
+                f"DSM tile {bn} global shape {gshape} != {(gh, gw)}; skipping"
+            )
+            continue
+        h, w = d_win.shape[:2]
+        win_dsm = dsm[r0:r0 + h, c0:c0 + w]
+        win_ortho = ortho[r0:r0 + h, c0:c0 + w]
+        # Take cells where this tile has a surface and either the global grid is
+        # empty there or this tile's height wins (NaN-safe: NaN comparisons are
+        # False, so the isnan term carries empty cells).
+        take = ~np.isnan(d_win) & (np.isnan(win_dsm) | (d_win > win_dsm))
+        win_dsm[take] = d_win[take]
+        win_ortho[take] = o_win[take]
+        n_merged += 1
+        del d_win, o_win
+        gc.collect()
+
+    data.save_dsm(dsm, origin_x, origin_y, gsd, reference)
+    # No-data (transparent) wherever no cluster produced a surface.
+    data.save_ortho(
+        ortho, origin_x, origin_y, gsd, reference,
+        nodata_mask=np.isnan(dsm),
+    )
+    n_valid = int(np.count_nonzero(~np.isnan(dsm)))
+    logger.info(
+        f"Merged {n_merged} DSM/ortho tile(s) → {data.dsm_file()} / "
+        f"{data.ortho_file()} ({n_valid} valid cells)"
+    )
+
+    if data.config.get("depthmap_delete_fusion_batches", True):
+        for bn in present:
+            data.io_handler.rm_if_exist(data.dsm_ortho_batch_file(bn))
+        logger.info(f"Removed {len(present)} merged DSM/ortho tile(s)")
 
 
 # ═══════════════════════════════════════════════════════════════════════

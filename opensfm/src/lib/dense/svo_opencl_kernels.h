@@ -990,17 +990,6 @@ float gray_from_array(read_only image2d_array_t images,
     return (c.x + c.y + c.z) * 0.333333f;
 }
 
-// Grayscale from a precomputed single-channel luma image array (built by
-// svo_refine_make_luma).  Same bilinear sampler as gray_from_array but reads
-// one channel instead of RGBA (≈¼ the texture bandwidth + cache footprint).
-float gray_from_luma(read_only image2d_array_t luma,
-                     const sampler_t samp,
-                     float u, float v, int layer)
-{
-    return read_imagef(luma, samp,
-                       (float4)(u + 0.5f, v + 0.5f, (float)layer, 0.0f)).x;
-}
-
 // Color (rgb) from image array layer.
 float3 color_from_array(read_only image2d_array_t images,
                         const sampler_t samp,
@@ -1070,7 +1059,7 @@ typedef struct {
 
 // Precompute the reference side of the ZNCC patch for a pixel (see ZnccRef).
 void compute_zncc_ref(
-    read_only image2d_array_t luma,
+    read_only image2d_array_t images,
     int ref_layer, float ref_cx, float ref_cy,
     int half_patch,
     float inv_sigma_s2,
@@ -1080,7 +1069,7 @@ void compute_zncc_ref(
                            CLK_ADDRESS_CLAMP_TO_EDGE |
                            CLK_FILTER_LINEAR;
 
-    float ref_center = gray_from_luma(luma, samp, ref_cx, ref_cy, ref_layer);
+    float ref_center = gray_from_array(images, samp, ref_cx, ref_cy, ref_layer);
 
     float sum_w  = 0.0f;
     float sum_r  = 0.0f, sum_rr = 0.0f;
@@ -1097,7 +1086,7 @@ void compute_zncc_ref(
     for (int iy = -half_patch; iy <= half_patch; iy++) {
         for (int ix = -half_patch; ix <= half_patch; ix++) {
             float fdx = (float)ix, fdy = (float)iy;
-            float ref_g = gray_from_luma(luma, samp, ref_cx + fdx, ref_cy + fdy, ref_layer);
+            float ref_g = gray_from_array(images, samp, ref_cx + fdx, ref_cy + fdy, ref_layer);
 
             float r = ref_g - ref_center;            // centered at ref_center
             float w = rp->w_lut[ix*ix + iy*iy];
@@ -1136,7 +1125,7 @@ void compute_zncc_ref(
 // image gradient at (src_cx, src_cy) to *grad_out — captured from the very
 // patch taps it already reads, so no extra texture fetches are issued.
 float4 compute_zncc_src(
-    read_only image2d_array_t luma,
+    read_only image2d_array_t images,
     int src_layer, float src_cx, float src_cy,
     int half_patch,
     const ZnccRef *rp,
@@ -1149,7 +1138,7 @@ float4 compute_zncc_src(
                            CLK_ADDRESS_CLAMP_TO_EDGE |
                            CLK_FILTER_LINEAR;
 
-    float src_center = gray_from_luma(luma, samp, src_cx, src_cy, src_layer);
+    float src_center = gray_from_array(images, samp, src_cx, src_cy, src_layer);
 
     float sum_s  = 0.0f, sum_ss = 0.0f, sum_rs = 0.0f;
     float g_xp = 0.0f, g_xm = 0.0f, g_yp = 0.0f, g_ym = 0.0f;
@@ -1158,7 +1147,7 @@ float4 compute_zncc_src(
     for (int iy = -half_patch; iy <= half_patch; iy++) {
         for (int ix = -half_patch; ix <= half_patch; ix++) {
             float fdx = (float)ix, fdy = (float)iy;
-            float src_g = gray_from_luma(luma, samp, src_cx + fdx, src_cy + fdy, src_layer);
+            float src_g = gray_from_array(images, samp, src_cx + fdx, src_cy + fdy, src_layer);
 
             float w  = rp->w_lut[ix*ix + iy*iy];
             float wr = rp->wr[p];
@@ -1274,29 +1263,6 @@ float4 compute_zncc_array(
 // =====================================================================
 // svo_refine_clear — zero gradient (1 float/slot) + Adam (2 floats/slot)
 // =====================================================================
-// =====================================================================
-// svo_refine_make_luma — precompute single-channel luma from the RGBA color
-// image array so the ZNCC patch sampling reads 1 channel instead of 4
-// (≈¼ the texture bandwidth + cache footprint).  gray = (r+g+b)/3, matching
-// gray_from_array exactly.  Run once per PrepareRefinement.
-// global = (width, height, n_views).
-// =====================================================================
-__kernel void svo_refine_make_luma(
-    read_only  image2d_array_t color_images,   // CL_RGBA UNORM_INT8
-    write_only image2d_array_t luma_images,    // CL_R    UNORM_INT8
-    int width, int height, int n_views)
-{
-    int x = get_global_id(0);
-    int y = get_global_id(1);
-    int v = get_global_id(2);
-    if (x >= width || y >= height || v >= n_views) return;
-    // Sampler-less integer read of the exact texel, then the same gray as
-    // gray_from_array.  Hardware quantizes g to the luma image's 8-bit format.
-    float4 c = read_imagef(color_images, (int4)(x, y, v, 0));
-    float g = (c.x + c.y + c.z) * 0.333333f;
-    write_imagef(luma_images, (int4)(x, y, v, 0), (float4)(g, 0.0f, 0.0f, 0.0f));
-}
-
 __kernel void svo_refine_clear(
     __global float* grad_buf,   // 1 float per slot
     __global float* grad_w_buf, // 1 float per slot
@@ -1331,8 +1297,7 @@ __kernel void svo_refine_accumulate(
     uint                      capacity_mask,
     __global float*           grad_buf,          // 1 float per slot
     __global float*           grad_w_buf,        // 1 float per slot
-    read_only image2d_array_t color_images,      // CL_RGBA UNORM_INT8 (alpha = validity)
-    read_only image2d_array_t luma_images,       // CL_R UNORM_INT8 (precomputed gray)
+    read_only image2d_array_t color_images,      // CL_RGBA UNORM_INT8
     read_only image2d_array_t tsdf_depths,       // CL_R FLOAT
     __constant SVOCamera*     cameras,
     __global const int*       neighbor_buf,      // n_views × max_neighbors
@@ -1413,7 +1378,7 @@ __kernel void svo_refine_accumulate(
     // A flat/uniform reference patch (var_r below threshold) makes every
     // neighbor's NCC fail, so nothing would be deposited: bail out early.
     ZnccRef zref;
-    compute_zncc_ref(luma_images, src_view, (float)col, (float)row,
+    compute_zncc_ref(color_images, src_view, (float)col, (float)row,
                      half_patch, inv_sigma_s2, &zref);
     if (!zref.valid) return;
 
@@ -1464,7 +1429,7 @@ __kernel void svo_refine_accumulate(
         // image gradient (ig) from the same source reads — no extra fetches.
         float2 ig;
         float4 zncc_result = compute_zncc_src(
-            luma_images, j, px, py, half_patch, &zref, &ig);
+            color_images, j, px, py, half_patch, &zref, &ig);
 
         float ncc   = zncc_result.x;
         float d2ncc = zncc_result.y;
@@ -1769,14 +1734,18 @@ __kernel void svo_bake_colors(
                                CLK_FILTER_LINEAR;
 
     // Gather phase: collect valid observations.
-    // Private arrays; n_views is bounded by host to KMAX.
+    // ALL uploaded views are candidates.  The private buffers hold at most KMAX
+    // observations and retain the KMAX highest-resolution ones (evicting the
+    // weakest when full).  The host does NOT pre-limit n_views to KMAX, so the
+    // loop MUST scan every view: a sub-volume with >KMAX views would otherwise
+    // colour only the first KMAX (by shot id) and leave the rest pure black.
     const int KMAX = 36;
     float obs_r[36], obs_g[36], obs_b[36];
     float obs_w[36];    // geometric prior = cos^2(theta)
     float obs_res[36];  // resolution score = fx * cos(theta) / z  (~1/GSD)
     int n_valid = 0;
 
-    for (int j = 0; j < n_views && j < KMAX; j++) {
+    for (int j = 0; j < n_views; j++) {
         __constant SVOCamera* cam_j = &cameras[j];
 
         // Project point into view j.
@@ -1829,13 +1798,31 @@ __kernel void svo_bake_colors(
         float4 rgba = read_imagef(color_images, lin_samp,
                           (float4)(px + 0.5f, py + 0.5f, (float)j, 0.0f));
 
-        obs_r[n_valid]   = rgba.x;
-        obs_g[n_valid]   = rgba.y;
-        obs_b[n_valid]   = rgba.z;
-        obs_w[n_valid]   = cos_theta * cos_theta;        // geometric prior
-        obs_res[n_valid] = relax_pt ? cos_theta          // nadir-ness (height-robust)
-                                    : (fx_j * cos_theta * inv_zj);  // ~px/world
-        n_valid++;
+        float o_r   = rgba.x;
+        float o_g   = rgba.y;
+        float o_b   = rgba.z;
+        float o_w   = cos_theta * cos_theta;             // geometric prior
+        float o_res = relax_pt ? cos_theta               // nadir-ness (height-robust)
+                               : (fx_j * cos_theta * inv_zj);  // ~px/world
+
+        if (n_valid < KMAX) {
+            obs_r[n_valid] = o_r;  obs_g[n_valid] = o_g;  obs_b[n_valid] = o_b;
+            obs_w[n_valid] = o_w;  obs_res[n_valid] = o_res;
+            n_valid++;
+        } else {
+            // Buffer full: keep the KMAX highest-resolution observations so a
+            // surface seen only by later views still gets coloured.  Evict the
+            // current lowest-resolution slot iff this view beats it.
+            int   min_i   = 0;
+            float min_res = obs_res[0];
+            for (int k = 1; k < KMAX; k++) {
+                if (obs_res[k] < min_res) { min_res = obs_res[k]; min_i = k; }
+            }
+            if (o_res > min_res) {
+                obs_r[min_i] = o_r;  obs_g[min_i] = o_g;  obs_b[min_i] = o_b;
+                obs_w[min_i] = o_w;  obs_res[min_i] = o_res;
+            }
+        }
     }
 
     // Fallback: no valid observation.  Emit black (0) — NOT grey (128) — so
