@@ -113,12 +113,15 @@ def merge_dsm_ortho_batches(
     """Composite per-cluster DSM/ortho tiles into the final dsm.tif / ortho.tif.
 
     Each cluster wrote a tight-cropped tile (``save_dsm_ortho_batch``) keyed on
-    its offset into the shared global grid.  We allocate the global grid once
-    and merge every tile by **max-z**: a cell takes a tile's height+colour when
-    the tile has a surface there AND (the global cell is still empty OR the
-    tile's height is greater).  This keeps the higher surface where cluster
-    footprints overlap — the same arbitration used within a cluster.  The ortho
-    colour follows the winning height, so DSM and ortho stay consistent.
+    its offset into the shared global grid.
+
+    With ``dsm_merge_feather`` (default) the tiles are left overlapping at fusion
+    time and composited by **distance-transform feather blending**: each tile's
+    weight is its pixel distance into its own valid region (deepest interior =
+    highest weight, ramping to ~0 at tile edges), and the output is the weighted
+    average of all tiles covering a cell.  Overlaps cross-fade, so cluster seams
+    lose both their tonal step and the boundary speckle that a hard territory
+    mask produced.  Otherwise (legacy) tiles are composited by hard **max-z**.
 
     Tiles are deleted afterwards when ``depthmap_delete_fusion_batches`` is set,
     matching the PLY batch cleanup.
@@ -135,29 +138,76 @@ def merge_dsm_ortho_batches(
     # across clusters); read the first to size the output grid.
     _, _, _, _, (gh, gw), (origin_x, origin_y, gsd) = \
         data.load_dsm_ortho_batch(present[0])
-    dsm = np.full((gh, gw), np.nan, dtype=np.float32)
-    ortho = np.zeros((gh, gw, 3), dtype=np.uint8)
 
-    n_merged = 0
-    for bn in present:
-        d_win, o_win, r0, c0, gshape, _geo = data.load_dsm_ortho_batch(bn)
-        if gshape != (gh, gw):
-            logger.warning(
-                f"DSM tile {bn} global shape {gshape} != {(gh, gw)}; skipping"
-            )
-            continue
-        h, w = d_win.shape[:2]
-        win_dsm = dsm[r0:r0 + h, c0:c0 + w]
-        win_ortho = ortho[r0:r0 + h, c0:c0 + w]
-        # Take cells where this tile has a surface and either the global grid is
-        # empty there or this tile's height wins (NaN-safe: NaN comparisons are
-        # False, so the isnan term carries empty cells).
-        take = ~np.isnan(d_win) & (np.isnan(win_dsm) | (d_win > win_dsm))
-        win_dsm[take] = d_win[take]
-        win_ortho[take] = o_win[take]
-        n_merged += 1
-        del d_win, o_win
+    feather = data.config.get("dsm_merge_feather", True)
+
+    if feather:
+        from scipy.ndimage import distance_transform_edt
+
+        # Weighted-average accumulators (sum of w, w*height, w*colour).
+        acc_w = np.zeros((gh, gw), dtype=np.float32)
+        acc_h = np.zeros((gh, gw), dtype=np.float32)
+        acc_c = np.zeros((gh, gw, 3), dtype=np.float32)
+        n_merged = 0
+        for bn in present:
+            d_win, o_win, r0, c0, gshape, _geo = data.load_dsm_ortho_batch(bn)
+            if gshape != (gh, gw):
+                logger.warning(
+                    f"DSM tile {bn} global shape {gshape} != {(gh, gw)}; "
+                    "skipping"
+                )
+                continue
+            h, w = d_win.shape[:2]
+            valid = ~np.isnan(d_win)
+            if not valid.any():
+                continue
+            # Feather weight = distance into the valid region.  A False border
+            # is padded in so the tile's own outer edges also ramp to ~0 (not
+            # just interior holes), giving a symmetric cross-fade in overlaps.
+            padded = np.zeros((h + 2, w + 2), dtype=bool)
+            padded[1:-1, 1:-1] = valid
+            wgt = distance_transform_edt(padded)[1:-1, 1:-1].astype(np.float32)
+            wgt *= valid  # exactly zero outside the surface
+            sl = (slice(r0, r0 + h), slice(c0, c0 + w))
+            acc_w[sl] += wgt
+            acc_h[sl] += wgt * np.where(valid, d_win, 0.0).astype(np.float32)
+            acc_c[sl] += wgt[..., None] * o_win.astype(np.float32)
+            n_merged += 1
+            del d_win, o_win, wgt, valid, padded
+            gc.collect()
+
+        filled = acc_w > 0.0
+        dsm = np.full((gh, gw), np.nan, dtype=np.float32)
+        dsm[filled] = acc_h[filled] / acc_w[filled]
+        ortho = np.zeros((gh, gw, 3), dtype=np.uint8)
+        ortho[filled] = np.clip(
+            acc_c[filled] / acc_w[filled][:, None] + 0.5, 0.0, 255.0
+        ).astype(np.uint8)
+        del acc_w, acc_h, acc_c, filled
         gc.collect()
+    else:
+        dsm = np.full((gh, gw), np.nan, dtype=np.float32)
+        ortho = np.zeros((gh, gw, 3), dtype=np.uint8)
+        n_merged = 0
+        for bn in present:
+            d_win, o_win, r0, c0, gshape, _geo = data.load_dsm_ortho_batch(bn)
+            if gshape != (gh, gw):
+                logger.warning(
+                    f"DSM tile {bn} global shape {gshape} != {(gh, gw)}; "
+                    "skipping"
+                )
+                continue
+            h, w = d_win.shape[:2]
+            win_dsm = dsm[r0:r0 + h, c0:c0 + w]
+            win_ortho = ortho[r0:r0 + h, c0:c0 + w]
+            # Take cells where this tile has a surface and either the global grid
+            # is empty there or this tile's height wins (NaN-safe).
+            take = ~np.isnan(d_win) & (np.isnan(win_dsm) | (d_win > win_dsm))
+            win_dsm[take] = d_win[take]
+            win_ortho[take] = o_win[take]
+            n_merged += 1
+            del d_win, o_win
+            gc.collect()
 
     data.save_dsm(dsm, origin_x, origin_y, gsd, reference)
     # No-data (transparent) wherever no cluster produced a surface.

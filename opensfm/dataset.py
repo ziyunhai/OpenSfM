@@ -1102,6 +1102,7 @@ class UndistortedDataSet:
         origin_y: float,
         gsd: float,
         reference: Optional["geo.TopocentricConverter"] = None,
+        path: Optional[str] = None,
     ) -> None:
         """Save a DSM grid as a GeoTIFF.
 
@@ -1111,11 +1112,13 @@ class UndistortedDataSet:
             origin_y: Y coordinate of the bottom edge of the grid.
             gsd: ground sample distance in world units per pixel.
             reference: topocentric reference for CRS (UTM). None = no CRS.
+            path: output path; defaults to the final ``dsm.tif`` (override for
+                per-cluster debug tiles).
         """
         from osgeo import gdal, osr
 
         self.io_handler.mkdir_p(self._depthmap_path())
-        path = self.dsm_file()
+        path = path or self.dsm_file()
         h, w = grid.shape
 
         driver = gdal.GetDriverByName("GTiff")
@@ -1180,6 +1183,7 @@ class UndistortedDataSet:
         gsd: float,
         reference: Optional["geo.TopocentricConverter"] = None,
         nodata_mask: Optional[NDArray] = None,
+        path: Optional[str] = None,
     ) -> None:
         """Save an ortho image as a GeoTIFF (uint8 RGB, optional alpha).
 
@@ -1193,11 +1197,13 @@ class UndistortedDataSet:
                 When given, a 4th alpha band is written (0 = no-data /
                 transparent, 255 = valid) so no-data is distinguishable from a
                 genuine black pixel and GIS tools can fill it.
+            path: output path; defaults to the final ``ortho.tif`` (override for
+                per-cluster debug tiles).
         """
         from osgeo import gdal, osr
 
         self.io_handler.mkdir_p(self._depthmap_path())
-        path = self.ortho_file()
+        path = path or self.ortho_file()
         h, w = image.shape[:2]
 
         n_bands = 4 if nodata_mask is not None else 3
@@ -1236,6 +1242,18 @@ class UndistortedDataSet:
             self._depthmap_path(), f"dsm_ortho_batch_{batch_num:04d}.npz"
         )
 
+    def dsm_cluster_file(self, batch_num: int) -> str:
+        """Path of a per-cluster debug DSM GeoTIFF (dsm_save_cluster_tiles)."""
+        return os.path.join(
+            self._depthmap_path(), f"dsm_cluster_{batch_num:04d}.tif"
+        )
+
+    def ortho_cluster_file(self, batch_num: int) -> str:
+        """Path of a per-cluster debug ortho GeoTIFF (dsm_save_cluster_tiles)."""
+        return os.path.join(
+            self._depthmap_path(), f"ortho_cluster_{batch_num:04d}.tif"
+        )
+
     def dsm_ortho_batch_exists(self, batch_num: int) -> bool:
         return self.io_handler.isfile(self.dsm_ortho_batch_file(batch_num))
 
@@ -1247,22 +1265,29 @@ class UndistortedDataSet:
         origin_x: float,
         origin_y: float,
         gsd: float,
+        base_offset: Tuple[int, int] = (0, 0),
+        global_shape: Optional[Tuple[int, int]] = None,
     ) -> None:
         """Save one cluster's finished DSM+ortho as a compact tile.
 
-        Each cluster's grids span the full global extent but only the cluster's
-        footprint carries data, so we crop to the tight bounding box of valid
-        (non-NaN) DSM cells and store the row/col offset — a many-cluster
-        project must not write that many full-extent rasters to disk.  The
-        tiles are composited back by max-z in ``dense.merge.merge_dsm_ortho_batches``.
-        Writes nothing for an empty footprint.
+        The passed grids may already be a territory-sized WINDOW into the shared
+        global grid (re-fitted per cluster to bound RAM).  We crop them further
+        to the tight bounding box of valid (non-NaN) DSM cells and store the
+        row/col offset *within the global grid* — ``base_offset`` is the window's
+        own offset, added to the local crop.  The tiles are composited back by
+        max-z in ``dense.merge.merge_dsm_ortho_batches``.  Writes nothing for an
+        empty footprint.
 
         Args:
             batch_num: cluster index (matches the ``fused_batch`` numbering).
-            dsm_grid: (H, W) float32, NaN = no surface, full global extent.
-            ortho_grid: (H, W, 3) uint8, full global extent.
-            origin_x/origin_y/gsd: global grid georeference (identical across
+            dsm_grid: (H, W) float32, NaN = no surface (window or full extent).
+            ortho_grid: (H, W, 3) uint8 (same window as ``dsm_grid``).
+            origin_x/origin_y/gsd: GLOBAL grid georeference (identical across
                 clusters); stored so the merge can write the final GeoTIFF.
+            base_offset: (row, col) offset of the passed window within the global
+                grid.  ``(0, 0)`` when the grid already spans the full extent.
+            global_shape: (H, W) of the global grid; defaults to the passed
+                grid's shape (full-extent case).
         """
         self.io_handler.mkdir_p(self._depthmap_path())
         valid = ~np.isnan(dsm_grid)
@@ -1276,13 +1301,18 @@ class UndistortedDataSet:
         ortho_win = np.ascontiguousarray(
             ortho_grid[r0:r1, c0:c1], dtype=np.uint8
         )
+        base_r, base_c = base_offset
+        gshape = (
+            global_shape if global_shape is not None
+            else (int(dsm_grid.shape[0]), int(dsm_grid.shape[1]))
+        )
         buf = BytesIO()
         np.savez(
             buf,
             dsm=dsm_win,
             ortho=ortho_win,
-            offset=np.array([r0, c0], dtype=np.int64),
-            global_shape=np.array(dsm_grid.shape[:2], dtype=np.int64),
+            offset=np.array([base_r + r0, base_c + c0], dtype=np.int64),
+            global_shape=np.array(gshape, dtype=np.int64),
             geo=np.array([origin_x, origin_y, gsd], dtype=np.float64),
         )
         with self.io_handler.open_wb(self.dsm_ortho_batch_file(batch_num)) as f:

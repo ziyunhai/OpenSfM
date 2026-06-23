@@ -538,6 +538,12 @@ class OpenSfMConfig:
     ##################################
     # Controls DSM + ortho rendering.
     dsm_enabled: bool = True
+    # Debug: also write each cluster's own DSM+ortho as georeferenced GeoTIFFs
+    # (dsm_cluster_XXXX.tif / ortho_cluster_XXXX.tif) before they are merged, so
+    # per-cluster boundary/baking artefacts can be inspected (e.g. in QGIS).
+    dsm_save_cluster_tiles: bool = True
+    # Merge per-cluster DSM/ortho tiles by distance-transform feather blending
+    dsm_merge_feather: bool = True
     # Ground sample distance in meters/pixel. 0 = auto from voxel size.
     dsm_gsd: float = 0.0
     # Wall cull for the DSM mesh: a surface-net triangle is rasterized only if |cos| of its normal from vertical >= this

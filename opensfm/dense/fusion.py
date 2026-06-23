@@ -291,6 +291,101 @@ def _render_dsm_patch_from_sv(
     )
 
 
+def _pack_coarse_cells(
+    cells: NDArray, origin: NDArray, span: NDArray
+) -> NDArray:
+    """Pack integer coarse-cell coords into unique int64 keys for fast lookup.
+
+    Coordinates are offset by ``origin`` into ``[0, span)`` per axis and folded
+    into a single int64.  Cells outside that range get key ``-1`` (so they never
+    match a real, non-negative owned key).
+    """
+    c = cells - origin
+    in_range = np.all((c >= 0) & (c < span), axis=1)
+    keys = np.full(len(c), -1, dtype=np.int64)
+    if np.any(in_range):
+        cc = c[in_range]
+        keys[in_range] = (cc[:, 0] * span[1] + cc[:, 1]) * span[2] + cc[:, 2]
+    return keys
+
+
+def _compute_cell_ownership(
+    data: UndistortedDataSet,
+    clusters: List[List[str]],
+    reconstruction: types.Reconstruction,
+    voxel_size: float,
+    coarse_factor: int,
+    fusable_set: Set[str],
+) -> Dict[Tuple[int, int, int], int]:
+    """Assign every occupied coarse cell to one owning cluster (fusion Plan B).
+
+    Each processable shot belongs to exactly one cluster, so prescanning every
+    cluster's OWN cleaned depthmaps covers the whole surface exactly once.  A
+    coarse cell is *covered* by a cluster when that cluster's own cameras
+    project depth into it; the cell is awarded to the covering cluster whose
+    camera centroid is nearest (ties broken toward the lower cluster index).
+
+    Restricting each cluster's fusion to the cells it owns then yields disjoint,
+    gap-free territories: no two clusters fuse the same cell (no fuse-then-
+    discard waste), and every cell is fused by a cluster that can actually see
+    it (no holes).  The coarse grid is floored against the world origin with a
+    shared cell size, so cell coordinates are consistent across clusters and
+    with the per-cluster fusion prescan.
+
+    Returns ``cell_owner`` mapping coarse-cell coord → owning cluster index.
+    """
+    coarse_size = voxel_size * coarse_factor
+
+    centroids: List[Optional[NDArray]] = []
+    for cl in clusters:
+        origins = [
+            reconstruction.shots[s].pose.get_origin()
+            for s in cl if s in reconstruction.shots
+        ]
+        centroids.append(
+            np.mean(origins, axis=0).astype(np.float64) if origins else None
+        )
+
+    cell_owner: Dict[Tuple[int, int, int], int] = {}
+    cell_best: Dict[Tuple[int, int, int], float] = {}
+
+    for ci, cl in enumerate(clusters):
+        own = [s for s in cl if s in fusable_set]
+        cen = centroids[ci]
+        if not own or cen is None:
+            continue
+
+        # Load this cluster's own cleaned depthmaps (bounded — one cluster at a
+        # time) and prescan them at the shared coarse resolution.
+        loaded = data.load_clean_depthmaps_parallel(own)
+        cache: Dict[str, Tuple[NDArray, NDArray, Optional[NDArray]]] = {
+            sid: (d, n, c) for sid, (d, n, _s, c) in zip(own, loaded)
+        }
+        del loaded
+        grid = _prescan_coarse_grid(
+            data, own, reconstruction, voxel_size, coarse_factor,
+            clean_cache=cache,
+        )
+        del cache
+        if not grid:
+            continue
+
+        # Nearest-centroid award (vectorised distance, strict `<` so an earlier
+        # / lower-index cluster keeps the cell on ties).
+        keys = list(grid.keys())
+        cells = np.array(keys, dtype=np.int64)
+        centers = (cells.astype(np.float64) + 0.5) * coarse_size
+        d2 = np.sum((centers - cen) ** 2, axis=1)
+        for key, dist in zip(keys, d2):
+            prev = cell_best.get(key)
+            if prev is None or dist < prev:
+                cell_best[key] = float(dist)
+                cell_owner[key] = ci
+        del grid
+
+    return cell_owner
+
+
 def fuse_clusters(
     data: UndistortedDataSet,
     neighbors: Dict[str, List[pymap.Shot]],
@@ -318,6 +413,21 @@ def fuse_clusters(
         return
 
     fusable_set: Set[str] = set(fusable)
+
+    # Pre-assign every occupied coarse cell to the nearest covering cluster, so each cluster fuses only its own territory.
+    ownership_voxel_size = config["depthmap_fusion_svo_voxel_size"]
+    ownership_coarse_factor = config["depthmap_fusion_svo_coarse_factor"]
+    context.log_memory("fusion: cell-ownership pre-pass start")
+    cell_owner = _compute_cell_ownership(
+        data, clusters, reconstruction,
+        ownership_voxel_size, ownership_coarse_factor, fusable_set,
+    )
+    n_owners = len(set(cell_owner.values()))
+    logger.info(
+        f"Territory ownership: {len(cell_owner)} occupied coarse cells "
+        f"assigned across {n_owners}/{len(clusters)} clusters"
+    )
+    context.log_memory("fusion: cell-ownership pre-pass done")
 
     def _fuse_single_cluster(batch_num: int) -> None:
         """Fuse one cluster: load views from disk, run fuser, save PLY."""
@@ -465,6 +575,31 @@ def fuse_clusters(
         )
         context.log_memory(f"cluster {batch_num}: pre-scan grid built")
 
+        n_cells_all = len(grid)
+        grid = {
+            cell: views for cell, views in grid.items()
+            if cell_owner.get(cell) == batch_num
+        }
+        logger.info(
+            f"Cluster {batch_num}: territory owns {len(grid)}/{n_cells_all} "
+            f"occupied coarse cells"
+        )
+        if not grid:
+            logger.info(
+                f"Cluster {batch_num}: owns no cells, nothing to fuse"
+            )
+            gc.collect()
+            return
+
+        # Owned-cell lookup for the extraction clip.
+        owned_cells = np.array(list(grid.keys()), dtype=np.int64)
+        owned_origin = owned_cells.min(axis=0)
+        owned_span = owned_cells.max(axis=0) - owned_origin + 1
+        owned_keys = np.sort(
+            _pack_coarse_cells(owned_cells, owned_origin, owned_span)
+        )
+        inv_coarse = 1.0 / coarse_size
+
         # Step 3: Split into sub-volumes.
         subvolumes = _split_into_subvolumes(
             grid, augmented, voxel_size, coarse_factor,
@@ -514,6 +649,12 @@ def fuse_clusters(
         dsm_z_max: float = 0.0
         dsm_w: int = 0
         dsm_h: int = 0
+        dsm_global_origin_x: float = 0.0
+        dsm_global_origin_y: float = 0.0
+        dsm_global_w: int = 0
+        dsm_global_h: int = 0
+        win_r0: int = 0
+        win_c0: int = 0
 
         if dsm_enabled and reconstruction.points:
             coords = np.array(
@@ -525,28 +666,52 @@ def fuse_clusters(
             margin_xy = np.maximum(
                 extent_xy * 0.05, dsm_gsd * 2
             ).astype(np.float32)
-            dsm_origin_x = float(min_xyz[0] - margin_xy[0])
-            dsm_origin_y = float(min_xyz[1] - margin_xy[1])
+            # Global grid: defines the shared georeference + size every cluster's
+            # tile composites into (merge_dsm_ortho_batches).
+            dsm_global_origin_x = float(min_xyz[0] - margin_xy[0])
+            dsm_global_origin_y = float(min_xyz[1] - margin_xy[1])
             max_x = float(max_xyz[0] + margin_xy[0])
             max_y = float(max_xyz[1] + margin_xy[1])
-            dsm_w = int(np.ceil((max_x - dsm_origin_x) / dsm_gsd))
-            dsm_h = int(np.ceil((max_y - dsm_origin_y) / dsm_gsd))
+            dsm_global_w = int(
+                np.ceil((max_x - dsm_global_origin_x) / dsm_gsd))
+            dsm_global_h = int(
+                np.ceil((max_y - dsm_global_origin_y) / dsm_gsd))
             z_margin = (max_xyz[2] - min_xyz[2]) * 0.1 + voxel_size * 5
             dsm_z_min = float(min_xyz[2] - z_margin)
             dsm_z_max = float(max_xyz[2] + z_margin)
-            dsm_grid = np.full(
-                (dsm_h, dsm_w), np.nan, dtype=np.float32
-            )
-            ortho_grid = np.zeros(
-                (dsm_h, dsm_w, 3), dtype=np.uint8
-            )
-            owner_grid = np.full(
-                (dsm_h, dsm_w), -1, dtype=np.int32
-            )
-            logger.info(
-                f"Cluster {batch_num}: DSM grid {dsm_w}×{dsm_h}, "
-                f"GSD={dsm_gsd:.4f}, Z=[{dsm_z_min:.2f}, {dsm_z_max:.2f}]"
-            )
+
+            # Re-fit the raster to this cluster's territory: the owned cells' XY
+            # AABB → a window into the global grid (padded a few px so DSM/ortho
+            # hole-filling has context at the territory edge).  This keeps the
+            # in-RAM rasters proportional to the cluster, not the whole scene.
+            owned_xy_min = owned_origin[:2].astype(np.float64) * coarse_size
+            owned_xy_max = (
+                owned_cells.max(axis=0)[:2] + 1
+            ).astype(np.float64) * coarse_size
+            pad = 4
+            win_c0 = max(0, int(np.floor(
+                (owned_xy_min[0] - dsm_global_origin_x) / dsm_gsd)) - pad)
+            win_r0 = max(0, int(np.floor(
+                (owned_xy_min[1] - dsm_global_origin_y) / dsm_gsd)) - pad)
+            win_c1 = min(dsm_global_w, int(np.ceil(
+                (owned_xy_max[0] - dsm_global_origin_x) / dsm_gsd)) + pad)
+            win_r1 = min(dsm_global_h, int(np.ceil(
+                (owned_xy_max[1] - dsm_global_origin_y) / dsm_gsd)) + pad)
+            dsm_w = max(0, win_c1 - win_c0)
+            dsm_h = max(0, win_r1 - win_r0)
+            dsm_origin_x = dsm_global_origin_x + win_c0 * dsm_gsd
+            dsm_origin_y = dsm_global_origin_y + win_r0 * dsm_gsd
+
+            if dsm_w > 0 and dsm_h > 0:
+                dsm_grid = np.full((dsm_h, dsm_w), np.nan, dtype=np.float32)
+                ortho_grid = np.zeros((dsm_h, dsm_w, 3), dtype=np.uint8)
+                owner_grid = np.full((dsm_h, dsm_w), -1, dtype=np.int32)
+                logger.info(
+                    f"Cluster {batch_num}: DSM window {dsm_w}×{dsm_h} at "
+                    f"(r{win_r0},c{win_c0}) of global {dsm_global_w}×"
+                    f"{dsm_global_h}, GSD={dsm_gsd:.4f}, "
+                    f"Z=[{dsm_z_min:.2f}, {dsm_z_max:.2f}]"
+                )
             context.log_memory(f"cluster {batch_num}: DSM grid allocated")
 
         # Batch-load all views upfront (parallel I/O).
@@ -757,6 +922,21 @@ def fuse_clusters(
                 clr = clr[inside_core]
 
             if len(pts) > 0:
+                # Restrict to cells this cluster actually owns (exact, jagged-
+                # boundary-safe dedup across clusters; the AABB core clip above
+                # already separates sibling sub-volumes within this cluster).
+                pcells = np.floor(
+                    pts.astype(np.float64) * inv_coarse
+                ).astype(np.int64)
+                owned_mask = np.isin(
+                    _pack_coarse_cells(pcells, owned_origin, owned_span),
+                    owned_keys,
+                )
+                pts = pts[owned_mask]
+                nrm = nrm[owned_mask]
+                clr = clr[owned_mask]
+
+            if len(pts) > 0:
                 all_points.append(pts)
                 all_normals.append(nrm)
                 all_colors.append(clr)
@@ -801,21 +981,12 @@ def fuse_clusters(
             # Every cell that carries a height — reconstructed OR hole-filled — is
             # coloured by REPROJECTING its final DSM height into source images and
             # taking the best-resolution inlier views (real multi-view baking, NOT
-            # colour interpolation).  A reconstructed cell is baked by the leaf
-            # that won its height (max-z); a filled hole, which has no owner, is
-            # baked by the leaf whose CORE XY footprint covers it — that leaf
-            # holds exactly the views that see the region.  In a no-MVS hole
-            # interior the clean depth is 0, so the bake is not occlusion-culled
-            # and samples the true image colour.
+            # colour interpolation).
             if ortho_grid is not None and owner_grid is not None:
                 n_final = int(config["ortho_bake_n_final_views"])
                 irls_iters = int(config["ortho_bake_irls_iterations"])
                 valid = ~np.isnan(dsm_grid)
-                # Cells that received a REAL (non-black) bake.  A cell is baked
-                # by exactly one leaf (its owner, or — for a filled hole — its
-                # footprint leaf, claimed below), so no leaf can overwrite
-                # another's colour; this only records WHICH cells got colour, so
-                # the residual fill touches strictly the never-baked remainder.
+                # Cells that received a REAL (non-black) bake.  A cell is baked by exactly one leaf
                 baked_mask = np.zeros((dsm_h, dsm_w), dtype=bool)
                 n_filled_tot = 0  # diagnostics: filled cells + how many baked
                 n_filled_black = 0  # filled cells the bake still left black
@@ -852,14 +1023,7 @@ def fuse_clusters(
                     nrm = _dsm_point_normals(
                         dsm_grid, rows_idx, cols_idx, dsm_gsd
                     )
-                    # Filled holes carry interpolated geometry: bake them with a
-                    # flat up-normal (no false grazing rejects), and for the
-                    # RELIABLY-interpolated ones relax the depth-validity mask so
-                    # they sample real image colour (their projection lands on
-                    # masked no-depth pixels in every view).  EXTRAPOLATED filled
-                    # cells (nearest-neighbour, outside the Delaunay hull — the
-                    # open side of boundary concavities) keep the strict mask, so
-                    # their unreliable geometry can't sample spurious colour.
+                    # Filled holes carry interpolated geometry: bake them with a flat up-normal (no false grazing rejects)
                     is_filled = fill_local[lr, lc]
                     if is_filled.any():
                         nrm[is_filled] = (0.0, 0.0, 1.0)
@@ -923,23 +1087,73 @@ def fuse_clusters(
             leaf_fusers = []
             view_cache.clear()
 
-            # Persist this cluster's finished DSM+ortho as a compact tile; the
-            # final dsm.tif / ortho.tif are composited from every cluster's tile
-            # by max-z in Phase 4 (mirrors the fused_batch PLY merge).  Writing
-            # straight to dsm.tif here would let each cluster overwrite the
-            # previous one, so only the last cluster processed would survive.
+            if not config.get("dsm_merge_feather", True):
+                owned_xy = np.unique(owned_cells[:, :2], axis=0)
+                oxy_origin = owned_xy.min(axis=0)
+                oxy_span = owned_xy.max(axis=0) - oxy_origin + 1
+                owned_xy_keys = np.sort(
+                    (owned_xy[:, 0] - oxy_origin[0]) * oxy_span[1]
+                    + (owned_xy[:, 1] - oxy_origin[1])
+                )
+                vr, vc = np.where(~np.isnan(dsm_grid))
+                cx = np.floor(
+                    (dsm_origin_x + (vc + 0.5) * dsm_gsd) * inv_coarse
+                ).astype(np.int64) - oxy_origin[0]
+                cy = np.floor(
+                    (dsm_origin_y + (vr + 0.5) * dsm_gsd) * inv_coarse
+                ).astype(np.int64) - oxy_origin[1]
+                in_range = (
+                    (cx >= 0) & (cx < oxy_span[0])
+                    & (cy >= 0) & (cy < oxy_span[1])
+                )
+                col_keys = np.where(in_range, cx * oxy_span[1] + cy, -1)
+                spill = ~np.isin(col_keys, owned_xy_keys)
+                if spill.any():
+                    dsm_grid[vr[spill], vc[spill]] = np.nan
+                    if ortho_grid is not None:
+                        ortho_grid[vr[spill], vc[spill]] = 0
+                    logger.info(
+                        f"Cluster {batch_num}: masked {int(spill.sum())} "
+                        f"DSM/ortho spill cell(s) (hard territory mask)"
+                    )
+
+            # Persist this cluster's finished DSM+ortho as a compact tile;
             ortho_tile = (
                 ortho_grid if ortho_grid is not None
                 else np.zeros((dsm_h, dsm_w, 3), dtype=np.uint8)
             )
+            # The tile carries the GLOBAL georeference + shape and its window
+            # offset, so the merge places this territory-sized raster correctly.
             data.save_dsm_ortho_batch(
                 batch_num, dsm_grid, ortho_tile,
-                dsm_origin_x, dsm_origin_y, dsm_gsd,
+                dsm_global_origin_x, dsm_global_origin_y, dsm_gsd,
+                base_offset=(win_r0, win_c0),
+                global_shape=(dsm_global_h, dsm_global_w),
             )
             logger.info(
                 f"Cluster {batch_num}: DSM/ortho tile saved → "
                 f"{data.dsm_ortho_batch_file(batch_num)}"
             )
+
+            # Debug: also dump this cluster's own DSM+ortho window as standalone
+            # georeferenced GeoTIFFs (they overlay the final raster in GIS), to
+            # isolate per-cluster boundary / grazing-bake artefacts.
+            if config.get("dsm_save_cluster_tiles", False):
+                data.save_dsm(
+                    dsm_grid, dsm_origin_x, dsm_origin_y, dsm_gsd,
+                    reconstruction.reference,
+                    path=data.dsm_cluster_file(batch_num),
+                )
+                data.save_ortho(
+                    ortho_tile, dsm_origin_x, dsm_origin_y, dsm_gsd,
+                    reconstruction.reference,
+                    nodata_mask=np.isnan(dsm_grid),
+                    path=data.ortho_cluster_file(batch_num),
+                )
+                logger.info(
+                    f"Cluster {batch_num}: debug DSM/ortho GeoTIFFs → "
+                    f"{data.ortho_cluster_file(batch_num)}"
+                )
         else:
             view_cache.clear()
 
@@ -957,59 +1171,7 @@ def fuse_clusters(
             f"from {len(subvolumes)} sub-volume(s)"
         )
         context.log_memory("fused cluster data in memory")
-
-        # Clip to cluster bbox with Voronoi deduplication.
-        if len(points) > 0:
-            bb_min, bb_max = cluster_bboxes[batch_num]
-            inside = np.all(
-                (points >= bb_min) & (points <= bb_max), axis=1
-            )
-
-            def _cam_centroid(shot_ids: List[str]) -> NDArray:
-                origins = [
-                    reconstruction.shots[s].pose.get_origin()
-                    for s in shot_ids
-                    if s in reconstruction.shots
-                ]
-                if origins:
-                    return np.mean(origins, axis=0).astype(np.float64)
-                return ((bb_min + bb_max) / 2.0).astype(np.float64)
-
-            my_center = _cam_centroid(cluster_shots)
-            my_dist_sq = np.sum(
-                (points.astype(np.float64) - my_center) ** 2, axis=1
-            )
-            for other_idx in range(len(cluster_bboxes)):
-                if other_idx == batch_num:
-                    continue
-                obb_min, obb_max = cluster_bboxes[other_idx]
-                in_other = np.all(
-                    (points >= obb_min) & (points <= obb_max), axis=1
-                )
-                contested = in_other & inside
-                if not np.any(contested):
-                    continue
-                o_center = _cam_centroid(clusters[other_idx])
-                o_dist_sq = np.sum(
-                    (points.astype(np.float64) - o_center) ** 2, axis=1
-                )
-                give_away = contested & (
-                    (o_dist_sq < my_dist_sq)
-                    | (
-                        (o_dist_sq == my_dist_sq)
-                        & (other_idx < batch_num)
-                    )
-                )
-                inside &= ~give_away
-
-            n_before = len(points)
-            points = points[inside]
-            normals = normals[inside]
-            colors = colors[inside]
-        logger.info(
-            "Batch %d: %d fused points (%d clipped by bbox)",
-            batch_num, len(points), n_before - len(points),
-        )
+        logger.info("Batch %d: %d fused points", batch_num, len(points))
 
         if len(points) > 0:
             labels = np.zeros(len(points), dtype=np.uint8)
