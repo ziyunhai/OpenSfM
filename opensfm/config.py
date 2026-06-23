@@ -481,8 +481,12 @@ class OpenSfMConfig:
     depthmap_neighbor_min_angle: float = 3.0
     # Maximum baseline angle (degrees) for neighbor selection.
     depthmap_neighbor_max_angle: float = 60.0
-    # SVO voxel size in world units (meters). Smaller = finer but more memory.
-    depthmap_fusion_svo_voxel_size: float = 0.035
+    # SVO voxel resolution level, auto-derived from the cleaned depthmaps'
+    # surface sampling. "fine" sets the voxel to the median per-pixel footprint
+    # (depth/focal — the finest detail the data resolves); "half" doubles that
+    # voxel (2x coarser); "quarter" quadruples it (4x coarser). One of
+    # {"fine", "half", "quarter"}.
+    depthmap_fusion_svo_voxel_level: str = "fine"
     # SVO truncation factor: truncation_distance = factor * voxel_size.
     depthmap_fusion_svo_trunc_factor: float = 8
     # SVO minimum weight for extracting points
@@ -544,8 +548,6 @@ class OpenSfMConfig:
     dsm_save_cluster_tiles: bool = True
     # Merge per-cluster DSM/ortho tiles by distance-transform feather blending
     dsm_merge_feather: bool = True
-    # Ground sample distance in meters/pixel. 0 = auto from voxel size.
-    dsm_gsd: float = 0.0
     # Wall cull for the DSM mesh: a surface-net triangle is rasterized only if |cos| of its normal from vertical >= this
     dsm_wall_cull_nz: float = 0.5
     # Orthophoto color baking (svo_bake_colors): number of sharpest inlier views blended for the final color

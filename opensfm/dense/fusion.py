@@ -49,6 +49,17 @@ _SVO_REFINE_IMG_BYTES_PX_VIEW: int = 12
 # Transient refine scratch, per slot: grad (4) + grad_w (4) + adam m/v (8).
 _SVO_REFINE_SCRATCH_BYTES_SLOT: int = 16
 
+# Coverage safety factor applied to the median per-pixel surface footprint when deriving the "fine" voxel size.
+_SAMPLING_COVERAGE_FACTOR: float = 2.0
+
+# SVO voxel resolution levels: voxel = fine_sampling * multiplier. "fine" tracks
+# the depthmaps' median surface sampling; "half"/"quarter" coarsen it 2x/4x.
+_VOXEL_LEVEL_MULTIPLIER: Dict[str, float] = {
+    "fine": 1.0,
+    "half": 2.0,
+    "quarter": 4.0,
+}
+
 
 class _SubVolume(NamedTuple):
     """Axis-aligned sub-volume for bounded SVO fusion."""
@@ -386,6 +397,88 @@ def _compute_cell_ownership(
     return cell_owner
 
 
+def _estimate_sampling_voxel_size(
+    data: UndistortedDataSet,
+    view_ids: List[str],
+    reconstruction: types.Reconstruction,
+    subsample: int = 8,
+    max_views: int = 200,
+) -> float:
+    """Median surface sampling distance of the cleaned depthmaps (world units).
+
+    Each valid depth pixel back-projects to a surface footprint of about
+    ``depth / focal_px`` — the finest detail the data actually resolves. We take
+    each view's median footprint, then the median across views, giving a robust,
+    redundancy-agnostic estimate of the surface sampling, scaled by
+    ``_SAMPLING_COVERAGE_FACTOR`` to keep ray-driven integration hole-free. Views are
+    scanned in parallel and only a subsampled, transient slice of each depthmap
+    is held, so peak RAM stays bounded.
+
+    At most ``max_views`` views are sampled (seeded, so the derived size is
+    reproducible across runs); the median is stable on a sample this size, so a
+    large scene's voxel size costs a bounded scan rather than one per view.
+    """
+    if len(view_ids) > max_views:
+        idx = np.random.default_rng(0).choice(
+            len(view_ids), size=max_views, replace=False
+        )
+        view_ids = [view_ids[i] for i in sorted(idx.tolist())]
+
+    def _view_median(sid: str) -> Optional[float]:
+        if not data.clean_depthmap_exists(sid):
+            return None
+        depth, _normal, _score, _conf = data.load_clean_depthmap(sid)
+        h, w = depth.shape
+        d = depth[::subsample, ::subsample].ravel()
+        d = d[d > 0]
+        if d.size == 0:
+            return None
+        K = reconstruction.shots[sid].camera.get_K_in_pixel_coordinates(w, h)
+        focal_px = 0.5 * (float(K[0, 0]) + float(K[1, 1]))
+        if focal_px <= 0.0:
+            return None
+        return _SAMPLING_COVERAGE_FACTOR * float(np.median(d)) / focal_px
+
+    with ThreadPoolExecutor(max_workers=data.config["io_processes"]) as pool:
+        medians = [m for m in pool.map(
+            _view_median, view_ids) if m is not None]
+
+    if not medians:
+        raise RuntimeError(
+            "Cannot derive SVO voxel size: no cleaned depthmaps with valid "
+            "depth were found."
+        )
+    return float(np.median(medians))
+
+
+def _resolve_voxel_size(
+    data: UndistortedDataSet,
+    view_ids: List[str],
+    reconstruction: types.Reconstruction,
+    config: Dict[str, Any],
+) -> float:
+    """Resolve the SVO voxel size from ``depthmap_fusion_svo_voxel_level``.
+
+    The "fine" sampling is measured once over all fusable cleaned depthmaps and
+    scaled by the level multiplier (fine=1x, half=2x, quarter=4x). One global
+    size keeps the cell-ownership grid, sub-volumes, and DSM raster consistent
+    across clusters.
+    """
+    level = str(config["depthmap_fusion_svo_voxel_level"]).lower()
+    if level not in _VOXEL_LEVEL_MULTIPLIER:
+        raise ValueError(
+            f"Unknown depthmap_fusion_svo_voxel_level '{level}'; expected one "
+            f"of {sorted(_VOXEL_LEVEL_MULTIPLIER)}."
+        )
+    fine = _estimate_sampling_voxel_size(data, view_ids, reconstruction)
+    voxel_size = fine * _VOXEL_LEVEL_MULTIPLIER[level]
+    logger.info(
+        "SVO voxel size: level=%s, fine sampling=%.4fm -> voxel=%.4fm",
+        level, fine, voxel_size,
+    )
+    return voxel_size
+
+
 def fuse_clusters(
     data: UndistortedDataSet,
     neighbors: Dict[str, List[pymap.Shot]],
@@ -414,8 +507,16 @@ def fuse_clusters(
 
     fusable_set: Set[str] = set(fusable)
 
+    # Derive the global SVO voxel size from the depthmaps' surface sampling.
+    # One value is shared by every cluster (ownership grid, sub-volumes, DSM).
+    voxel_size = _resolve_voxel_size(data, fusable, reconstruction, config)
+    logger.info(
+        "Fusing %d clusters with %d fusable views at %.4fm voxel size",
+        len(clusters), len(fusable), voxel_size,
+    )
+
     # Pre-assign every occupied coarse cell to the nearest covering cluster, so each cluster fuses only its own territory.
-    ownership_voxel_size = config["depthmap_fusion_svo_voxel_size"]
+    ownership_voxel_size = voxel_size
     ownership_coarse_factor = config["depthmap_fusion_svo_coarse_factor"]
     context.log_memory("fusion: cell-ownership pre-pass start")
     cell_owner = _compute_cell_ownership(
@@ -533,7 +634,7 @@ def fuse_clusters(
             return result
 
         # ── SVO fusion with sub-volume splitting ─────────────────
-        voxel_size = config["depthmap_fusion_svo_voxel_size"]
+        # voxel_size is resolved once for the whole run (see fuse_clusters top).
         trunc_factor_cfg = config["depthmap_fusion_svo_trunc_factor"]
         max_voxels = config["depthmap_fusion_svo_max_voxels"]
         coarse_factor = config["depthmap_fusion_svo_coarse_factor"]
@@ -637,9 +738,7 @@ def fuse_clusters(
 
         # --- DSM/ortho grid (populated per sub-volume if svo method) ---
         dsm_enabled = config["dsm_enabled"]
-        dsm_gsd: float = config.get("dsm_gsd", 0.0)
-        if dsm_gsd <= 0.0:
-            dsm_gsd = voxel_size
+        dsm_gsd = voxel_size / _SAMPLING_COVERAGE_FACTOR
         dsm_grid: Optional[NDArray] = None
         ortho_grid: Optional[NDArray] = None
         owner_grid: Optional[NDArray] = None
