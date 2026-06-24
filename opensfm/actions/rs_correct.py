@@ -10,10 +10,9 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 
 def run_dataset(dataset: DataSetBase, rolling_shutter_readout: Optional[float]) -> None:
-    """Rolling shutter correct an aerial reconstruction.
-
-    Limitations and assumptions:
-     - Speed information from EXIF must be available - or - camera must be moving (to compute speed estimates)
+    """Rolling shutter correct the features of an aerial reconstruction.
+    
+    Speed information from EXIF must be available - or - camera must be moving (to compute speed estimates)
 
     Args:
         rolling_shutter_readout: sensor readout time (ms)
