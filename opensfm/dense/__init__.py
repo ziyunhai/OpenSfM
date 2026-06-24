@@ -134,9 +134,8 @@ def run_clustering(
             fuse_radius_factor=0.5,
             edge_max_factor=config["depthmap_cluster_edge_max_factor"],
         )
-        if config["depthmap_save_debug_ply"]:
-            clustering._save_cluster_debug_ply(
-                data, clusters, reconstruction, sp_coords, sp_vis)
+        clustering._save_cluster_debug_ply(
+            data, clusters, reconstruction, sp_coords, sp_vis)
         super_points = covis.super_points
         data.save_clusters(clusters)
         data.save_clusters_points(super_points)
