@@ -86,6 +86,8 @@ setuptools.setup(
             "pysfm.*",
             "pyfoundation.*",
             "pymap.*",
+            "configs/aerial.json",
+            "configs/terrestrial.yaml",
             "data/sensor_data.json",
             "data/camera_calibration.yaml",
             "data/bow/bow_hahog_root_uchar_10000.npz",
