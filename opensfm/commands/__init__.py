@@ -30,6 +30,7 @@ from . import (
     mesh,
     reconstruct,
     reconstruct_from_prior,
+    rs_correct,
     undistort,
 )
 from .command_runner import command_runner
@@ -46,6 +47,7 @@ opensfm_commands: List[ModuleType] = [
     reconstruct,
     crop_reconstruction,
     reconstruct_from_prior,
+    rs_correct,
     bundle,
     mesh,
     undistort,
