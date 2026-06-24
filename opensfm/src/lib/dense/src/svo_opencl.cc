@@ -1367,7 +1367,11 @@ void SVOIntegratorCL::BakeColors(const std::vector<Vec3f>& points,
                                  const std::vector<Vec3f>& normals,
                                  std::vector<Vec3<uint8_t>>* out_colors,
                                  int n_final, int irls_iters,
-                                 const std::vector<uint8_t>* relax_occ) {
+                                 const std::vector<uint8_t>* relax_occ,
+                                 const std::vector<float>* dsm_occ, int dsm_w,
+                                 int dsm_h, float dsm_origin_x,
+                                 float dsm_origin_y, float dsm_gsd,
+                                 float dsm_max_z) {
   if (!refine_prepared_) {
     throw std::runtime_error(
         "SVOIntegratorCL::BakeColors: PrepareRefinement() not called");
@@ -1409,6 +1413,21 @@ void SVOIntegratorCL::BakeColors(const std::vector<Vec3f>& points,
     opencl::CheckCL(err, "bake relax dummy buffer");
   }
 
+  // Optional DSM heightfield for per-view horizon occlusion of filled cells.
+  const bool has_dsm_occ = dsm_occ && dsm_w > 0 && dsm_h > 0 &&
+                           dsm_occ->size() ==
+                               static_cast<size_t>(dsm_w) * dsm_h;
+  cl::Buffer cl_dsm;
+  if (has_dsm_occ) {
+    cl_dsm = cl::Buffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                        dsm_occ->size() * sizeof(float),
+                        const_cast<float*>(dsm_occ->data()), &err);
+    opencl::CheckCL(err, "bake dsm occlusion buffer");
+  } else {
+    cl_dsm = cl::Buffer(ctx, CL_MEM_READ_ONLY, sizeof(float), nullptr, &err);
+    opencl::CheckCL(err, "bake dsm occlusion dummy buffer");
+  }
+
   // Output color buffer.
   const size_t color_bytes = M * 3;
   cl::Buffer cl_out(ctx, CL_MEM_WRITE_ONLY, color_bytes, nullptr, &err);
@@ -1439,6 +1458,14 @@ void SVOIntegratorCL::BakeColors(const std::vector<Vec3f>& points,
     k_bake_colors_.setArg(arg++, cl_relax);
     k_bake_colors_.setArg(arg++, static_cast<cl_int>(has_relax ? 1 : 0));
     k_bake_colors_.setArg(arg++, static_cast<cl_int>(M));
+    k_bake_colors_.setArg(arg++, cl_dsm);
+    k_bake_colors_.setArg(arg++, static_cast<cl_int>(has_dsm_occ ? 1 : 0));
+    k_bake_colors_.setArg(arg++, dsm_origin_x);
+    k_bake_colors_.setArg(arg++, dsm_origin_y);
+    k_bake_colors_.setArg(arg++, dsm_gsd);
+    k_bake_colors_.setArg(arg++, static_cast<cl_int>(dsm_w));
+    k_bake_colors_.setArg(arg++, static_cast<cl_int>(dsm_h));
+    k_bake_colors_.setArg(arg++, dsm_max_z);
 
     const size_t global = ((M + 255) / 256) * 256;
     queue.enqueueNDRangeKernel(k_bake_colors_, cl::NullRange,

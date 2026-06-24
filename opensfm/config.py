@@ -429,7 +429,7 @@ class OpenSfMConfig:
     # Cosine threshold for grazing-angle detection (below → pixel is grazing, stricter filtering).
     depthmap_grazing_cos_threshold: float = 0.2
     # Save per-shot raw/clean PLYs and per-cluster debug PLYs (slow, for debugging only).
-    depthmap_save_debug_ply: bool = True
+    depthmap_save_debug_ply: bool = False
     # ── Disk reclamation (intermediate depthmap/PLY cleanup) ──
     # Delete each raw depthmap (.raw.npz) once the whole cleaning phase has
     # produced its clean counterpart. Raw maps are only consumed by cleaning,
@@ -542,18 +542,20 @@ class OpenSfMConfig:
     ##################################
     # Controls DSM + ortho rendering.
     dsm_enabled: bool = True
-    # Debug: also write each cluster's own DSM+ortho as georeferenced GeoTIFFs
-    # (dsm_cluster_XXXX.tif / ortho_cluster_XXXX.tif) before they are merged, so
-    # per-cluster boundary/baking artefacts can be inspected (e.g. in QGIS).
+    # Debug: also write each cluster's own DSM+ortho as georeferenced GeoTIFFs (dsm_cluster_XXXX.tif / ortho_cluster_XXXX.tif) before they are merged
     dsm_save_cluster_tiles: bool = True
     # Merge per-cluster DSM/ortho tiles by distance-transform feather blending
     dsm_merge_feather: bool = True
+    # Soft RAM budget (MB) for the DSM/ortho merge: the final raster is written band-by-band, sized so each band's accumulators stay under this
+    dsm_merge_max_ram_mb: int = 512
     # Wall cull for the DSM mesh: a surface-net triangle is rasterized only if |cos| of its normal from vertical >= this
     dsm_wall_cull_nz: float = 0.5
     # Orthophoto color baking (svo_bake_colors): number of sharpest inlier views blended for the final color
     ortho_bake_n_final_views: int = 3
     # Tukey-biweight reweighting iterations for the robust color consensus.
     ortho_bake_irls_iterations: int = 5
+    # Per-view horizon occlusion for hole-filled (interpolated) ortho cells: the bake marches the full DSM from each cell toward the camera and drops views blocked by a taller surface (roof)
+    ortho_bake_dsm_occlusion: bool = True
     # Gated 3x3 median despeckle of the baked ortho: a pixel is replaced by the local median only when it differs from it by more than this
     ortho_median_threshold: float = 24.0
     # DSM Post-process hole filling : a hole's connected component is "tiny" when it has <= hole_fill_small_area_max cells
@@ -562,6 +564,10 @@ class OpenSfMConfig:
     hole_fill_small_area_max: int = 256
     # DSM Post-process hole filling : hole_fill_small_area_max is exceeded, the hole is filled by linear interpolation
     hole_fill_footprint_close: int = 256
+    # DSM large-hole fill geometry: instead of linearly interpolating across the hole (which slants ground up to a bordering roof), complete it as a gravity-aligned FLAT surface at the LOW altitude of its boundary
+    hole_fill_low_percentile: float = 20.0
+    # Fallback occluded-ground heuristic (superseded by ortho_bake_dsm_occlusion, so 0 = off by default).
+    hole_fill_occlusion_drop: float = 0.0
     # Coherence-enhancing shock filter on the DSM that sharpens edges
     dsm_shock_iterations: int = 6
     # Structure-tensor half-window in cells (larger = straighter / more coherent).

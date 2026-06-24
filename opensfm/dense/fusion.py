@@ -1068,6 +1068,9 @@ def fuse_clusters(
                 f"{valid_count}/{dsm_grid.size} valid cells"
             )
 
+            # debug: which cells were reconstructed BEFORE the hole-fill (vs
+            # hole-filled afterwards) — used by the bake-category raster below.
+            orig_valid = ~np.isnan(dsm_grid)
             dsm_grid, dsm_extrap = _fill_dsm_holes(dsm_grid, config)
             logger.info(
                 "  Filled DSM footprint holes (diffuse tiny + Delaunay pockets)"
@@ -1085,6 +1088,15 @@ def fuse_clusters(
                 n_final = int(config["ortho_bake_n_final_views"])
                 irls_iters = int(config["ortho_bake_irls_iterations"])
                 valid = ~np.isnan(dsm_grid)
+                # DSM heightfield for per-view horizon occlusion of filled cells:
+                # the bake marches it from each cell toward the camera and drops
+                # views a taller surface (e.g. a roof) blocks — so occluded ground
+                # gets real colour from clear nadir views, not a roof ghost.
+                dsm_occ_arr = None
+                dsm_max_z = 0.0
+                if config["ortho_bake_dsm_occlusion"]:
+                    dsm_occ_arr = np.ascontiguousarray(dsm_grid, dtype=np.float32)
+                    dsm_max_z = float(np.nanmax(dsm_grid))
                 # Cells that received a REAL (non-black) bake.  A cell is baked by exactly one leaf
                 baked_mask = np.zeros((dsm_h, dsm_w), dtype=bool)
                 n_filled_tot = 0  # diagnostics: filled cells + how many baked
@@ -1126,6 +1138,10 @@ def fuse_clusters(
                     is_filled = fill_local[lr, lc]
                     if is_filled.any():
                         nrm[is_filled] = (0.0, 0.0, 1.0)
+                    # Mask-relax filled cells so they sample real colour where no
+                    # view has depth — EXCEPT cells flagged no-relax: extrapolated
+                    # (linear) or OCCLUDED ground under a tall roof (low_flat), to
+                    # avoid ghosting roof colour onto occluded ground.
                     relax = (
                         is_filled & ~dsm_extrap[rows_idx, cols_idx]
                     ).astype(np.uint8)
@@ -1143,6 +1159,11 @@ def fuse_clusters(
                         baker.bake_colors(
                             pts, nrm, n_final=n_final, irls_iters=irls_iters,
                             relax_occlusion=relax,
+                            dsm_occ=dsm_occ_arr,
+                            dsm_origin_x=dsm_origin_x,
+                            dsm_origin_y=dsm_origin_y,
+                            dsm_gsd=dsm_gsd,
+                            dsm_max_z=dsm_max_z,
                         ),
                         dtype=np.uint8,
                     )
@@ -1172,6 +1193,39 @@ def fuse_clusters(
                     f"{n_filled_tot} filled, reconstructed black: "
                     f"{n_owned_black}"
                 )
+                # DEBUG (dsm_save_cluster_tiles): classify every cell so the
+                # fan artefact can be localised in QGIS BEFORE the residual fill
+                # repaints anything.  green = reconstructed geometry, baked;
+                # red = reconstructed but no view saw it; cyan = tiny hole filled
+                # by DIFFUSION (a smooth ramp), baked; blue = large hole filled
+                # FLAT-LOW, baked; yellow = hole-filled but no view (→ residual
+                # fill).  Overlay on the fan: cyan/blue ⇒ it's a hole-fill bake,
+                # green ⇒ it's real (oblique-painted facade) geometry.
+                if config.get("dsm_save_cluster_tiles", False):
+                    from scipy import ndimage as _ndi
+                    recon = orig_valid
+                    filled = valid & ~recon
+                    lbl, _ = _ndi.label(filled)
+                    csz = np.bincount(lbl.ravel())
+                    small_max = int(config["hole_fill_small_area_max"])
+                    tiny = filled & (csz[lbl] <= small_max)
+                    cat = np.zeros((dsm_h, dsm_w, 3), dtype=np.uint8)
+                    cat[recon & baked_mask] = (0, 170, 0)
+                    cat[recon & ~baked_mask] = (200, 0, 0)
+                    cat[tiny & baked_mask] = (0, 200, 200)
+                    cat[(filled & ~tiny) & baked_mask] = (0, 90, 255)
+                    cat[filled & ~baked_mask] = (255, 210, 0)
+                    data.save_ortho(
+                        cat, dsm_origin_x, dsm_origin_y, dsm_gsd,
+                        reconstruction.reference, nodata_mask=~valid,
+                        path=data.ortho_cluster_file(batch_num).replace(
+                            "ortho_cluster_", "ortho_dbg_cluster_"),
+                    )
+                    logger.info(
+                        "  [debug] wrote bake-category raster: green=recon, "
+                        "red=recon-noview, cyan=diffusion-fill, blue=flatlow-"
+                        "fill, yellow=fill-noview"
+                    )
                 ortho_grid = _fill_ortho_holes(
                     ortho_grid, dsm_grid, config, baked_mask=baked_mask
                 )
@@ -1223,11 +1277,15 @@ def fuse_clusters(
             )
             # The tile carries the GLOBAL georeference + shape and its window
             # offset, so the merge places this territory-sized raster correctly.
+            # `orig_valid` (real MVS reconstruction, before hole-fill) is the
+            # per-cell confidence the merge uses to favour real heights over
+            # interpolated ones across overlapping tiles (no staircase seams).
             data.save_dsm_ortho_batch(
                 batch_num, dsm_grid, ortho_tile,
                 dsm_global_origin_x, dsm_global_origin_y, dsm_gsd,
                 base_offset=(win_r0, win_c0),
                 global_shape=(dsm_global_h, dsm_global_w),
+                confidence=orig_valid,
             )
             logger.info(
                 f"Cluster {batch_num}: DSM/ortho tile saved → "

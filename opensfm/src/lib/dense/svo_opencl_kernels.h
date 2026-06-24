@@ -1694,6 +1694,11 @@ float3 linear_to_srgb(float3 c) {
 // interpolated (relaxed) cell.  0.7 ~= within 45deg of nadir.  Higher = stricter
 // (less oblique smear, more cells left to the smooth residual fill).
 #define ORTHO_FILLED_NADIR_COS 0.7f
+// DSM horizon-occlusion march (filled cells only): march the heightfield from
+// the cell toward the camera and reject a view if a taller surface blocks the
+// line of sight.  MARGIN tolerates DSM noise / the cell's own neighbourhood.
+#define DSM_OCC_MAX_STEPS 1024
+#define DSM_OCC_MARGIN 1.0f
 __kernel void svo_bake_colors(
     __global const float*    points,
     __global const float*    normals,
@@ -1709,7 +1714,15 @@ __kernel void svo_bake_colors(
     int                      irls_iters,        // Tukey reweight iterations
     __global const uchar*    relax_occ,         // per-point: 1 = skip occlusion
     int                      has_relax,         // relax_occ buffer provided?
-    int                      n_points)          // bound guard (M)
+    int                      n_points,          // bound guard (M)
+    __global const float*    dsm_occ,           // DSM heights, row-major H*W (NaN=nodata)
+    int                      has_dsm_occ,       // DSM occlusion enabled?
+    float                    dsm_origin_x,      // world X of column 0
+    float                    dsm_origin_y,      // world Y of row 0
+    float                    dsm_gsd,           // metres per cell
+    int                      dsm_w,
+    int                      dsm_h,
+    float                    dsm_max_z)         // global max DSM height (march early-out)
 {
     uint gid = get_global_id(0);
     if (gid >= (uint)n_points) return;   // dispatch is padded to 256
@@ -1793,6 +1806,43 @@ __kernel void svo_bake_colors(
         // rank them by nadir-ness, not resolution.  If none are near-nadir the
         // cell goes black → smooth residual fill (better than an oblique smear).
         if (relax_pt && cos_theta < ORTHO_FILLED_NADIR_COS) continue;
+
+        // DSM horizon occlusion (filled cells only).  A filled cell is a hole,
+        // so its depth-validity mask is 0 and the per-view occlusion test above
+        // can't fire — yet a bordering roof may still block this view.  March the
+        // COMPLETE DSM from the cell toward the camera: if any cell rises above
+        // the straight line of sight, the view cannot see the cell → skip it.
+        // (This recovers real colour from genuinely-unoccluded near-nadir views
+        // and rejects the blocked ones, instead of ghosting roof colour.)
+        if (relax_pt && has_dsm_occ) {
+            float dxw = cam_pos_j.x - x.x;
+            float dyw = cam_pos_j.y - x.y;
+            float dzw = cam_pos_j.z - x.z;
+            float horiz = sqrt(dxw * dxw + dyw * dyw);
+            if (horiz > 1e-3f) {
+                float inv_h = 1.0f / horiz;
+                float sx = dxw * inv_h * dsm_gsd;   // one-cell XY step (world)
+                float sy = dyw * inv_h * dsm_gsd;
+                float slope = dzw * inv_h;          // world-z rise per world-XY
+                float wx_s = x.x, wy_s = x.y;
+                int blocked = 0;
+                for (int s = 1; s <= DSM_OCC_MAX_STEPS; s++) {
+                    wx_s += sx; wy_s += sy;
+                    float dist = (float)s * dsm_gsd;
+                    if (dist > horiz) break;             // reached the camera XY
+                    float los_z = x.z + slope * dist;    // line-of-sight height
+                    if (los_z > dsm_max_z) break;        // LOS above all terrain
+                    int gc = (int)((wx_s - dsm_origin_x) / dsm_gsd);
+                    int gr = (int)((wy_s - dsm_origin_y) / dsm_gsd);
+                    if (gc < 0 || gc >= dsm_w || gr < 0 || gr >= dsm_h) break;
+                    float hz = dsm_occ[gr * dsm_w + gc];
+                    if (!isnan(hz) && hz > los_z + DSM_OCC_MARGIN) {
+                        blocked = 1; break;
+                    }
+                }
+                if (blocked) continue;
+            }
+        }
 
         // Sample color with bilinear interpolation.
         float4 rgba = read_imagef(color_images, lin_samp,

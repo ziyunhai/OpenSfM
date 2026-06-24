@@ -13,11 +13,16 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+from numpy.typing import NDArray
 
 from opensfm import io, pypointcloud
 from opensfm.dataset import UndistortedDataSet
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+# Binary PLY record of the dense point-cloud layout: 6 float32 (xyz + normal)
+# + 4 uint8 (rgb + class) = 28 bytes (mirrors io.pack_point_cloud_rows).
+_PLY_ROW_DT: np.dtype = np.dtype([("f", "<f4", 6), ("c", "u1", 4)])
 
 
 def merge_fusion_batches(
@@ -121,7 +126,14 @@ def merge_dsm_ortho_batches(
     highest weight, ramping to ~0 at tile edges), and the output is the weighted
     average of all tiles covering a cell.  Overlaps cross-fade, so cluster seams
     lose both their tonal step and the boundary speckle that a hard territory
-    mask produced.  Otherwise (legacy) tiles are composited by hard **max-z**.
+    mask produced.
+
+    The blend is **two-tier by confidence**: a cell's REAL (reconstructed) tiles
+    feather among themselves and win outright; the FILL (hole-filled) tier is
+    used only where no tile reconstructed the cell.  This stops a good roof
+    height from being averaged toward an overlapping tile that filled the same
+    spot from the ground (the DSM staircase).  Otherwise (legacy) tiles are
+    composited by hard **max-z**.
 
     Tiles are deleted afterwards when ``depthmap_delete_fusion_batches`` is set,
     matching the PLY batch cleanup.
@@ -136,89 +148,121 @@ def merge_dsm_ortho_batches(
 
     # Global extent + georeference come from the tiles themselves (identical
     # across clusters); read the first to size the output grid.
-    _, _, _, _, (gh, gw), (origin_x, origin_y, gsd) = \
+    _, _, _, _, (gh, gw), (origin_x, origin_y, gsd), _ = \
         data.load_dsm_ortho_batch(present[0])
 
     feather = data.config.get("dsm_merge_feather", True)
-
     if feather:
         from scipy.ndimage import distance_transform_edt
 
-        # Weighted-average accumulators (sum of w, w*height, w*colour).
-        acc_w = np.zeros((gh, gw), dtype=np.float32)
-        acc_h = np.zeros((gh, gw), dtype=np.float32)
-        acc_c = np.zeros((gh, gw, 3), dtype=np.float32)
-        n_merged = 0
-        for bn in present:
-            d_win, o_win, r0, c0, gshape, _geo = data.load_dsm_ortho_batch(bn)
-            if gshape != (gh, gw):
-                logger.warning(
-                    f"DSM tile {bn} global shape {gshape} != {(gh, gw)}; "
-                    "skipping"
-                )
-                continue
-            h, w = d_win.shape[:2]
-            valid = ~np.isnan(d_win)
-            if not valid.any():
-                continue
-            # Feather weight = distance into the valid region.  A False border
-            # is padded in so the tile's own outer edges also ramp to ~0 (not
-            # just interior holes), giving a symmetric cross-fade in overlaps.
-            padded = np.zeros((h + 2, w + 2), dtype=bool)
-            padded[1:-1, 1:-1] = valid
-            wgt = distance_transform_edt(padded)[1:-1, 1:-1].astype(np.float32)
-            wgt *= valid  # exactly zero outside the surface
-            sl = (slice(r0, r0 + h), slice(c0, c0 + w))
-            acc_w[sl] += wgt
-            acc_h[sl] += wgt * np.where(valid, d_win, 0.0).astype(np.float32)
-            acc_c[sl] += wgt[..., None] * o_win.astype(np.float32)
-            n_merged += 1
-            del d_win, o_win, wgt, valid, padded
-            gc.collect()
+    # Metadata pass: each tile's window offset + shape (one decompress each,
+    # pixel data discarded), so the band loop below knows which tiles touch
+    # each band without holding them all resident.
+    meta: List[Tuple[int, int, int, int, int]] = []  # (bn, r0, c0, h, w)
+    for bn in present:
+        d_win, o_win, r0, c0, gshape, _geo, _conf = \
+            data.load_dsm_ortho_batch(bn)
+        if gshape != (gh, gw):
+            logger.warning(
+                f"DSM tile {bn} global shape {gshape} != {(gh, gw)}; skipping"
+            )
+        else:
+            meta.append((bn, r0, c0, d_win.shape[0], d_win.shape[1]))
+        del d_win, o_win
 
-        filled = acc_w > 0.0
-        dsm = np.full((gh, gw), np.nan, dtype=np.float32)
-        dsm[filled] = acc_h[filled] / acc_w[filled]
-        ortho = np.zeros((gh, gw, 3), dtype=np.uint8)
-        ortho[filled] = np.clip(
-            acc_c[filled] / acc_w[filled][:, None] + 0.5, 0.0, 255.0
-        ).astype(np.uint8)
-        del acc_w, acc_h, acc_c, filled
-        gc.collect()
-    else:
-        dsm = np.full((gh, gw), np.nan, dtype=np.float32)
-        ortho = np.zeros((gh, gw, 3), dtype=np.uint8)
-        n_merged = 0
-        for bn in present:
-            d_win, o_win, r0, c0, gshape, _geo = data.load_dsm_ortho_batch(bn)
-            if gshape != (gh, gw):
-                logger.warning(
-                    f"DSM tile {bn} global shape {gshape} != {(gh, gw)}; "
-                    "skipping"
-                )
-                continue
-            h, w = d_win.shape[:2]
-            win_dsm = dsm[r0:r0 + h, c0:c0 + w]
-            win_ortho = ortho[r0:r0 + h, c0:c0 + w]
-            # Take cells where this tile has a surface and either the global grid
-            # is empty there or this tile's height wins (NaN-safe).
-            take = ~np.isnan(d_win) & (np.isnan(win_dsm) | (d_win > win_dsm))
-            win_dsm[take] = d_win[take]
-            win_ortho[take] = o_win[take]
-            n_merged += 1
+    # Band height bounded by the RAM budget: each band holds accumulators of
+    # band_rows × gw.  Feather keeps TWO tiers (real + fill), each w + h + RGB
+    # ≈ 20 B/cell → ~40 B/cell plus outputs/flips.
+    max_ram = int(data.config.get("dsm_merge_max_ram_mb", 512)) * (1 << 20)
+    band_rows = max(1, min(int(gh), max(64, max_ram // max(1, gw * 50))))
+
+    def fill_band(rs: int, re_: int) -> Tuple[NDArray, NDArray]:
+        """Composite all tiles overlapping grid rows [rs, re_) into one band."""
+        bh = re_ - rs
+        if feather:
+            # Two confidence tiers per cell: REAL (reconstructed) and FILL
+            # (hole-filled / interpolated).  Real cells feather-blend among
+            # themselves; the fill tier is consulted ONLY where no real tile
+            # covers the cell — so a good roof estimate is never dragged toward
+            # an overlapping tile's ground-level fill (no staircase seams).
+            accR_w = np.zeros((bh, gw), dtype=np.float32)
+            accR_h = np.zeros((bh, gw), dtype=np.float32)
+            accR_c = np.zeros((bh, gw, 3), dtype=np.float32)
+            accF_w = np.zeros((bh, gw), dtype=np.float32)
+            accF_h = np.zeros((bh, gw), dtype=np.float32)
+            accF_c = np.zeros((bh, gw, 3), dtype=np.float32)
+        else:
+            dsm_b = np.full((bh, gw), np.nan, dtype=np.float32)
+            ortho_b = np.zeros((bh, gw, 3), dtype=np.uint8)
+        for bn, r0, c0, h, w in meta:
+            if r0 >= re_ or r0 + h <= rs:
+                continue  # tile does not intersect this band
+            d_win, o_win, _, _, _, _, conf = data.load_dsm_ortho_batch(bn)
+            # Row ranges: tile-local [ts, te) ↔ band-local [bs, be).
+            ts = max(rs, r0) - r0
+            te = min(re_, r0 + h) - r0
+            bs = max(rs, r0) - rs
+            be = min(re_, r0 + h) - rs
+            cs, ce = c0, c0 + w
+            if feather:
+                valid = ~np.isnan(d_win)
+                # Feather weight computed on the FULL tile (a padded False
+                # border so its outer edges ramp to ~0), then sliced — so band
+                # boundaries don't introduce artificial weight edges.
+                padded = np.zeros((h + 2, w + 2), dtype=bool)
+                padded[1:-1, 1:-1] = valid
+                wgt = distance_transform_edt(
+                    padded
+                )[1:-1, 1:-1].astype(np.float32) * valid
+                wseg = wgt[ts:te]
+                vseg = valid[ts:te]
+                dseg = np.where(vseg, d_win[ts:te], 0.0).astype(np.float32)
+                oseg = o_win[ts:te].astype(np.float32)
+                # Split this tile's valid cells into the two tiers.  A legacy
+                # tile (conf is None) is treated as all-real → plain feather.
+                if conf is not None:
+                    real = vseg & (conf[ts:te] > 0)
+                else:
+                    real = vseg
+                wR = wseg * real
+                wF = wseg * (vseg & ~real)
+                accR_w[bs:be, cs:ce] += wR
+                accR_h[bs:be, cs:ce] += wR * dseg
+                accR_c[bs:be, cs:ce] += wR[..., None] * oseg
+                accF_w[bs:be, cs:ce] += wF
+                accF_h[bs:be, cs:ce] += wF * dseg
+                accF_c[bs:be, cs:ce] += wF[..., None] * oseg
+            else:
+                dseg = d_win[ts:te]
+                cur = dsm_b[bs:be, cs:ce]
+                curo = ortho_b[bs:be, cs:ce]
+                take = ~np.isnan(dseg) & (np.isnan(cur) | (dseg > cur))
+                cur[take] = dseg[take]
+                curo[take] = o_win[ts:te][take]
             del d_win, o_win
-            gc.collect()
+        if feather:
+            useR = accR_w > 0.0                       # real tile(s) cover it
+            useF = (~useR) & (accF_w > 0.0)           # fill only where no real
+            dsm_b = np.full((bh, gw), np.nan, dtype=np.float32)
+            dsm_b[useR] = accR_h[useR] / accR_w[useR]
+            dsm_b[useF] = accF_h[useF] / accF_w[useF]
+            ortho_b = np.zeros((bh, gw, 3), dtype=np.uint8)
+            ortho_b[useR] = np.clip(
+                accR_c[useR] / accR_w[useR][:, None] + 0.5, 0.0, 255.0
+            ).astype(np.uint8)
+            ortho_b[useF] = np.clip(
+                accF_c[useF] / accF_w[useF][:, None] + 0.5, 0.0, 255.0
+            ).astype(np.uint8)
+        gc.collect()
+        return dsm_b, ortho_b
 
-    data.save_dsm(dsm, origin_x, origin_y, gsd, reference)
-    # No-data (transparent) wherever no cluster produced a surface.
-    data.save_ortho(
-        ortho, origin_x, origin_y, gsd, reference,
-        nodata_mask=np.isnan(dsm),
+    n_valid = data.save_dsm_ortho_streamed(
+        gh, gw, origin_x, origin_y, gsd, fill_band, band_rows,
+        reference=reference,
     )
-    n_valid = int(np.count_nonzero(~np.isnan(dsm)))
     logger.info(
-        f"Merged {n_merged} DSM/ortho tile(s) → {data.dsm_file()} / "
-        f"{data.ortho_file()} ({n_valid} valid cells)"
+        f"Merged {len(meta)} DSM/ortho tile(s) → {data.dsm_file()} / "
+        f"{data.ortho_file()} ({n_valid} valid cells, band_rows={band_rows})"
     )
 
     if data.config.get("depthmap_delete_fusion_batches", True):
@@ -234,7 +278,10 @@ def export_pointcloud_formats(
     """Stream the merged ``fused.ply`` into LAS and/or LAZ when configured.
 
     fused.ply stays the canonical product / octree input; these are additional
-    archival/interchange copies. Conversion is chunked (bounded memory) and any
+    archival/interchange copies.  The PLY is read with plain buffered file reads
+    in fixed-size record chunks (NOT memory-mapped), so an arbitrarily large
+    cloud never has its page cache balloon resident — the cause of OOM on the
+    previous mmap-based reader.  The LAS/LAZ writers already stream to disk.  Any
     failure is logged without aborting the pipeline.
     """
     formats = []
@@ -250,35 +297,41 @@ def export_pointcloud_formats(
         logger.warning("No fused.ply found; skipping LAS/LAZ export.")
         return
 
+    rec = _PLY_ROW_DT.itemsize
+    chunk_pts = 1_000_000
+    # fused.ply always carries the full dense layout (xyz + normal + rgb + class).
     for fmt in formats:
         out_path = data.point_cloud_file(f"fused.{fmt}")
         try:
-            reader = pypointcloud.open_reader(src)
-            has_normals, has_colors, has_labels = reader.attributes()
-            header = pypointcloud.PointCloudHeader()
-            header.point_count = reader.total_count
-            header.has_normals = has_normals
-            header.has_colors = has_colors
-            header.has_labels = has_labels
-            writer = pypointcloud.open_writer(out_path, header)
+            with data.io_handler.open_rb(src) as fp:
+                n_total = io.read_ply_vertex_count(fp)
+                header = pypointcloud.PointCloudHeader()
+                header.point_count = n_total
+                header.has_normals = True
+                header.has_colors = True
+                header.has_labels = True
+                writer = pypointcloud.open_writer(out_path, header)
 
-            total = 0
-            while True:
-                chunk = reader.read_chunk(1_000_000)
-                if chunk is None:
-                    break
-                pos, nrm, col, lbl = chunk
-                kwargs: Dict[str, Any] = {}
-                if nrm is not None:
-                    kwargs["normals"] = nrm
-                if col is not None:
-                    kwargs["colors"] = col
-                if lbl is not None:
-                    kwargs["labels"] = lbl
-                writer.write_chunk(pos, **kwargs)
-                total += len(pos)
-            writer.finalize()
-            logger.info(f"Exported {total} points to fused.{fmt}")
+                written = 0
+                while written < n_total:
+                    k = min(chunk_pts, n_total - written)
+                    buf = fp.read(k * rec)
+                    if not buf:
+                        break
+                    rows = np.frombuffer(
+                        buf, dtype=_PLY_ROW_DT, count=len(buf) // rec
+                    )
+                    pos = rows["f"][:, :3].astype(np.float64)
+                    nrm = np.ascontiguousarray(rows["f"][:, 3:])
+                    col = np.ascontiguousarray(rows["c"][:, :3])
+                    lbl = np.ascontiguousarray(rows["c"][:, 3])
+                    writer.write_chunk(
+                        pos, normals=nrm, colors=col, labels=lbl
+                    )
+                    written += len(rows)
+                    del buf, rows, pos, nrm, col, lbl
+                writer.finalize()
+            logger.info(f"Exported {written} points to fused.{fmt} (streamed)")
         except Exception:
             logger.warning(f"Failed to export fused.{fmt}", exc_info=True)
 

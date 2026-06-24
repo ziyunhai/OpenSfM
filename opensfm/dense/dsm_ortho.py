@@ -108,6 +108,153 @@ def _linear_fill_components(
             sub_grid[qy, qx] = filled.astype(grid.dtype)
 
 
+def _smooth_fill_components(
+    grid: NDArray,
+    labels: NDArray,
+    fill_ids: NDArray,
+    sample_valid: NDArray,
+    ring_iters: int = 3,
+) -> None:
+    """Fill large COLOUR-hole components by solving Laplace's equation inside each
+    hole with the surrounding valid cells as the Dirichlet boundary — a HARMONIC
+    fill, the smooth-fill replacement for ``_linear_fill_components`` on the
+    ortho.
+
+    Linear (Delaunay) interpolation triangulates the boundary samples, and across
+    a wide irregular occluded strip those triangles render as radiating *fan*
+    streaks.  A fast-march inpaint (``cv2.inpaint``) removes the fans but leaves
+    its own medial-axis streaks on wide regions.  The harmonic solution is the
+    smoothest interpolant of the border colour — no triangulation, no streaks —
+    and (unlike bounded diffusion) fills any width exactly in one direct solve.
+
+    Per-component, cropped to the bbox (+``ring_iters``+2 pad) so cost scales with
+    hole size, not grid size; ``grid`` (``(H,W,C)`` colour) is modified in place.
+    Only ``sample_valid`` cells inside the crop pin the solution (Dirichlet); the
+    no-data exterior and other holes are free (Neumann), so nothing bleeds in.
+    """
+    from scipy import sparse as sp
+    from scipy.sparse.linalg import splu
+
+    H, W = labels.shape
+    nchan = grid.shape[2]
+    pad = ring_iters + 2
+    boxes = ndimage.find_objects(labels)
+    for lid in fill_ids:
+        box = boxes[lid - 1]
+        if box is None:
+            continue
+        y0 = max(box[0].start - pad, 0)
+        y1 = min(box[0].stop + pad, H)
+        x0 = max(box[1].start - pad, 0)
+        x1 = min(box[1].stop + pad, W)
+
+        sub = grid[y0:y1, x0:x1]  # a view → writes propagate to grid
+        comp = labels[y0:y1, x0:x1] == lid
+        seed = sample_valid[y0:y1, x0:x1]  # Dirichlet boundary values live here
+        if not seed.any():
+            continue
+        hN, wN = comp.shape
+        ys, xs = np.nonzero(comp)
+        n = ys.size
+        if n == 0:
+            continue
+        uidx = np.full((hN, wN), -1, np.int64)
+        uidx[ys, xs] = np.arange(n)
+
+        # 5-point Laplacian over the unknown (hole) cells.  Each row:
+        # diag·u - Σ neighbour_unknown = Σ neighbour_seed_value.  Neighbours that
+        # are neither unknown nor seed (exterior / other holes) and out-of-bounds
+        # neighbours are dropped (homogeneous Neumann → no-flux), which keeps the
+        # fill anchored only to real colour.
+        diag = np.zeros(n)
+        rhs = np.zeros((n, nchan))
+        off_r: list = []
+        off_c: list = []
+        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            ny = ys + dy
+            nx = xs + dx
+            inb = (ny >= 0) & (ny < hN) & (nx >= 0) & (nx < wN)
+            nyc = np.clip(ny, 0, hN - 1)
+            nxc = np.clip(nx, 0, wN - 1)
+            nb_u = inb & (uidx[nyc, nxc] >= 0)
+            nb_s = inb & seed[nyc, nxc] & ~nb_u
+            diag += (nb_u | nb_s).astype(np.float64)
+            uu = np.nonzero(nb_u)[0]
+            off_r.append(uu)
+            off_c.append(uidx[nyc[uu], nxc[uu]])
+            ss = np.nonzero(nb_s)[0]
+            if ss.size:
+                rhs[ss] += sub[nyc[ss], nxc[ss], :]
+        diag[diag == 0.0] = 1.0  # isolated cell with no valid neighbour → keep 0
+
+        rows = np.concatenate([np.arange(n)] + off_r)
+        cols = np.concatenate([np.arange(n)] + off_c)
+        vals = np.concatenate([diag] + [-np.ones(u.size) for u in off_r])
+        amat = sp.csc_matrix((vals, (rows, cols)), shape=(n, n))
+        lu = splu(amat)
+        out = np.empty((n, nchan))
+        for ch in range(nchan):
+            out[:, ch] = lu.solve(rhs[:, ch])
+        sub[ys, xs, :] = np.clip(out, 0, 255).astype(grid.dtype)
+
+
+def _low_flat_fill_components(
+    grid: NDArray,
+    labels: NDArray,
+    fill_ids: NDArray,
+    sample_valid: NDArray,
+    low_percentile: float,
+    ring_iters: int = 3,
+    occlusion_drop: float = 0.0,
+    no_relax_out: Optional[NDArray] = None,
+) -> None:
+    """Fill each large hole as a gravity-aligned FLAT surface at the LOW altitude
+    of its boundary ring (single-channel DSM only).
+
+    Models occlusion: the higher bordering surface (a roof — likely NOT occluded,
+    so correctly reconstructed) keeps its height and meets the hole with a SHARP
+    edge, while the hole — assumed to be occluded ground — is completed flat at
+    the lower (``low_percentile``-th) altitude of its surrounding ring, rather
+    than being slanted up toward the roof by linear interpolation.
+    ``grid`` ``(H,W)`` float is modified in place; work is cropped per component.
+
+    ``occlusion_drop``/``no_relax_out``: when a hole's ring spans more than
+    ``occlusion_drop`` (high border minus the low fill altitude), the filled
+    ground sits in a bordering roof's shadow → it is OCCLUDED, so its cells are
+    marked in ``no_relax_out`` and the bake keeps the strict mask there (no
+    roof-colour ghosting; falls to the smooth residual fill instead).
+    """
+    H, W = labels.shape
+    pad = ring_iters + 1
+    boxes = ndimage.find_objects(labels)
+    for lid in fill_ids:
+        box = boxes[lid - 1]
+        if box is None:
+            continue
+        y0 = max(box[0].start - pad, 0)
+        y1 = min(box[0].stop + pad, H)
+        x0 = max(box[1].start - pad, 0)
+        x1 = min(box[1].stop + pad, W)
+
+        sub_grid = grid[y0:y1, x0:x1]  # a view → writes propagate to grid
+        comp = labels[y0:y1, x0:x1] == lid
+        ring = ndimage.binary_dilation(
+            comp, iterations=ring_iters) & sample_valid[y0:y1, x0:x1]
+        ring_vals = sub_grid[ring]
+        if ring_vals.size == 0:
+            continue
+        # Low altitude of the border = the (occluded) ground level to continue.
+        low = np.percentile(ring_vals, low_percentile)
+        sub_grid[comp] = np.float32(low)
+
+        # A tall border (roof) above this ground → the fill is occluded ground;
+        # don't let the bake mask-relax it (would ghost roof colour onto it).
+        if occlusion_drop > 0.0 and no_relax_out is not None:
+            high = np.percentile(ring_vals, 100.0 - low_percentile)
+            if high - low > occlusion_drop:
+                no_relax_out[y0:y1, x0:x1][comp] = True
+
+
 def _fill_holes_2pass(
     values: NDArray,
     sample_valid: NDArray,
@@ -117,14 +264,19 @@ def _fill_holes_2pass(
     diffuse_iters: int,
     kappa: float,
     dt: float,
+    large_fill: str = "linear",
+    low_percentile: float = 20.0,
+    occlusion_drop: float = 0.0,
     device: int = 0,
 ) -> Tuple[NDArray, NDArray]:
     """Two-stage hole fill on a float grid (post-process).
 
     Stage 1 — tiny holes (connected components <= ``small_area_max`` cells):
     bounded GPU Perona-Malik diffusion seeded from the surrounding data.
-    Stage 2 — larger holes: per-component linear (Delaunay) interpolation
-    from their boundary ring.
+    Stage 2 — larger holes: ``large_fill="linear"`` per-component linear
+    (Delaunay) interpolation from their boundary ring, or ``"low_flat"`` a
+    gravity-aligned flat fill at the ``low_percentile`` border altitude
+    (DSM only — continues occluded ground flat with a sharp roof edge).
 
     ``values``      : float ``(H,W)`` or ``(H,W,C)``.
     ``sample_valid``: bool ``(H,W)``, True where real data exists (samples,
@@ -135,8 +287,10 @@ def _fill_holes_2pass(
                       filled — the caller is responsible for excluding the
                       genuine no-data exterior (DSM: the footprint test; ortho:
                       ``has_dsm``).
-    Returns ``(filled_copy_float32, extrapolated_mask_bool)`` where the second
-    is True at cells filled by nearest-neighbour extrapolation (unreliable).
+    Returns ``(filled_copy_float32, no_relax_mask_bool)`` where the second marks
+    cells the ortho bake must NOT mask-relax: linear → cells extrapolated by
+    nearest-neighbour (outside the hull); low_flat → occluded holes (a tall roof
+    border above the ground fill).
     """
     out = values.astype(np.float32, copy=True)
     extrap = np.zeros(values.shape[:2], dtype=bool)
@@ -193,17 +347,33 @@ def _fill_holes_2pass(
         stage2_valid = sample_valid
 
     n_tiny = int(small_mask.sum()) if diffuse_ok else 0
-    n_linear = int(comp_size[stage2_ids].sum()) if stage2_ids.size else 0
-    n_nodata = int(hole_mask.sum()) - n_tiny - n_linear
+    n_large = int(comp_size[stage2_ids].sum()) if stage2_ids.size else 0
+    n_nodata = int(hole_mask.sum()) - n_tiny - n_large
+    mode = {"low_flat": "flat-low", "inpaint": "inpaint"}.get(
+        large_fill, "linear")
     logger.info(
-        f"Hole fill: {n_tiny} tiny cells (diffusion), {n_linear} enclosed "
-        f"cells (linear), {n_nodata} cells left as no-data"
+        f"Hole fill: {n_tiny} tiny cells (diffusion), {n_large} enclosed "
+        f"cells ({mode}), {n_nodata} cells left as no-data"
     )
 
     if stage2_ids.size:
-        _linear_fill_components(
-            out, labels, stage2_ids, stage2_valid, extrap_out=extrap
-        )
+        if large_fill == "low_flat":
+            # Flat gravity-aligned fill (DSM).  `extrap` here carries the
+            # no-mask-relax cells = the OCCLUDED holes (ground in a roof's
+            # shadow), so the bake won't ghost roof colour onto them.
+            _low_flat_fill_components(
+                out, labels, stage2_ids, stage2_valid, low_percentile,
+                occlusion_drop=occlusion_drop, no_relax_out=extrap,
+            )
+        elif large_fill == "inpaint":
+            # Smooth HARMONIC (Laplace) fill (ortho colour): no Delaunay fan
+            # streaks across wide occluded strips, and no fast-march medial
+            # streaks either.  Leaves `extrap` empty (unused by the ortho fill).
+            _smooth_fill_components(out, labels, stage2_ids, stage2_valid)
+        else:
+            _linear_fill_components(
+                out, labels, stage2_ids, stage2_valid, extrap_out=extrap
+            )
 
     return out, extrap
 
@@ -229,13 +399,16 @@ def _fill_dsm_holes(
     dsm_grid: NDArray, config: Dict[str, Any]
 ) -> Tuple[NDArray, NDArray]:
     """Fill DSM no-data holes that lie INSIDE the reconstructed footprint: tiny
-    ones by edge-aware GPU diffusion, larger pockets/boundary concavities by
-    per-component linear (Delaunay) interpolation.  The no-data EXTERIOR outside
-    the footprint is kept as no-data (so the ortho stays transparent there).
+    ones by edge-aware GPU diffusion, larger ones by a gravity-aligned FLAT fill
+    at the low border altitude (continues occluded ground flat, leaving a sharp
+    edge under the bordering roof — not a linear slant).  The no-data EXTERIOR
+    outside the footprint is kept as no-data (ortho stays transparent there).
 
-    Returns ``(filled_dsm, extrapolated_mask)`` — the mask marks cells filled by
-    nearest-neighbour extrapolation (unreliable geometry, e.g. the open side of
-    boundary concavities); the ortho bake must NOT mask-relax those.
+    Returns ``(filled_dsm, no_relax_mask)``; the flat fill marks the OCCLUDED
+    holes (ground sitting below a tall roof border, > ``hole_fill_occlusion_drop``
+    m) so the bake keeps the strict mask there — no roof-colour ghosting; those
+    fall to the smooth residual fill.  Open/shallow filled holes are left
+    mask-relaxed (real colour, nadir-only gate keeps it height-robust).
     """
     valid = ~np.isnan(dsm_grid)
     empty = np.zeros(dsm_grid.shape, dtype=bool)
@@ -255,6 +428,9 @@ def _fill_dsm_holes(
         diffuse_iters=config["hole_fill_diffuse_iters"],
         kappa=0.5,  # metres: large steps (building edges) stop diffusion
         dt=0.2,
+        large_fill="low_flat",  # continue occluded ground flat, sharp roof edge
+        low_percentile=float(config["hole_fill_low_percentile"]),
+        occlusion_drop=float(config["hole_fill_occlusion_drop"]),
     )
 
 
@@ -268,7 +444,9 @@ def _fill_ortho_holes(
     produced no colour (occluded in every view → black).  Most filled-DSM cells
     are coloured by the Pass-2 reprojection bake; this only mops up the few the
     bake could not see.  Tiny holes by (near-isotropic) GPU diffusion, larger
-    ones by linear interpolation.  Cells with no DSM stay untouched (black).
+    ones by a smooth fast-march inpaint (NOT Delaunay linear — its triangulation
+    fanned out as streaks across wide occluded strips).  Cells with no DSM stay
+    untouched (black).
 
     ``baked_mask`` (if given) marks cells that received a real bake; only the
     complement (DSM but not baked) is filled, and the fill is seeded from the
@@ -290,6 +468,7 @@ def _fill_ortho_holes(
         diffuse_iters=config["hole_fill_diffuse_iters"],
         kappa=1e9,  # near-isotropic: smooth colour fill, no false edges
         dt=0.2,
+        large_fill="inpaint",  # smooth fast-march fill, no Delaunay fan streaks
     )
     return np.clip(filled, 0, 255).astype(ortho_grid.dtype)
 

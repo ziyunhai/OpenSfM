@@ -469,7 +469,9 @@ class SVOFuserWrapper {
   py::array_t<uint8_t> BakeColorsStandalone(
       const py::array_t<float, py::array::c_style>& points,
       const py::array_t<float, py::array::c_style>& normals, int n_final,
-      int irls_iters, const py::object& relax_occlusion) {
+      int irls_iters, const py::object& relax_occlusion,
+      const py::object& dsm_occ, float dsm_origin_x, float dsm_origin_y,
+      float dsm_gsd, float dsm_max_z) {
     if (points.ndim() != 2 || points.shape(1) != 3) {
       throw std::invalid_argument("points must be (N, 3)");
     }
@@ -499,12 +501,28 @@ class SVOFuserWrapper {
       std::memcpy(relax.data(), arr.data(), n);
     }
 
+    // Optional DSM heightfield (H, W) float for per-view horizon occlusion.
+    std::vector<float> dsm;
+    int dsm_h = 0, dsm_w = 0;
+    if (!dsm_occ.is_none()) {
+      auto arr = dsm_occ.cast<py::array_t<float, py::array::c_style>>();
+      if (arr.ndim() != 2) {
+        throw std::invalid_argument("dsm_occ must be a 2D (H, W) array");
+      }
+      dsm_h = static_cast<int>(arr.shape(0));
+      dsm_w = static_cast<int>(arr.shape(1));
+      dsm.resize(static_cast<size_t>(dsm_h) * dsm_w);
+      std::memcpy(dsm.data(), arr.data(), dsm.size() * sizeof(float));
+    }
+
     std::vector<Vec3<uint8_t>> colors(n, Vec3<uint8_t>(128, 128, 128));
 
     {
       py::gil_scoped_release release;
       sf_.BakeColors(pts, nrm, &colors, n_final, irls_iters,
-                     relax.empty() ? nullptr : &relax);
+                     relax.empty() ? nullptr : &relax,
+                     dsm.empty() ? nullptr : &dsm, dsm_w, dsm_h, dsm_origin_x,
+                     dsm_origin_y, dsm_gsd, dsm_max_z);
     }
 
     py::array_t<uint8_t> colors_arr({n, 3});

@@ -1236,6 +1236,83 @@ class UndistortedDataSet:
             aband.FlushCache()
         ds = None
 
+    def save_dsm_ortho_streamed(
+        self,
+        gh: int,
+        gw: int,
+        origin_x: float,
+        origin_y: float,
+        gsd: float,
+        fill_band: "Any",
+        band_rows: int,
+        reference: Optional["geo.TopocentricConverter"] = None,
+    ) -> int:
+        """Write dsm.tif + ortho.tif band-by-band, never holding the full grid.
+
+        ``fill_band(row_start, row_end)`` returns this horizontal band's
+        ``(dsm_band (bh, gw) float32 with NaN = no-data, ortho_band (bh, gw, 3)
+        uint8)`` in our grid convention (row 0 = bottom).  This method owns the
+        GeoTIFF georeferencing, the vertical flip to GeoTIFF top-down order, the
+        DSM no-data value, and the ortho alpha band.  BIGTIFF is enabled so the
+        rasters can exceed 4 GB.  Returns the count of valid (non-NaN) cells.
+        """
+        from osgeo import gdal, osr
+
+        self.io_handler.mkdir_p(self._depthmap_path())
+        opts = ["BIGTIFF=IF_SAFER"]
+        drv = gdal.GetDriverByName("GTiff")
+        dsm_ds = drv.Create(
+            self.dsm_file(), int(gw), int(gh), 1, gdal.GDT_Float32, options=opts
+        )
+        ortho_ds = drv.Create(
+            self.ortho_file(), int(gw), int(gh), 4, gdal.GDT_Byte, options=opts
+        )
+        if dsm_ds is None or ortho_ds is None:
+            raise RuntimeError("Failed to create DSM/ortho GeoTIFF(s)")
+
+        top_left_y = origin_y + gh * gsd
+        gt = (origin_x, gsd, 0.0, top_left_y, 0.0, -gsd)
+        dsm_ds.SetGeoTransform(gt)
+        ortho_ds.SetGeoTransform(gt)
+        if reference is not None:
+            srs = osr.SpatialReference()
+            utm_zone = int((reference.lon + 180.0) / 6.0) + 1
+            srs.SetUTM(utm_zone, reference.lat >= 0.0)
+            srs.SetWellKnownGeogCS("WGS84")
+            wkt = srs.ExportToWkt()
+            dsm_ds.SetProjection(wkt)
+            ortho_ds.SetProjection(wkt)
+
+        nodata = -9999.0
+        dsm_band = dsm_ds.GetRasterBand(1)
+        dsm_band.SetNoDataValue(nodata)
+        ortho_ds.GetRasterBand(4).SetColorInterpretation(gdal.GCI_AlphaBand)
+
+        n_valid = 0
+        for rs in range(0, int(gh), int(band_rows)):
+            re_ = min(int(gh), rs + int(band_rows))
+            dsm_b, ortho_b = fill_band(rs, re_)
+            valid = ~np.isnan(dsm_b)
+            n_valid += int(np.count_nonzero(valid))
+            # GeoTIFF row 0 = top; our row 0 = bottom → flip and place this band's
+            # window at yoff = gh - re_ (see save_dsm for the full-grid case).
+            yoff = int(gh) - re_
+            out_dsm = np.where(valid, dsm_b, nodata).astype(np.float32)
+            dsm_band.WriteArray(np.flipud(out_dsm), 0, yoff)
+            of = np.flipud(ortho_b)
+            for b in range(3):
+                ortho_ds.GetRasterBand(b + 1).WriteArray(
+                    np.ascontiguousarray(of[:, :, b]), 0, yoff
+                )
+            alpha = np.where(np.flipud(valid), 255, 0).astype(np.uint8)
+            ortho_ds.GetRasterBand(4).WriteArray(alpha, 0, yoff)
+
+        dsm_ds.FlushCache()
+        ortho_ds.FlushCache()
+        dsm_ds = None
+        ortho_ds = None
+        return n_valid
+
     # ── Per-cluster DSM/ortho tiles (composited into the final raster) ──
     def dsm_ortho_batch_file(self, batch_num: int) -> str:
         return os.path.join(
@@ -1267,6 +1344,7 @@ class UndistortedDataSet:
         gsd: float,
         base_offset: Tuple[int, int] = (0, 0),
         global_shape: Optional[Tuple[int, int]] = None,
+        confidence: Optional[NDArray] = None,
     ) -> None:
         """Save one cluster's finished DSM+ortho as a compact tile.
 
@@ -1288,6 +1366,11 @@ class UndistortedDataSet:
                 grid.  ``(0, 0)`` when the grid already spans the full extent.
             global_shape: (H, W) of the global grid; defaults to the passed
                 grid's shape (full-extent case).
+            confidence: optional (H, W) bool/uint8, True where the DSM cell is a
+                REAL reconstruction (vs a hole-fill).  Stored (cropped identically
+                to the DSM) so the merge can favour real heights over interpolated
+                ones in tile overlaps.  Omitted → the merge treats the tile as all
+                real (legacy behaviour).
         """
         self.io_handler.mkdir_p(self._depthmap_path())
         valid = ~np.isnan(dsm_grid)
@@ -1306,26 +1389,32 @@ class UndistortedDataSet:
             global_shape if global_shape is not None
             else (int(dsm_grid.shape[0]), int(dsm_grid.shape[1]))
         )
-        buf = BytesIO()
-        np.savez(
-            buf,
+        arrays = dict(
             dsm=dsm_win,
             ortho=ortho_win,
             offset=np.array([base_r + r0, base_c + c0], dtype=np.int64),
             global_shape=np.array(gshape, dtype=np.int64),
             geo=np.array([origin_x, origin_y, gsd], dtype=np.float64),
         )
+        if confidence is not None:
+            arrays["conf"] = np.ascontiguousarray(
+                confidence[r0:r1, c0:c1], dtype=np.uint8
+            )
+        buf = BytesIO()
+        np.savez(buf, **arrays)
         with self.io_handler.open_wb(self.dsm_ortho_batch_file(batch_num)) as f:
             f.write(lz4_frame.compress(buf.getvalue()))
 
     def load_dsm_ortho_batch(
         self, batch_num: int
     ) -> Tuple[NDArray, NDArray, int, int, Tuple[int, int],
-               Tuple[float, float, float]]:
+               Tuple[float, float, float], Optional[NDArray]]:
         """Load a DSM/ortho tile.
 
         Returns ``(dsm_win, ortho_win, row0, col0, (global_h, global_w),
-        (origin_x, origin_y, gsd))``.
+        (origin_x, origin_y, gsd), conf)`` where ``conf`` is the (H, W) uint8
+        real-reconstruction mask (1 = real, 0 = hole-fill), or ``None`` for a
+        legacy tile saved without it.
         """
         with self.io_handler.open_rb(
             self.dsm_ortho_batch_file(batch_num)
@@ -1338,8 +1427,9 @@ class UndistortedDataSet:
         gh, gw = int(o["global_shape"][0]), int(o["global_shape"][1])
         ox, oy, gsd = (float(o["geo"][0]), float(o["geo"][1]),
                        float(o["geo"][2]))
+        conf = o["conf"] if "conf" in o.files else None
         o.close()
-        return dsm, ortho, r0, c0, (gh, gw), (ox, oy, gsd)
+        return dsm, ortho, r0, c0, (gh, gw), (ox, oy, gsd), conf
 
     def raw_depthmap_exists(self, image: str) -> bool:
         return self.io_handler.isfile(self.depthmap_file(image, "raw.npz"))
