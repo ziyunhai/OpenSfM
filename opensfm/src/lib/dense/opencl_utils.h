@@ -82,7 +82,7 @@ class CLDevice {
     cl::Program program(context_, source);
 
     std::string full_opts =
-        "-cl-std=CL1.2 -cl-mad-enable -cl-fast-relaxed-math" + options;
+        "-cl-std=CL1.2 -cl-mad-enable -cl-fast-relaxed-math " + options;
     try {
       program.build({device_}, full_opts.c_str());
     } catch (const cl::BuildError& e) {
