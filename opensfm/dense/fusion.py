@@ -1095,7 +1095,8 @@ def fuse_clusters(
                 dsm_occ_arr = None
                 dsm_max_z = 0.0
                 if config["ortho_bake_dsm_occlusion"]:
-                    dsm_occ_arr = np.ascontiguousarray(dsm_grid, dtype=np.float32)
+                    dsm_occ_arr = np.ascontiguousarray(
+                        dsm_grid, dtype=np.float32)
                     dsm_max_z = float(np.nanmax(dsm_grid))
                 # Cells that received a REAL (non-black) bake.  A cell is baked by exactly one leaf
                 baked_mask = np.zeros((dsm_h, dsm_w), dtype=bool)
@@ -1147,8 +1148,7 @@ def fuse_clusters(
                     ).astype(np.uint8)
                     baker = leaf_fusers[leaf_idx]
                     if baker is None:
-                        # Not retained from Pass 1 (over the GPU cap) — rebuild
-                        # and re-fuse, as before.
+                        # Not retained from Pass 1 (over the GPU cap) — rebuild and re-fuse, as before.
                         baker, n_loaded = _build_fuser(leaf_sv)
                         if n_loaded == 0:
                             del baker
@@ -1195,11 +1195,13 @@ def fuse_clusters(
                 )
                 # DEBUG (dsm_save_cluster_tiles): classify every cell so the
                 # fan artefact can be localised in QGIS BEFORE the residual fill
-                # repaints anything.  green = reconstructed geometry, baked;
-                # red = reconstructed but no view saw it; cyan = tiny hole filled
-                # by DIFFUSION (a smooth ramp), baked; blue = large hole filled
-                # FLAT-LOW, baked; yellow = hole-filled but no view (→ residual
-                # fill).  Overlay on the fan: cyan/blue ⇒ it's a hole-fill bake,
+                # repaints anything.
+                # green = reconstructed geometry, baked;
+                # red = reconstructed but no view saw it;
+                # cyan = tiny hole filled by DIFFUSION (a smooth ramp), baked;
+                # blue = large hole filled  FLAT-LOW, baked;
+                # yellow = hole-filled but no view (→ residual fill).  Overlay on the fan:
+                # cyan/blue ⇒ it's a hole-fill bake,
                 # green ⇒ it's real (oblique-painted facade) geometry.
                 if config.get("dsm_save_cluster_tiles", False):
                     from scipy import ndimage as _ndi
@@ -1277,9 +1279,6 @@ def fuse_clusters(
             )
             # The tile carries the GLOBAL georeference + shape and its window
             # offset, so the merge places this territory-sized raster correctly.
-            # `orig_valid` (real MVS reconstruction, before hole-fill) is the
-            # per-cell confidence the merge uses to favour real heights over
-            # interpolated ones across overlapping tiles (no staircase seams).
             data.save_dsm_ortho_batch(
                 batch_num, dsm_grid, ortho_tile,
                 dsm_global_origin_x, dsm_global_origin_y, dsm_gsd,

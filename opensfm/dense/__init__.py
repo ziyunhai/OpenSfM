@@ -239,9 +239,11 @@ def run_depthmaps(
     )
     context.log_memory("phase 2 cleaning done")
 
-    # Reclaim raw depthmaps — they are consumed only by the cleaning phase.
-    # Delete a raw map only once its clean counterpart exists on disk, so a
-    # cluster that failed to clean keeps its raw map for a resumed re-run.
+    # Final safety-net sweep: clean_depthmaps already reclaims raw maps on the
+    # fly (reference-counted, as soon as each one's last consumer is cleaned), so
+    # this normally finds only stragglers — raws of clusters that were skipped or
+    # failed to clean.  Delete a raw map only once its clean counterpart exists,
+    # so a cluster that failed to clean keeps its raw for a resumed re-run.
     if config.get("depthmap_delete_raw_after_clean", True):
         removed = 0
         for sid in processable:
