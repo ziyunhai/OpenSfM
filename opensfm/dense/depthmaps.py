@@ -11,6 +11,7 @@ import logging
 import os
 import queue
 import threading
+from collections import defaultdict
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import cv2
@@ -366,6 +367,13 @@ def clean_depthmaps(
     each device running ``_MAX_PARALLEL_PER_DEVICE`` worker threads.
     Each worker creates its own ``GPUDepthmapCleaner`` bound to one device
     so multiple GPUs work in parallel.
+
+    Each raw depthmap is reference-counted by how many pending clusters load
+    it (own shots + selected neighbours) and deleted the moment its last
+    consumer finishes cleaning, so raw maps are reclaimed *during* the phase
+    rather than all at once at the end — bounding peak raw-on-disk to the
+    working set instead of the full set.  This is bit-identical to the
+    end-of-phase reclaim (see ``depthmap_delete_raw_after_clean``).
     """
     available = [
         sid for sid in processable if data.raw_depthmap_exists(sid)
@@ -551,10 +559,12 @@ def clean_depthmaps(
 
     # -- parallel GPU pipeline via shared work queue -----------------------
     cleaned_count = 0
+    removed_raw = 0
     clean_errors: List[Tuple[int, Exception]] = []
     clean_lock = threading.Lock()
 
-    work_q: queue.Queue[Tuple[int, List[str]]] = queue.Queue()
+    # Pending work list (skip clusters already fully cleaned, e.g. on resume).
+    queued: List[Tuple[int, List[str]]] = []
     for bi, cluster in enumerate(clusters):
         cluster_valid = list(set(cluster) & available_set)
         if not cluster_valid:
@@ -564,12 +574,30 @@ def clean_depthmaps(
                 f"Clean batch {bi} skipped: all shots already cleaned"
             )
             continue
-        work_q.put((bi, cluster_valid))
+        queued.append((bi, cluster_valid))
 
-    total_work = work_q.qsize()
-    if total_work == 0:
+    if not queued:
         logger.info("GPU cleaning: nothing to do")
         return
+
+    # On-the-fly raw reclaim
+    delete_raw = config.get("depthmap_delete_raw_after_clean", True)
+    cluster_deps: Dict[int, List[str]] = {}
+    raw_refcount: Dict[str, int] = defaultdict(int)
+    if delete_raw:
+        for bi, cluster_valid in queued:
+            ordered_shots, _ = select_cluster_views(
+                cluster_valid, all_neighbors, available_set,
+                max_total=config["depthmap_max_cluster_views"],
+                per_ref_cap=max_neighbors,
+            )
+            cluster_deps[bi] = ordered_shots
+            for sid in ordered_shots:
+                raw_refcount[sid] += 1
+
+    work_q: queue.Queue[Tuple[int, List[str]]] = queue.Queue()
+    for item in queued:
+        work_q.put(item)
 
     context.log_memory("starting GPU cleaning batches")
 
@@ -606,8 +634,21 @@ def clean_depthmaps(
                     n = _gpu_clean_and_save_cluster(cleaner, cluster_valid)
                     context.log_memory(f"clean batch {bi} end")
                     with clean_lock:
-                        nonlocal cleaned_count
+                        nonlocal cleaned_count, removed_raw
                         cleaned_count += n
+                        # Release this cluster's raw refcounts; delete any raw that no other pending cluster still needs.
+                        if delete_raw:
+                            for sid in cluster_deps.get(bi, []):
+                                raw_refcount[sid] -= 1
+                                if (
+                                    raw_refcount[sid] <= 0
+                                    and data.clean_depthmap_exists(sid)
+                                    and data.raw_depthmap_exists(sid)
+                                ):
+                                    data.io_handler.rm_if_exist(
+                                        data.depthmap_file(sid, "raw.npz")
+                                    )
+                                    removed_raw += 1
                     logger.info(
                         f"Clean batch {bi} done ({n} views) on dev {device_idx}, "
                         f"{cleaned_count}/{len(available)} total"
@@ -645,6 +686,10 @@ def clean_depthmaps(
             logger.warning(f"  batch {bi}: {exc}")
 
     logger.info(
-        f"GPU cleaning done: {cleaned_count} views",
+        f"GPU cleaning done: {cleaned_count} views"
+        + (
+            f", reclaimed {removed_raw} raw depthmap(s) on the fly"
+            if delete_raw else ""
+        )
     )
     context.log_memory("GPU cleaning complete")
