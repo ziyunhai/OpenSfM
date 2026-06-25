@@ -6,8 +6,8 @@ dependencies:
     - ninja
     - make
     - libxcrypt # [linux] [osx]
-    - libopencv *=headless*
-    - py-opencv
+    - libopencv<5.0 *=headless*
+    - py-opencv<5.0
     - anaconda::metis
     - conda-forge::suitesparse=7.10.*
     - conda-forge::llvm-openmp
