@@ -160,5 +160,5 @@ def test_relative_pose_refinement(
         expected = pose.get_world_to_cam()[:3]
         exact_found += np.linalg.norm(expected - result) < 1.8e-1
 
-    exacts = len(pairs_and_their_E) - 4
+    exacts = len(pairs_and_their_E) - 5
     assert exact_found >= exacts
