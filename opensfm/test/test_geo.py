@@ -3,6 +3,8 @@ import os
 
 import numpy as np
 import pytest
+from osgeo import gdal
+
 from opensfm import geo, pygeo, pymap
 
 
@@ -169,7 +171,8 @@ def test_utm_zone_from_lonlat() -> None:
     assert geo.utm_zone_from_lonlat(18.4, -33.9) == (34, False)   # Cape Town
     # Zone boundaries (each zone spans 6° of longitude, zone 1 starts at -180°).
     assert geo.utm_zone_from_lonlat(-180.0, 0.0)[0] == 1
-    assert geo.utm_zone_from_lonlat(-174.01, 0.0)[0] == 1   # still band [-180, -174)
+    # still band [-180, -174)
+    assert geo.utm_zone_from_lonlat(-174.01, 0.0)[0] == 1
     assert geo.utm_zone_from_lonlat(-173.99, 0.0)[0] == 2
     assert geo.utm_zone_from_lonlat(0.0, 0.0)[0] == 31      # band [0, 6)
     assert geo.utm_zone_from_lonlat(6.01, 0.0)[0] == 32
@@ -215,7 +218,8 @@ def test_crs_to_wkt() -> None:
     wkt = geo.crs_to_wkt("EPSG:32631")
     assert "UTM zone 31N" in wkt
     # proj strings are also accepted.
-    assert "PROJCS" in geo.crs_to_wkt("+proj=utm +zone=31 +datum=WGS84 +units=m")
+    assert "PROJCS" in geo.crs_to_wkt(
+        "+proj=utm +zone=31 +datum=WGS84 +units=m")
     with pytest.raises(ValueError):
         geo.crs_to_wkt("definitely-not-a-crs")
 
@@ -253,8 +257,6 @@ def test_load_dsm_geotiff_missing(tmp_path) -> None:
 
 
 def test_ortho_geotiff_rgb_only(tmp_path) -> None:
-    from osgeo import gdal
-
     img = np.zeros((2, 3, 3), np.uint8)
     img[..., 0] = 10
     img[..., 1] = 20
@@ -263,15 +265,15 @@ def test_ortho_geotiff_rgb_only(tmp_path) -> None:
     ds = gdal.Open(path)
     assert ds.RasterCount == 3
     # Stored flipped (raster row 0 = our top row); red band matches flipud(img).
-    assert np.array_equal(ds.GetRasterBand(1).ReadAsArray(), np.flipud(img[..., 0]))
+    assert np.array_equal(ds.GetRasterBand(
+        1).ReadAsArray(), np.flipud(img[..., 0]))
     ds = None
 
 
 def test_ortho_geotiff_alpha(tmp_path) -> None:
-    from osgeo import gdal
-
     img = np.full((2, 3, 3), 50, np.uint8)
-    mask = np.array([[True, False, False], [False, False, False]])  # row 0 = bottom
+    # row 0 = bottom
+    mask = np.array([[True, False, False], [False, False, False]])
     path = str(tmp_path / "ortho.tif")
     geo.save_ortho_geotiff(path, img, 0.0, 0.0, 1.0, nodata_mask=mask)
     ds = gdal.Open(path)
@@ -287,8 +289,6 @@ def test_ortho_geotiff_alpha(tmp_path) -> None:
 
 
 def test_streamed_geotiff_roundtrip(tmp_path) -> None:
-    from osgeo import gdal
-
     gh, gw, gsd = 5, 4, 2.0
     full = np.arange(gh * gw, dtype=np.float32).reshape(gh, gw)
     full[0, 0] = np.nan
@@ -327,25 +327,48 @@ def test_streamed_geotiff_custom_geotransform(tmp_path) -> None:
     assert np.allclose(gt, rotated)
 
 
-# ── Topocentric → projected affine + georeferenced warp ──────────────
+# ── Exact topocentric → projected transform (points + normals) ───────
 
 
-def test_proj_affine_from_reference() -> None:
-    ref = geo.TopocentricConverter(48.85, 2.35, 35.0)
-    T, wkt, origin = geo.proj_affine_from_reference(ref, "EPSG:32631")
-    assert T.shape == (4, 4)
-    assert np.allclose(T[3], [0, 0, 0, 1])
-    assert np.allclose(origin, T[:3, 3])         # origin is the translation column
-    assert "UTM zone 31N" in wkt
-    # Reference origin lands at the UTM 31N coords of (48.85, 2.35).
-    assert 440000 < origin[0] < 460000
-    assert 5.40e6 < origin[1] < 5.42e6
-    assert abs(origin[2] - 35.0) < 1.0
+def test_transform_points_to_proj_matches_pointwise() -> None:
+    ref = geo.TopocentricConverter(45.0, 6.0, 300.0)
+    tr = geo.construct_proj_transformer("EPSG:32632", inverse=True)
+    pts = (np.random.RandomState(0).rand(50, 3) - 0.5) * 20000.0
+    vec = geo.transform_points_to_proj(ref, tr, pts)
+    pointwise = np.array([geo.transform_to_proj(p, ref, tr) for p in pts])
+    assert np.allclose(vec, pointwise, atol=1e-6)
+
+
+def test_transform_points_to_proj_is_nonlinear() -> None:
+    """Over a large extent the exact transform must differ from a single affine
+    by metres (the error the affine path used to introduce)."""
+    ref = geo.TopocentricConverter(45.0, 6.0, 300.0)
+    tr = geo.construct_proj_transformer("EPSG:32632", inverse=True)
+    affine = geo.get_proj_transform_matrix(ref, tr)
+    pts = np.array([[20000.0, 20000.0, 20.0], [-15000.0, 8000.0, 5.0]])
+    exact = geo.transform_points_to_proj(ref, tr, pts)
+    approx = pts @ affine[:3, :3].T + affine[:3, 3]
+    # Mostly a vertical (tangent-plane curvature) gap of tens of metres.
+    assert abs(exact[0, 2] - approx[0, 2]) > 10.0
+
+
+def test_transform_points_normals_to_proj() -> None:
+    ref = geo.TopocentricConverter(45.0, 6.0, 300.0)
+    tr = geo.construct_proj_transformer("EPSG:32632", inverse=True)
+    pts = (np.random.RandomState(1).rand(100, 3) - 0.5) * 20000.0
+    normals = np.tile([0.0, 0.0, 1.0], (100, 1)).astype(np.float32)
+    proj, nrm = geo.transform_points_normals_to_proj(ref, tr, pts, normals)
+    # Positions match the points-only path; normals stay unit-length and ~up
+    # (the local vertical is nearly preserved by the metric transform).
+    assert np.allclose(proj, geo.transform_points_to_proj(ref, tr, pts))
+    assert np.allclose(np.linalg.norm(nrm, axis=1), 1.0, atol=1e-5)
+    assert np.all(nrm[:, 2] > 0.99)
+
+
+# ── Georeferenced (GCP-warp) DSM/ortho ───────────────────────────────
 
 
 def test_dsm_ortho_georeferenced_warp(tmp_path) -> None:
-    from osgeo import gdal
-
     ref = geo.TopocentricConverter(48.85, 2.35, 35.0)
     gh, gw, gsd = 30, 40, 0.5
     full = np.full((gh, gw), 10.0, np.float32)   # flat surface at topo z = 10
@@ -383,3 +406,38 @@ def test_dsm_ortho_georeferenced_warp(tmp_path) -> None:
     assert od.RasterCount == 4
     assert od.GetRasterBand(4).GetColorInterpretation() == gdal.GCI_AlphaBand
     od = None
+
+
+def test_dsm_georeferenced_heights_follow_curvature(tmp_path) -> None:
+    """Over a 20 km extent a flat topocentric plane must come out as exact
+    *altitudes* that rise with distance (tangent-plane curvature) — the metres of
+    error the old single-affine path could not represent."""
+
+    ref = geo.TopocentricConverter(45.0, 6.0, 300.0)
+    half, gsd = 10000.0, 50.0
+    gw = gh = int(2 * half / gsd)            # 400 x 400
+    flat = np.zeros((gh, gw), np.float32)    # topocentric plane z = 0
+    ortho = np.zeros((gh, gw, 3), np.uint8)
+
+    def fill_band(rs: int, re_: int):
+        return flat[rs:re_].copy(), ortho[rs:re_].copy()
+
+    dsm_p = str(tmp_path / "dsm.tif")
+    ortho_p = str(tmp_path / "ortho.tif")
+    geo.save_dsm_ortho_streamed_georeferenced(
+        dsm_p, ortho_p, gh, gw, -half, -half, gsd, fill_band, band_rows=128,
+        reference=ref, output_crs=geo.decide_output_crs(None, ref),
+        tmp_dsm_path=dsm_p + ".t.tif", tmp_ortho_path=ortho_p + ".t.tif",
+    )
+    ds = gdal.Open(dsm_p)
+    arr = ds.GetRasterBand(1).ReadAsArray()
+    valid = arr[arr != ds.GetRasterBand(1).GetNoDataValue()]
+    ds = None
+
+    # ≈ 300 (reference alt)
+    origin_alt = ref.to_lla(0.0, 0.0, 0.0)[2]
+    corner_alt = ref.to_lla(half, half, 0.0)[2]          # lifted by curvature
+    assert corner_alt - origin_alt > 10.0                # curvature is real here
+    # Warped heights span the exact altitude range (a single affine would be flat).
+    assert abs(valid.min() - origin_alt) < 1.0
+    assert abs(valid.max() - corner_alt) < 1.0

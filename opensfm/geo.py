@@ -848,6 +848,7 @@ def save_dsm_ortho_streamed_geotiff(
     nodata: float = DSM_NODATA,
     geotransform: Optional[Tuple[float, float,
                                  float, float, float, float]] = None,
+    gcps: Optional[List["gdal.GCP"]] = None,
 ) -> int:
     """Write dsm + ortho GeoTIFFs band-by-band, never holding the full grid.
 
@@ -858,8 +859,10 @@ def save_dsm_ortho_streamed_geotiff(
     no-data value, and the ortho alpha band.  BIGTIFF is enabled so the rasters
     can exceed 4 GB.  Returns the count of valid (non-NaN) cells.
 
-    ``geotransform`` overrides the default north-up transform (used to bake a
-    topocentric→projected affine, including rotation, into the raster).
+    Georeferencing is either ``geotransform`` (north-up affine; defaults to the
+    bottom-up transform from ``origin``/``gsd``) or ``gcps`` (ground control
+    points mapping pixel→world, used for a non-linear topocentric→projected
+    mapping that a later ``gdal.Warp`` resolves); ``gcps`` takes precedence.
     """
 
     opts = ["BIGTIFF=IF_SAFER"]
@@ -873,13 +876,17 @@ def save_dsm_ortho_streamed_geotiff(
     if dsm_ds is None or ortho_ds is None:
         raise RuntimeError("Failed to create DSM/ortho GeoTIFF(s)")
 
-    gt = geotransform or _bottom_up_geotransform(
-        origin_x, origin_y, gsd, int(gh))
-    dsm_ds.SetGeoTransform(gt)
-    ortho_ds.SetGeoTransform(gt)
-    if srs_wkt:
-        dsm_ds.SetProjection(srs_wkt)
-        ortho_ds.SetProjection(srs_wkt)
+    if gcps is not None:
+        dsm_ds.SetGCPs(gcps, srs_wkt or "")
+        ortho_ds.SetGCPs(gcps, srs_wkt or "")
+    else:
+        gt = geotransform or _bottom_up_geotransform(
+            origin_x, origin_y, gsd, int(gh))
+        dsm_ds.SetGeoTransform(gt)
+        ortho_ds.SetGeoTransform(gt)
+        if srs_wkt:
+            dsm_ds.SetProjection(srs_wkt)
+            ortho_ds.SetProjection(srs_wkt)
 
     dsm_band = dsm_ds.GetRasterBand(1)
     dsm_band.SetNoDataValue(nodata)
@@ -911,20 +918,135 @@ def save_dsm_ortho_streamed_geotiff(
     return n_valid
 
 
-def proj_affine_from_reference(
-    reference: "TopocentricConverter", output_crs: str
-) -> Tuple[NDArray, str, NDArray]:
-    """Linear transform from topocentric (reconstruction) coords to ``output_crs``.
+def transform_points_to_proj(
+    reference: "TopocentricConverter",
+    transformer: pyproj.Transformer,
+    pts: NDArray,
+) -> NDArray:
+    """Exact topocentric → projected transform of ``pts`` (N, 3), vectorized.
 
-    Returns ``(T, wkt, origin)`` where ``T`` is the 4x4 affine mapping
-    topocentric ``(x, y, z)`` to projected ``(easting, northing, altitude)``
-    (local linearization at the reference, same model as ``export_geocoords``),
-    ``wkt`` is the CRS as WKT, and ``origin`` is the projected reference origin
-    (``T[:3, 3]``).
+    Uses the full PROJ pipeline per point (``to_lla`` then the projection), so it
+    is free of the tangent-plane / projection-distortion error that a single
+    affine linearization accumulates over large extents.  ``transformer`` must go
+    from WGS84 (EPSG:4326) to the target CRS (``construct_proj_transformer(...,
+    inverse=True)``).  Returns ``(easting, northing, altitude)`` columns.
     """
-    transformer = construct_proj_transformer(output_crs, inverse=True)
-    T = get_proj_transform_matrix(reference, transformer)
-    return T, crs_to_wkt(output_crs), T[:3, 3].copy()
+    lat, lon, alt = reference.to_lla(pts[:, 0], pts[:, 1], pts[:, 2])
+    easting, northing = transformer.transform(lat, lon)
+    return np.column_stack([easting, northing, alt])
+
+
+def transform_points_normals_to_proj(
+    reference: "TopocentricConverter",
+    transformer: pyproj.Transformer,
+    pts: NDArray,
+    normals: NDArray,
+    eps: float = 1.0,
+) -> Tuple[NDArray, NDArray]:
+    """Exact transform of points and their normals to the projected CRS.
+
+    Positions go through :func:`transform_points_to_proj`.  Normals are rotated
+    by the *local* Jacobian of the transform at each point (finite differences
+    with step ``eps`` metres), then renormalized — so they stay correct as the
+    local frame rotates across the extent (Earth curvature + meridian
+    convergence), unlike a single global rotation.  Returns ``(pts_proj (N, 3),
+    normals_proj (N, 3))``.
+    """
+    base = transform_points_to_proj(reference, transformer, pts)
+    jcols = []
+    for axis in range(3):
+        step = np.zeros(3)
+        step[axis] = eps
+        jcols.append(
+            (transform_points_to_proj(reference, transformer, pts + step) - base)
+            / eps
+        )
+    # J[n] = [dcol0 dcol1 dcol2]; rotate each normal: n' = J @ n.
+    jac = np.stack(jcols, axis=2)                       # (N, 3, 3)
+    rotated = np.einsum("nij,nj->ni", jac, normals)
+    norms = np.linalg.norm(rotated, axis=1, keepdims=True)
+    np.divide(rotated, norms, out=rotated, where=norms > 0)
+    return base, rotated
+
+
+def _exact_pixel_gcps(
+    reference: "TopocentricConverter",
+    transformer: pyproj.Transformer,
+    gh: int,
+    gw: int,
+    origin_x: float,
+    origin_y: float,
+    gsd: float,
+    n: int,
+) -> List["gdal.GCP"]:
+    """Build an ``n×n`` grid of GCPs mapping source pixel → exact projected X/Y.
+
+    Pixel ``(col, row)`` (top-down, as written by the streamed writer) maps to
+    topocentric ``(origin_x + col*gsd, top_left_y - row*gsd)`` and then through
+    the exact PROJ transform.  Horizontal position is height-independent for the
+    supported CRS, so ``z = 0`` is used for the GCP coordinates.
+    """
+    top_left_y = origin_y + gh * gsd
+    cols = np.linspace(0.0, gw, n)
+    rows = np.linspace(0.0, gh, n)
+    cc, rr = np.meshgrid(cols, rows)
+    cc, rr = cc.ravel(), rr.ravel()
+    tx = origin_x + cc * gsd
+    ty = top_left_y - rr * gsd
+    lat, lon, _ = reference.to_lla(tx, ty, np.zeros_like(tx))
+    easting, northing = transformer.transform(lat, lon)
+    return [
+        gdal.GCP(float(easting[i]), float(northing[i]), 0.0,
+                 float(cc[i]), float(rr[i]))
+        for i in range(cc.size)
+    ]
+
+
+def _gcp_warp_method(
+    gcps: List["gdal.GCP"],
+    srs_wkt: str,
+    gh: int,
+    gw: int,
+    reference: "TopocentricConverter",
+    transformer: pyproj.Transformer,
+    origin_x: float,
+    origin_y: float,
+    gsd: float,
+    tol: float,
+) -> Tuple[Dict[str, Any], float]:
+    """Pick the GCP warp fit: order-3 polynomial, or TPS if its residual is high.
+
+    Evaluates GDAL's order-3 GCP polynomial against the exact PROJ mapping on a
+    dense check grid; returns the ``gdal.WarpOptions`` kwargs for the chosen
+    method and the order-3 max residual (metres).  The polynomial is exact for
+    realistic survey extents; TPS is the fallback for anything that isn't.
+    """
+    # A 1×1 MEM raster carries only the GCPs — the polynomial fit ignores raster
+    # size, so this stays O(1) in memory regardless of the real raster.
+    mem = gdal.GetDriverByName("MEM").Create("", 1, 1, 1, gdal.GDT_Byte)
+    mem.SetGCPs(gcps, srs_wkt)
+    tr = gdal.Transformer(
+        mem, None, ["DST_SRS=" + srs_wkt, "METHOD=GCP_POLYNOMIAL",
+                    "MAX_GCP_ORDER=3"])
+
+    top_left_y = origin_y + gh * gsd
+    g = np.linspace(0.0, 1.0, 21)
+    cc, rr = np.meshgrid(g * gw, g * gh)
+    cc, rr = cc.ravel(), rr.ravel()
+    lat, lon, _ = reference.to_lla(
+        origin_x + cc * gsd, top_left_y - rr * gsd, np.zeros_like(cc))
+    ex_e, ex_n = transformer.transform(lat, lon)
+    pts = np.column_stack([cc, rr, np.zeros_like(cc)]).tolist()
+    fit = np.array(tr.TransformPoints(0, pts)[0])
+    residual = float(np.max(
+        np.hypot(fit[:, 0] - ex_e, fit[:, 1] - ex_n)))
+    mem = None
+
+    if residual <= tol:
+        return {"polynomialOrder": 3}, residual
+    logger.warning(
+        f"GCP order-3 fit residual {residual:.3f} m > {tol} m; using TPS")
+    return {"tps": True}, residual
 
 
 def save_dsm_ortho_streamed_georeferenced(
@@ -941,33 +1063,31 @@ def save_dsm_ortho_streamed_georeferenced(
     output_crs: str,
     tmp_dsm_path: str,
     tmp_ortho_path: str,
+    n_gcp: int = 11,
+    gcp_residual_tol: float = 0.05,
 ) -> int:
     """Write dsm + ortho GeoTIFFs georeferenced (north-up) in ``output_crs``.
 
-    The grid is built in the topocentric east/north frame, which is rotated
-    relative to a projected grid by the meridian convergence.  We bake the
-    topocentric→projected affine into a (rotated) source raster — its pixels
-    untouched, heights transformed to projected altitude — then ``gdal.Warp`` it
-    to a standard north-up grid in ``output_crs``.  Returns the valid-cell count.
+    The grid is built in the topocentric east/north frame; the topocentric →
+    projected map is non-linear (Earth curvature + projection distortion), so a
+    single affine misplaces cells far from the reference (metres of error per
+    ~10 km, mostly vertical).  Instead this:
+
+    * writes a source raster whose pixels are the topocentric grid, carrying an
+      ``n_gcp × n_gcp`` grid of GCPs computed with the **exact** PROJ transform
+      and per-cell **exact altitudes** (``to_lla``), then
+    * ``gdal.Warp`` resolves the GCPs (order-3 polynomial, or TPS if the fit
+      residual exceeds ``gcp_residual_tol``) into a north-up raster.
+
+    Returns the valid-cell count.
     """
-
-    T, wkt, _ = proj_affine_from_reference(reference, output_crs)
-    a00, a01, b0 = float(T[0, 0]), float(T[0, 1]), float(T[0, 3])
-    a10, a11, b1 = float(T[1, 0]), float(T[1, 1]), float(T[1, 3])
-    tz0, tz1, tz2, tz3 = (float(T[2, 0]), float(T[2, 1]),
-                          float(T[2, 2]), float(T[2, 3]))
-
-    # Geotransform mapping source pixel (col, row top-down) → projected (E, N):
-    # compose pixel→topocentric (north-up, row 0 = top) with topocentric→proj.
-    top_left_y = origin_y + gh * gsd
-    rotated_gt = (
-        a00 * origin_x + a01 * top_left_y + b0,   # E at pixel (0, 0)
-        a00 * gsd,                                # dE/dcol
-        -a01 * gsd,                               # dE/drow
-        a10 * origin_x + a11 * top_left_y + b1,   # N at pixel (0, 0)
-        a10 * gsd,                                # dN/dcol
-        -a11 * gsd,                               # dN/drow
-    )
+    transformer = construct_proj_transformer(output_crs, inverse=True)
+    wkt = crs_to_wkt(output_crs)
+    gcps = _exact_pixel_gcps(
+        reference, transformer, gh, gw, origin_x, origin_y, gsd, n_gcp)
+    warp_method, _ = _gcp_warp_method(
+        gcps, wkt, gh, gw, reference, transformer,
+        origin_x, origin_y, gsd, gcp_residual_tol)
 
     cols_x = origin_x + (np.arange(gw) + 0.5) * gsd  # topo x per column centre
 
@@ -976,18 +1096,20 @@ def save_dsm_ortho_streamed_georeferenced(
         bh = re_ - rs
         rows_y = origin_y + (rs + np.arange(bh) + 0.5) * gsd  # topo y per row
         valid = ~np.isnan(dsm_b)
-        zp = (tz2 * dsm_b + (tz0 * cols_x)[None, :]
-              + (tz1 * rows_y)[:, None] + tz3)
-        return np.where(valid, zp, np.nan).astype(np.float32), ortho_b
+        xx = np.broadcast_to(cols_x, (bh, gw))
+        yy = np.broadcast_to(rows_y[:, None], (bh, gw))
+        # Exact projected altitude per cell (z 0 where invalid is irrelevant).
+        _, _, alt = reference.to_lla(xx, yy, np.where(valid, dsm_b, 0.0))
+        return np.where(valid, alt, np.nan).astype(np.float32), ortho_b
 
     n_valid = save_dsm_ortho_streamed_geotiff(
         tmp_dsm_path, tmp_ortho_path, gh, gw, origin_x, origin_y, gsd,
-        fill_band_geo, band_rows, srs_wkt=wkt, geotransform=rotated_gt,
+        fill_band_geo, band_rows, srs_wkt=wkt, gcps=gcps,
     )
 
     common = dict(
         dstSRS=wkt, xRes=gsd, yRes=gsd, multithread=True,
-        creationOptions=["BIGTIFF=IF_SAFER"],
+        creationOptions=["BIGTIFF=IF_SAFER"], **warp_method,
     )
     gdal.Warp(
         dsm_path, tmp_dsm_path,

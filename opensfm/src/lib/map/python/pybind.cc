@@ -713,11 +713,12 @@ PYBIND11_MODULE(pymap, m) {
            })
       // Tracks manager x Reconstruction intersection
       .def("compute_reprojection_errors", &map::Map::ComputeReprojectionErrors,
-           py::arg("tracks_manager"), py::arg("error_type"), py::arg("shot_ids") = std::vector<map::ShotId>())
+           py::arg("tracks_manager"), py::arg("error_type"),
+           py::arg("shot_ids") = std::vector<map::ShotId>())
       .def("get_valid_observations", &map::Map::GetValidObservations,
-           py::arg("tracks_manager"), py::arg("shot_ids") = std::vector<map::ShotId>())
+           py::arg("tracks_manager"),
+           py::arg("shot_ids") = std::vector<map::ShotId>())
       .def("to_tracks_manager", &map::Map::ToTracksManager);
-  // ── GCP I/O functions ──────────────────────────────────────────────────
   m.def(
       "read_gcp_json",
       [](const std::string& content, bool cdnEnabled,

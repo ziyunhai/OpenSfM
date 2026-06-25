@@ -384,17 +384,19 @@ def export_pointcloud_formats(
         logger.warning("No fused.ply found; skipping LAS/LAZ export.")
         return
 
-    # Optional reprojection topocentric → output CRS (positions + normals).
+    # Optional reprojection topocentric → output CRS (positions + normals), using
+    # the exact per-point PROJ transform (not a single affine, which drifts by
+    # metres over large extents — mostly in Z, from the tangent-plane curvature).
     crs_wkt = ""
     offset = None
-    A = b = None
+    transformer = None
     if output_crs is not None and reference is not None:
-        T, crs_wkt, origin = geo.proj_affine_from_reference(
-            reference, output_crs)
-        A, b = T[:3, :3], T[:3, 3]
+        transformer = geo.construct_proj_transformer(output_crs, inverse=True)
+        crs_wkt = geo.crs_to_wkt(output_crs)
         # Place the LAS integer offset near the data; projected eastings/northings
         # would otherwise overflow the int32 (value-offset)/scale encoding.
-        offset = np.floor(origin).tolist()
+        origin = geo.transform_to_proj([0.0, 0.0, 0.0], reference, transformer)
+        offset = [float(np.floor(c)) for c in origin]
 
     rec = _PLY_ROW_DT.itemsize
     chunk_pts = 1_000_000
@@ -426,11 +428,9 @@ def export_pointcloud_formats(
                     pos = rows["f"][:, :3].astype(np.float64)
                     nrm = np.ascontiguousarray(
                         rows["f"][:, 3:]).astype(np.float32)
-                    if A is not None:
-                        pos = pos @ A.T + b
-                        nrm = nrm @ A.T
-                        norms = np.linalg.norm(nrm, axis=1, keepdims=True)
-                        np.divide(nrm, norms, out=nrm, where=norms > 0)
+                    if transformer is not None:
+                        pos, nrm = geo.transform_points_normals_to_proj(
+                            reference, transformer, pos, nrm)
                         nrm = np.ascontiguousarray(nrm, dtype=np.float32)
                     col = np.ascontiguousarray(rows["c"][:, :3])
                     lbl = np.ascontiguousarray(rows["c"][:, 3])
