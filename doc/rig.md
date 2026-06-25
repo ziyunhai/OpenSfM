@@ -114,9 +114,7 @@ instances based on the filenames, such as
 
 
 
-Where "PATTERN" is the following :
- - `--method=camera` : a camera model ID. A given camera model ID correspond to one `RigCamera`
- - `--method=pattern` : A REGEX with the form (.*) where the part in parenthesis identifies the camera models. For example, it would be "(RED)" or "(GREEN)" for multispectral data.
+Where "PATTERN" is a REGEX with the form (.*) where the part in parenthesis identifies the camera models. For example, it would be "(RED)" or "(GREEN)" for multispectral data (used with `--method=pattern`).
 
  Based on this instances, it then run SfM on a small subset on the data (or metadata-based initialisation) and infers some averaged rig cameras poses, which are then written to `rig_cameras.json`.
 

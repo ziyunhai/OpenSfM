@@ -253,78 +253,117 @@ processes: 4
 
 ## Depth Estimation (PatchMatch OpenCL)
 
-| Parameter                          | Type  | Default  | Description                                |
-| ---------------------------------- | ----- | -------- | ------------------------------------------ |
-| `depthmap_resolution`              | int   | `640`    | Panorama sub-view resolution               |
-| `depthmap_num_neighbors`           | int   | `10`     | Candidate neighboring views                |
-| `depthmap_num_matching_views`      | int   | `4`      | Views used per depthmap                    |
-| `depthmap_min_depth`               | float | `0`      | Min depth (m). 0 = auto                    |
-| `depthmap_max_depth`               | float | `0`      | Max depth (m). 0 = auto                    |
-| `depthmap_max_iterations`          | int   | `4`      | Max PatchMatch iterations                  |
-| `depthmap_patch_size`              | int   | `5`      | Correlation patch size (odd)               |
-| `depthmap_max_image_size`          | int   | `3200`   | Max image dimension                        |
-| `depthmap_max_cost`                | float | `0.9`    | Max PatchMatch cost (0 = disabled)         |
-| `depthmap_same_depth_threshold`    | float | `0.01`   | Depth closeness threshold (clean stage)    |
-| `depthmap_min_consistent_views`    | int   | `3`      | Min consistent views (clean stage)         |
-| `depthmap_carving_threshold`       | float | `0.2`    | Space-carving relative depth threshold     |
-| `depthmap_max_carved_views`        | int   | `1`      | Max carve votes before discard             |
-| `depthmap_save_debug_ply`          | bool  | `false`  | Save per-shot debug PLYs                   |
-| `depthmap_sigma_spatial`           | float | `5.0`    | Bilateral NCC spatial sigma                |
-| `depthmap_sigma_color`             | float | `≈0.012` | Bilateral NCC color sigma (normalized)     |
-| `depthmap_census_weight`           | float | `0.3`    | Census vs NCC weight (0=NCC, 1=Census)     |
-| `depthmap_hierarchy_levels`        | int   | `4`      | Multi-scale levels                         |
-| `depthmap_smooth_weight`           | float | `0.3`    | Depth/normal smoothness weight             |
-| `depthmap_geom_consistency_weight` | float | `0.05`   | Geometric consistency weight (0=disabled)  |
-| `depthmap_cluster_max_size`        | int   | `8`      | Max reference views per cluster            |
-| `depthmap_sfm_planar_prior`        | bool  | `true`   | Seed Delaunay planar prior from SfM points |
+OpenSfM computes dense depthmaps with a GPU PatchMatch estimator (run by `compute_depthmaps`). These parameters control the per-view estimation and the consistency/visibility cleaning stage.
+
+| Parameter                          | Type  | Default  | Description                                                       |
+| ---------------------------------- | ----- | -------- | ---------------------------------------------------------------- |
+| `depthmap_num_neighbors`           | int   | `10`     | Candidate neighboring views per image                            |
+| `depthmap_num_matching_views`      | int   | `8`      | Views actually used to estimate each depthmap                    |
+| `depthmap_min_depth`               | float | `0`      | Min depth (m). `0` = auto-infer from the reconstruction          |
+| `depthmap_max_depth`               | float | `0`      | Max depth (m). `0` = auto-infer from the reconstruction          |
+| `depthmap_max_iterations`          | int   | `4`      | Max PatchMatch iterations                                        |
+| `depthmap_patch_size`              | int   | `5`      | Correlation patch window size (odd)                              |
+| `depthmap_max_image_size`          | int   | `3200`   | Max image dimension processed (longer side)                      |
+| `depthmap_max_cost`                | float | `0`      | Max PatchMatch cost to keep a pixel (`0` = disabled)             |
+| `depthmap_same_depth_threshold`    | float | `0.05`   | Depth-closeness threshold (clean stage)                          |
+| `depthmap_min_consistent_views`    | int   | `3`      | Min consistent views to keep a pixel (clean stage)               |
+| `depthmap_carving_threshold`       | float | `0.01`   | Relative depth margin for a space-carving vote                   |
+| `depthmap_max_carved_views`        | int   | `1`      | Max carve votes before a pixel is discarded                      |
+| `depthmap_carving_two_pass`        | bool  | `true`   | Pass 1 = consistency only, pass 2 = carving                      |
+| `depthmap_grazing_cos_threshold`   | float | `0.2`    | Cosine below which a pixel is "grazing" (stricter filtering)     |
+| `depthmap_sigma_spatial`           | float | `1.5`    | Bilateral NCC spatial sigma                                      |
+| `depthmap_sigma_color`             | float | `≈0.098` | Bilateral NCC color sigma (normalized intensity, `25/255`)       |
+| `depthmap_use_census`              | bool  | `true`   | Census-transform fallback in low-texture regions                 |
+| `depthmap_hierarchy_levels`        | int   | `3`      | Multi-scale levels (`1` = full-res only)                         |
+| `depthmap_checkerboard_filter`     | bool  | `false`  | Checkerboard bilateral median filter after PatchMatch            |
+| `depthmap_speckle_min_size`        | int   | `0`      | Remove connected components smaller than this (px; `0` = off)    |
+| `depthmap_gap_max_size`            | int   | `0`      | Max gap (px) for linear depth interpolation (`0` = disabled)     |
+| `depthmap_smooth_weight`           | float | `0.2`    | Depth/normal smoothness weight                                   |
+| `depthmap_anchor_views`            | int   | `2`      | Views from the previous iteration kept in view selection         |
+| `depthmap_geom_consistency_weight` | float | `0.05`   | Geometric-consistency cost weight (`0` = disabled)               |
+| `depthmap_cluster_max_size`        | int   | `16`     | Max reference views per cluster                                  |
+| `depthmap_cluster_edge_max_factor` | float | `2.0`    | Drop covisibility edges beyond this × median baseline (`0` = off) |
+| `depthmap_max_cluster_views`       | int   | `48`     | Hard cap on total views loaded per cluster batch                 |
+| `depthmap_sfm_planar_prior`        | bool  | `false`  | Seed a Delaunay planar prior from SfM points                     |
+| `depthmap_neighbor_min_angle`      | float | `3.0`    | Min baseline angle (deg) for neighbor selection                  |
+| `depthmap_neighbor_max_angle`      | float | `60.0`   | Max baseline angle (deg) for neighbor selection                  |
+| `depthmap_save_debug_ply`          | bool  | `false`  | Save per-shot/per-cluster debug PLYs (slow)                      |
 
 ### Fusion
 
-| Parameter                               | Type  | Default    | Description                                      |
-| --------------------------------------- | ----- | ---------- | ------------------------------------------------ |
-| `depthmap_fusion_batch_size`            | int   | `50`       | Shots per fusion batch                           |
-| `depthmap_fusion_min_consistent`        | int   | `4`        | Min consistent views for fused point             |
-| `depthmap_fusion_max_reproj_error`      | float | `2.0`      | Max reprojection error (px)                      |
-| `depthmap_fusion_max_depth_error`       | float | `0.01`     | Max relative depth error                         |
-| `depthmap_fusion_max_normal_error`      | float | `10.0`     | Max normal angle difference (degrees)            |
-| `depthmap_fusion_border_margin`         | int   | `10`       | Border margin (px)                               |
-| `depthmap_fusion_num_threads`           | int   | `8`        | Fusion threads                                   |
-| `depthmap_fusion_sor_knn`               | int   | `0`        | SOR k-NN count (0=disabled)                      |
-| `depthmap_fusion_sor_stddev_factor`     | float | `2.5`      | SOR std-dev multiplier                           |
-| `depthmap_fusion_behind_depth_factor`   | float | `0.3`      | Behind-depth asymmetric tolerance                |
-| `depthmap_fusion_backend`               | str   | `"svo"`    | `"depthmap"` (per-pixel) or `"svo"` (TSDF voxel) |
-| `depthmap_fusion_svo_voxel_size`        | float | `0.05`     | SVO voxel size (m)                               |
-| `depthmap_fusion_svo_trunc_factor`      | float | `12`       | SVO truncation factor                            |
-| `depthmap_fusion_svo_min_weight`        | float | `4`        | SVO min weight for point extraction              |
-| `depthmap_fusion_svo_max_voxels`        | int   | `80000000` | Max voxels per sub-volume                        |
-| `depthmap_fusion_svo_augment_neighbors` | int   | `2`        | Extra neighbor shots for boundary quality        |
-| `depthmap_fusion_svo_coarse_factor`     | int   | `8`        | Coarse grid cell multiplier                      |
-| `depthmap_cluster_bbox_margin`          | float | `0.01`     | Per-cluster bounding box margin                  |
+Cleaned depthmaps are fused into a point cloud (and optional mesh) by a sparse-voxel-octree (SVO) TSDF fuser, run by `fuse_depthmaps`. The voxel size is auto-derived from the data's per-pixel ground footprint; these parameters tune extraction, decimation and optional photometric refinement.
+
+| Parameter                                     | Type  | Default      | Description                                                           |
+| --------------------------------------------- | ----- | ------------ | -------------------------------------------------------------------- |
+| `depthmap_fusion_svo_voxel_level`             | str   | `"fine"`     | Voxel resolution: `fine` / `half` / `quarter` (progressively coarser) |
+| `depthmap_fusion_svo_trunc_factor`            | float | `8`          | TSDF truncation distance = factor × voxel size                       |
+| `depthmap_fusion_svo_min_weight`              | float | `2.0`        | Min voxel weight to extract a surface point                          |
+| `depthmap_fusion_svo_num_levels`              | int   | `3`          | Multi-level fill passes (`1` = fine only)                            |
+| `depthmap_fusion_svo_decimate_flat`           | int   | `4`          | Flat-surface decimation (`1` = off, `4` = keep 1/4)                  |
+| `depthmap_fusion_svo_edge_threshold`          | float | `0.15`       | Normal-divergence threshold protecting edges from decimation         |
+| `depthmap_fusion_svo_min_count`               | int   | `2`          | Min observation count for both voxels of a zero-crossing             |
+| `depthmap_fusion_svo_relative_min_weight`     | float | `0.25`       | Local adaptive weight threshold for extraction                       |
+| `depthmap_fusion_svo_max_voxels`              | int   | `80000000`   | Max voxels per SVO sub-volume (clusters are split to fit)            |
+| `depthmap_fusion_svo_augment_neighbors`       | int   | `4`          | Extra neighbor shots per cluster shot (boundary quality)             |
+| `depthmap_fusion_svo_coarse_factor`           | int   | `8`          | Coarse pre-scan cell size = factor × voxel size                      |
+| `depthmap_fusion_svo_refine_enabled`          | bool  | `false`      | Photometric TSDF refinement                                          |
+| `depthmap_fusion_svo_refine_iters`            | int   | `50`         | SDF refinement iterations                                            |
+| `depthmap_fusion_svo_refine_lambda_reg`       | float | `0.3`        | Laplacian regularization weight (`0` = disabled)                     |
+| `depthmap_fusion_svo_refine_lambda_anchor`    | float | `0.05`       | Anchor weight pulling the refined TSDF toward the fused value        |
+| `depthmap_fusion_svo_refine_early_stop_rel`   | float | `0.2`        | Early-stop once RMS surface motion drops below this fraction of peak |
+| `depthmap_fusion_svo_bake_reuse_max_fusers`   | int   | `4`          | Max fusers kept resident on the GPU at once                          |
+| `depthmap_fusion_svo_bake_reuse_vram_fraction`| float | `0.5`        | VRAM fraction ceiling for retained fusers                            |
+| `depthmap_fusion_mesh_enabled`                | bool  | `true`       | Also extract a Surface Nets mesh (`mesh.ply`) from the fused TSDF    |
+| `depthmap_fusion_mesh_delete_batches`         | bool  | `true`       | Delete per-cluster `mesh_batch_*.ply` after merging                 |
+
+### Dense disk reclamation and export
+
+| Parameter                          | Type | Default | Description                                                            |
+| ---------------------------------- | ---- | ------- | --------------------------------------------------------------------- |
+| `depthmap_delete_raw_after_clean`  | bool | `true`  | Delete each `.raw.npz` once its `.clean.npz` is produced (lossless)   |
+| `depthmap_delete_fusion_batches`   | bool | `true`  | Delete per-cluster `fused_batch_*.ply` after merging into `fused.ply` |
+| `depthmap_delete_geotiff_batches`  | bool | `false` | Delete per-cluster DSM/ortho tiles after the final merge              |
+| `dense_pointcloud_export_las`      | bool | `true`  | Also export the dense cloud as LAS (next to `fused.ply`)              |
+| `dense_pointcloud_export_laz`      | bool | `true`  | Also export the dense cloud as LAZ                                    |
 
 ## Octree Tiling
 
-| Parameter                    | Type | Default | Description                |
-| ---------------------------- | ---- | ------- | -------------------------- |
-| `octree_max_points_per_tile` | int  | `50000` | Max points per octree tile |
-| `octree_max_depth`           | int  | `15`    | Max octree depth           |
-| `octree_lod_sample_count`    | int  | `10000` | LOD points in inner tiles  |
+Streaming tiles for the point-cloud/web viewer, built by `dense_merging` into the `point_cloud/` directory.
 
-## DSM (Digital Surface Model)
+| Parameter                    | Type | Default   | Description                                                       |
+| ---------------------------- | ---- | --------- | ---------------------------------------------------------------- |
+| `octree_max_points_per_tile` | int  | `50000`   | Max points stored in a single octree tile                        |
+| `octree_max_depth`           | int  | `15`      | Max octree depth (root = 0)                                      |
+| `octree_lod_sample_count`    | int  | `10000`   | LOD representative points kept in each inner (non-leaf) tile     |
+| `octree_split_depth`         | int  | `4`       | Out-of-core build: depth at which points are bucketed to disk    |
+| `octree_max_bucket_points`   | int  | `8000000` | Out-of-core build: clouds larger than this are bucketed to disk  |
 
-| Parameter               | Type  | Default | Description                                    |
-| ----------------------- | ----- | ------- | ---------------------------------------------- |
-| `dsm_gsd`               | float | `0.0`   | Ground sample distance (m/px). 0 = auto        |
-| `dsm_outlier_threshold` | float | `1.0`   | Outlier rejection threshold (m)                |
-| `dsm_min_count`         | int   | `3`     | Min contributions per cell                     |
-| `dsm_z_bias`            | float | `2.5`   | Softmax Z-bias (0=mean, 2.5≈P90, 5+=max)       |
-| `dsm_bilateral_enabled` | bool  | `true`  | Edge-preserving bilateral smoothing            |
-| `dsm_bilateral_spatial` | int   | `2`     | Bilateral spatial radius (px)                  |
-| `dsm_bilateral_range`   | float | `0.3`   | Bilateral range sigma (m)                      |
-| `dsm_fill_holes`        | bool  | `true`  | Fill small holes by dilation                   |
-| `dsm_fill_max_radius`   | int   | `3`     | Max dilation radius (px)                       |
-| `dsm_fill_triangulate`  | bool  | `true`  | Delaunay fill for larger holes                 |
-| `dsm_percentile`        | float | `0.75`  | Per-cell Z percentile                          |
-| `dsm_median_radius`     | int   | `1`     | Post-process median filter radius (0=disabled) |
+## DSM and Orthophoto
+
+The Digital Surface Model (`dsm.tif`) and orthophoto (`ortho.tif`) are rendered during fusion and finalized by `dense_merging`. The ground sample distance is derived automatically from the fused voxel size.
+
+| Parameter                    | Type  | Default | Description                                                                       |
+| ---------------------------- | ----- | ------- | --------------------------------------------------------------------------------- |
+| `dsm_enabled`                | bool  | `true`  | Render the DSM + orthophoto during fusion                                          |
+| `dsm_territory_depth_factor` | float | `2.0`   | Drop depth samples farther than this × the view's median depth                     |
+| `dsm_save_cluster_tiles`     | bool  | `true`  | Also write each cluster's own DSM/ortho GeoTIFF before merging (debug)             |
+| `dsm_merge_feather`          | bool  | `true`  | Merge per-cluster tiles by distance-transform feather blending                     |
+| `dsm_merge_max_ram_mb`       | int   | `512`   | Soft RAM budget (MB) for the band-by-band merge                                    |
+| `dsm_wall_cull_nz`           | float | `0.5`   | Rasterize a surface triangle only if \|cos\| of its normal from vertical ≥ this    |
+| `ortho_bake_n_final_views`   | int   | `3`     | Sharpest inlier views blended for the final ortho color                            |
+| `ortho_bake_irls_iterations` | int   | `5`     | Tukey-biweight reweighting iterations for the color consensus                      |
+| `ortho_bake_dsm_occlusion`   | bool  | `true`  | Drop views occluded by a taller surface when baking hole-filled cells              |
+| `ortho_median_threshold`     | float | `24.0`  | Gated 3×3 median despeckle: replace a pixel only if it differs by more than this   |
+| `hole_fill_diffuse_iters`    | int   | `64`    | Diffusion iterations used to fill tiny DSM holes                                   |
+| `hole_fill_small_area_max`   | int   | `256`   | Holes with ≤ this many cells are "tiny" (filled by diffusion)                      |
+| `hole_fill_footprint_close`  | int   | `256`   | Morphological closing of the footprint before large-hole filling                  |
+| `hole_fill_low_percentile`   | float | `20.0`  | Large holes filled as a flat surface at this boundary-height percentile            |
+| `hole_fill_occlusion_drop`   | float | `0.0`   | Fallback occluded-ground heuristic (superseded by ortho occlusion; `0` = off)     |
+| `dsm_shock_iterations`       | int   | `6`     | Coherence-enhancing shock-filter iterations sharpening DSM edges                   |
+| `dsm_shock_window`           | int   | `5`     | Structure-tensor half-window (cells); larger = straighter edges                    |
+| `dsm_shock_dt`               | float | `0.25`  | Shock-filter time step (keep ≤ 0.5 for stability)                                  |
+| `dsm_shock_coherence`        | float | `0.1`   | Along-edge diffusion weight (straightens jittered boundaries)                      |
+| `dsm_shock_edge_slope`       | float | `2.0`   | Edge-strength gate: shock fires only where the local slope exceeds this            |
 
 ## Multi-Processing
 

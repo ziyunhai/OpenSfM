@@ -20,8 +20,10 @@ positional arguments:
     bundle               Bundle a reconstruction
     mesh                 Add Delaunay meshes to the reconstruction
     undistort            Save undistorted images
-    compute_depthmaps    Compute depthmaps and fuse into a dense point cloud
-    compute_dsm          Compute a Digital Surface Model from fused point cloud
+    dense_clustering     Dense stage 1: clusters, neighbours and depth ranges
+    compute_depthmaps    Dense stage 2: compute and clean depthmaps
+    fuse_depthmaps       Dense stage 3: fuse cleaned depthmaps per cluster
+    dense_merging        Dense stage 4: merge into the dense cloud, mesh, DSM and ortho
     compute_statistics   Compute statistics and save them in the stats folder
     export_ply           Export reconstruction to PLY format
     export_openmvs       Export reconstruction to openMVS format
@@ -175,21 +177,23 @@ Creates undistorted versions of the reconstruction, tracks, and images. Required
 
 Key config: `undistorted_image_format`, `undistorted_image_max_size`. See [configuration](configuration.md#undistortion).
 
-### `compute_depthmaps`
+### Dense reconstruction: `dense_clustering`, `compute_depthmaps`, `fuse_depthmaps`, `dense_merging`
 
-Computes a dense point cloud by computing and merging depth maps. Requires an undistorted reconstruction. Output is in the `depthmaps/` folder; the merged cloud is at `undistorted/depthmaps/merged.ply`.
-
-Key config: `depthmap_resolution`, `depthmap_num_matching_views`, `depthmap_max_image_size`. See [configuration](configuration.md#depth-estimation-patchmatch-opencl).
-
-### `compute_dsm`
-
-Computes a Digital Surface Model (GeoTIFF) from the fused dense point cloud. Requires `compute_depthmaps` to have been run first.
+Dense reconstruction runs as four stages on an undistorted reconstruction, handed off through the `undistorted/depthmaps/` folder:
 
 ```bash
-bin/opensfm compute_dsm path/to/dataset
+bin/opensfm dense_clustering  path/to/dataset
+bin/opensfm compute_depthmaps path/to/dataset
+bin/opensfm fuse_depthmaps    path/to/dataset
+bin/opensfm dense_merging     path/to/dataset   # add --georeferenced for LAS/LAZ + DSM/ortho in the output CRS
 ```
 
-Key config parameters: `dsm_gsd`, `dsm_outlier_threshold`, `dsm_min_count`. See [configuration](configuration.md) for all DSM options.
+- **`dense_clustering`** — groups covisible shots into clusters and computes per-shot neighbours and depth ranges (`clusters.json`, `neighbors_*.json`, `depth_ranges.json`, ...).
+- **`compute_depthmaps`** — GPU PatchMatch depthmaps followed by a consistency/visibility cleaning pass; writes per-shot `*.clean.npz`. Requires `dense_clustering` to have run first.
+- **`fuse_depthmaps`** — sparse-voxel-octree TSDF fusion per cluster → `fused_batch_*.ply` (plus `mesh_batch_*.ply` and DSM/ortho tiles when enabled).
+- **`dense_merging`** — merges the batches into the final products: `fused.ply`, `mesh.ply` (Surface Nets), `dsm.tif`, `ortho.tif`, optional `fused.las` / `fused.laz`, and the `point_cloud/` octree tiles. Pass `--georeferenced` to write the LAS/LAZ and DSM/ortho in the output coordinate system (the projected GCP CRS if one is given, otherwise a UTM zone derived from the reference position).
+
+Key config: [Depth Estimation](configuration.md#depth-estimation-patchmatch-opencl), [Fusion](configuration.md#fusion), [DSM and Orthophoto](configuration.md#dsm-and-orthophoto) and [Octree Tiling](configuration.md#octree-tiling).
 
 ### `compute_statistics`
 

@@ -40,8 +40,13 @@ project/
 │   ├── masks/
 │   ├── tracks.csv
 │   ├── reconstruction.json
-│   └── depthmaps/                   # Output of compute_depthmaps
-│       └── merged.ply
+│   └── depthmaps/                   # Output of the dense pipeline (clustering → depthmaps → fusion → merging)
+│       ├── <image>.clean.npz        #   cleaned per-shot depthmaps (compute_depthmaps)
+│       ├── fused.ply                #   dense point cloud (dense_merging)
+│       ├── mesh.ply                 #   Surface Nets mesh
+│       ├── fused.las, fused.laz     #   dense cloud as LAS/LAZ
+│       ├── dsm.tif, ortho.tif       #   DSM and orthophoto (GeoTIFF)
+│       └── point_cloud/             #   Potree-style octree tiles for the viewer
 │── stats/                           # Output of compute_statistics / export_report
 │   ├── stats.json
 │   ├── report.pdf

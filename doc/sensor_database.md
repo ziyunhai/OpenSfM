@@ -9,7 +9,7 @@ During reconstruction, OpenSfM adjusts calibration values to best explain the ob
 Calibration databases are stored under `opensfm/data/`:
 - `sensor_data_detailed.json`
 - `sensor_data.json`
-- `sensor_calibration.yaml`
+- `camera_calibration.yaml`
 
 ## `sensor_data_detailed.json`
 
@@ -19,7 +19,7 @@ Contains physical sensor width and height (in millimetres) for a given `model ma
 
 Contains a multiplicative factor for a given `model make` sensor. Applied to the EXIF focal length, this factor gives the 35mm equivalent focal length. Since the 35mm equivalent dimensions (24×32 mm) are known, the full sensor geometry can be recovered.
 
-## `camera_calibration.json`
+## `camera_calibration.yaml`
 
 Contains full camera calibration definitions in OpenSfM format, keyed by `make`. Within each make, calibrations are further refined:
 
