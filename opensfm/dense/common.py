@@ -44,7 +44,7 @@ def select_cluster_views(
         ranked: List[str] = []
         for nbr in all_neighbors.get(sid, []):
             nid = nbr.id if hasattr(nbr, "id") else nbr
-            if nid != sid and nid in available_set and nid not in cluster_set:
+            if nid != sid and nid in available_set:
                 ranked.append(nid)
                 if len(ranked) >= per_ref_cap:
                     break
@@ -54,7 +54,8 @@ def select_cluster_views(
 
     needed: Set[str] = set(cluster_shots)
     budget = max(0, max_total - len(needed))
-    chosen = sorted(votes.keys(), key=lambda k: votes[k], reverse=True)[:budget]
+    chosen = sorted(votes.keys(), key=lambda k: votes[k], reverse=True)[
+        :budget]
     needed.update(chosen)
 
     per_ref_nbrs = {

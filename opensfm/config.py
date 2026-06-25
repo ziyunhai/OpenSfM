@@ -542,6 +542,8 @@ class OpenSfMConfig:
     ##################################
     # Controls DSM + ortho rendering.
     dsm_enabled: bool = True
+    # Robust-to-grazing depth clamp: in the fusion pre-scan, drop depth samples farther than this multiple of the view's median depth.
+    dsm_territory_depth_factor: float = 2.0
     # Debug: also write each cluster's own DSM+ortho as georeferenced GeoTIFFs (dsm_cluster_XXXX.tif / ortho_cluster_XXXX.tif) before they are merged
     dsm_save_cluster_tiles: bool = True
     # Merge per-cluster DSM/ortho tiles by distance-transform feather blending

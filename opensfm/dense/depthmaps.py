@@ -462,7 +462,6 @@ def clean_depthmaps(
         # else: use configured max_carved_views (single-pass behavior)
 
         pass1_depths: Dict[str, NDArray] = {}
-        use_segment_filter = config.get("depthmap_segmentation_enabled", False)
         for sid in cluster_shots:
             nbr_indices = np.array(
                 [shot_to_idx[n] for n in per_ref_nbrs[sid]],

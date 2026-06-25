@@ -80,6 +80,7 @@ def _prescan_coarse_grid(
     clean_cache: Optional[
         Dict[str, Tuple[NDArray, NDArray, Optional[NDArray]]]
     ] = None,
+    depth_factor: float = 0.0,
 ) -> Dict[Tuple[int, int, int], Set[int]]:
     """CPU pre-scan: subsample cleaned depthmaps, project to world, bucket.
 
@@ -128,6 +129,15 @@ def _prescan_coarse_grid(
 
         if len(d) == 0:
             continue
+
+        # Depth clamp (robust to grazing): drop samples far beyond this view's typical viewing distance.
+        if depth_factor > 0.0:
+            med = float(np.median(d))
+            if med > 0.0:
+                keep = d <= depth_factor * med
+                rr, cc, d = rr[keep], cc[keep], d[keep]
+                if len(d) == 0:
+                    continue
 
         shot = reconstruction.shots[sid]
         K = shot.camera.get_K_in_pixel_coordinates(w, h)
@@ -376,6 +386,7 @@ def _compute_cell_ownership(
         grid = _prescan_coarse_grid(
             data, own, reconstruction, voxel_size, coarse_factor,
             clean_cache=cache,
+            depth_factor=data.config["dsm_territory_depth_factor"],
         )
         del cache
         if not grid:
@@ -668,6 +679,7 @@ def fuse_clusters(
         grid = _prescan_coarse_grid(
             data, augmented, reconstruction,
             voxel_size, coarse_factor, clean_cache=clean_cache,
+            depth_factor=config["dsm_territory_depth_factor"],
         )
         coarse_size = voxel_size * coarse_factor
         logger.info(

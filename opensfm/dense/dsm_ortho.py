@@ -150,7 +150,8 @@ def _smooth_fill_components(
 
         sub = grid[y0:y1, x0:x1]  # a view → writes propagate to grid
         comp = labels[y0:y1, x0:x1] == lid
-        seed = sample_valid[y0:y1, x0:x1]  # Dirichlet boundary values live here
+        # Dirichlet boundary values live here
+        seed = sample_valid[y0:y1, x0:x1]
         if not seed.any():
             continue
         hN, wN = comp.shape
@@ -185,7 +186,8 @@ def _smooth_fill_components(
             ss = np.nonzero(nb_s)[0]
             if ss.size:
                 rhs[ss] += sub[nyc[ss], nxc[ss], :]
-        diag[diag == 0.0] = 1.0  # isolated cell with no valid neighbour → keep 0
+        # isolated cell with no valid neighbour → keep 0
+        diag[diag == 0.0] = 1.0
 
         rows = np.concatenate([np.arange(n)] + off_r)
         cols = np.concatenate([np.arange(n)] + off_c)
