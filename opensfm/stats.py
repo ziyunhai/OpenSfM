@@ -1753,6 +1753,96 @@ def save_overlap_map(
     plt.close(fig)
 
 
+# Hard-coded longest side, in pixels, for the DSM/ortho report thumbnails.
+THUMBNAIL_MAX_SIZE = 1000
+
+
+def _save_thumbnail_jpeg(
+    io_handler: io.IoFilesystemBase, path: str, bgr: NDArray
+) -> None:
+    """Encode a BGR uint8 image as JPEG and write it through ``io_handler``."""
+    ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    if not ok:
+        raise RuntimeError(f"Failed to JPEG-encode thumbnail: {path}")
+    with io_handler.open_wb(path) as fwb:
+        fwb.write(buf.tobytes())
+
+
+def save_dsm_thumbnail(
+    data: DataSet,
+    output_path: str,
+    io_handler: io.IoFilesystemBase,
+    max_size: int = THUMBNAIL_MAX_SIZE,
+) -> bool:
+    """Render a colourised JPEG thumbnail of the dense DSM for the report.
+
+    Reads ``undistorted/depthmaps/dsm.tif`` (decimated to ``max_size``), maps the
+    elevation range through the ``terrain`` colormap and writes ``dsm_thumb.jpg``
+    into ``output_path``, leaving no-data cells white.  Returns False (and writes
+    nothing) when the DSM has not been produced.
+    """
+    dsm_path = data.undistorted_dataset().dsm_file()
+    if not io_handler.isfile(dsm_path):
+        return False
+
+    grid, nodata = geo.read_geotiff_downsampled(dsm_path, max_size)
+    grid = grid.astype(np.float32)
+    valid = np.isfinite(grid)
+    if nodata is not None:
+        valid &= grid != nodata
+    if not valid.any():
+        return False
+
+    lo, hi = np.percentile(grid[valid], [2, 98])
+    if hi <= lo:
+        hi = lo + 1.0
+    norm = np.clip((grid - lo) / (hi - lo), 0.0, 1.0)
+    rgb = (mpl.colormaps["terrain"](norm)[:, :, :3] * 255.0).astype(np.uint8)
+    rgb[~valid] = 255  # white for no-data cells
+
+    _save_thumbnail_jpeg(
+        io_handler,
+        os.path.join(output_path, "dsm_thumb.jpg"),
+        cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+    )
+    return True
+
+
+def save_ortho_thumbnail(
+    data: DataSet,
+    output_path: str,
+    io_handler: io.IoFilesystemBase,
+    max_size: int = THUMBNAIL_MAX_SIZE,
+) -> bool:
+    """Render a JPEG thumbnail of the dense orthophoto for the report.
+
+    Reads ``undistorted/depthmaps/ortho.tif`` (decimated to ``max_size``),
+    composites any alpha band over white (JPEG has no transparency) and writes
+    ``ortho_thumb.jpg`` into ``output_path``.  Returns False (and writes nothing)
+    when the orthophoto has not been produced.
+    """
+    ortho_path = data.undistorted_dataset().ortho_file()
+    if not io_handler.isfile(ortho_path):
+        return False
+
+    arr, _ = geo.read_geotiff_downsampled(ortho_path, max_size)
+    if arr.ndim == 2:  # grayscale fallback
+        rgb = np.repeat(arr[:, :, None], 3, axis=2).astype(np.uint8)
+    else:
+        rgb = arr[:, :, :3].astype(np.float32)
+        if arr.shape[2] >= 4:  # composite RGB over white using the alpha band
+            alpha = arr[:, :, 3:4].astype(np.float32) / 255.0
+            rgb = rgb * alpha + 255.0 * (1.0 - alpha)
+        rgb = rgb.astype(np.uint8)
+
+    _save_thumbnail_jpeg(
+        io_handler,
+        os.path.join(output_path, "ortho_thumb.jpg"),
+        cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+    )
+    return True
+
+
 def decimate_points(
     reconstructions: List[types.Reconstruction], max_num_points: int
 ) -> None:

@@ -749,6 +749,44 @@ def load_dsm_geotiff(path: str) -> Tuple[NDArray, Tuple[float, ...], str]:
     return arr, gt, wkt
 
 
+def read_geotiff_downsampled(
+    path: str, max_size: int
+) -> Tuple[NDArray, Optional[float]]:
+    """Read a GeoTIFF decimated so its longest side is at most ``max_size`` px.
+
+    The raster is decimated on read (GDAL RasterIO buffer resize), so the full
+    resolution grid is never materialised — handy for cheap thumbnails of large
+    DSM/ortho products.  Orientation is kept as stored in the file (GeoTIFF row 0
+    = top), i.e. ready for display.
+
+    Args:
+        path: GeoTIFF path.
+        max_size: longest output side in pixels; values <= 0 read at full size.
+
+    Returns:
+        (array, nodata): ``array`` is (H, W) for a single-band raster or
+        (H, W, bands) for a multi-band one, in the raster's native dtype.
+        ``nodata`` is band 1's NoData value (None if unset).
+    """
+    ds = gdal.Open(path, gdal.GA_ReadOnly)
+    if ds is None:
+        raise FileNotFoundError(f"GeoTIFF not found: {path}")
+    w, h = ds.RasterXSize, ds.RasterYSize
+    longest = max(w, h)
+    if max_size > 0 and longest > max_size:
+        out_w = max(1, int(round(w * max_size / longest)))
+        out_h = max(1, int(round(h * max_size / longest)))
+    else:
+        out_w, out_h = w, h
+    arr = ds.ReadAsArray(buf_xsize=out_w, buf_ysize=out_h)
+    nodata = ds.GetRasterBand(1).GetNoDataValue()
+    ds = None  # close file
+    if arr.ndim == 3:
+        # GDAL returns (bands, H, W); switch to (H, W, bands) for display.
+        arr = np.transpose(arr, (1, 2, 0))
+    return arr, nodata
+
+
 def save_ortho_geotiff(
     path: str,
     image: NDArray,

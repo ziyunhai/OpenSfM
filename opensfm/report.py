@@ -1151,6 +1151,34 @@ class Report:
 
         self.pdf.set_xy(MARGIN, self.pdf.get_y() + TABLE_GAP)
 
+    def make_dsm_details(self) -> None:
+        dsm_thumbs = [
+            f for f in self.io_handler.ls(self.output_path)
+            if f.startswith("dsm_thumb") and f.endswith(".jpg")
+        ]
+        if not dsm_thumbs:
+            return
+
+        self._make_section(self.locale.t("digital_surface_model"))
+        self._make_centered_image(
+            os.path.join(self.output_path, dsm_thumbs[0]), 120
+        )
+        self.pdf.set_xy(MARGIN, self.pdf.get_y() + TABLE_GAP)
+
+    def make_ortho_details(self) -> None:
+        ortho_thumbs = [
+            f for f in self.io_handler.ls(self.output_path)
+            if f.startswith("ortho_thumb") and f.endswith(".jpg")
+        ]
+        if not ortho_thumbs:
+            return
+
+        self._make_section(self.locale.t("orthophoto"))
+        self._make_centered_image(
+            os.path.join(self.output_path, ortho_thumbs[0]), 120
+        )
+        self.pdf.set_xy(MARGIN, self.pdf.get_y() + TABLE_GAP)
+
     def add_page_break(self) -> None:
         self.pdf.add_page("P")
 
@@ -1168,6 +1196,14 @@ class Report:
         self.make_camera_models_details()
         self.make_rig_cameras_details()
         self.add_page_break()
+
+        report_images = self.io_handler.ls(self.output_path)
+        if any(
+            f.startswith(("dsm_thumb", "ortho_thumb")) for f in report_images
+        ):
+            self.make_dsm_details()
+            self.make_ortho_details()
+            self.add_page_break()
 
         self.make_overlap_summary()
         self.make_gps_details()

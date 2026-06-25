@@ -45,5 +45,8 @@ def run_dataset(data: DataSet, diagram_max_points: int = -1) -> None:
         reconstructions, output_path, data.io_handler
     )
 
+    stats.save_dsm_thumbnail(data, output_path, data.io_handler)
+    stats.save_ortho_thumbnail(data, output_path, data.io_handler)
+
     with data.io_handler.open_wt(os.path.join(output_path, "stats.json")) as fout:
         io.json_dump(stats_dict, fout)
