@@ -27,7 +27,7 @@ processes: 4
 
 | Parameter                          | Type        | Default   | Description                                                               |
 | ---------------------------------- | ----------- | --------- | ------------------------------------------------------------------------- |
-| `feature_type`                     | str         | `"HAHOG"` | Feature detector: `HAHOG`, `SIFT`, `SURF`, `AKAZE`, `ORB`                 |
+| `feature_type`                     | str         | `"HAHOG"` | Feature detector: `HAHOG`, `SIFT`, `DSPSIFT`, `SURF`, `AKAZE`, `ORB`      |
 | `feature_root`                     | bool        | `true`    | Apply square-root mapping to descriptors                                  |
 | `feature_min_frames`               | int         | `4000`    | Target minimum features; detector threshold is relaxed if fewer are found |
 | `feature_min_frames_panorama`      | int         | `16000`   | Same as above for panoramas                                               |
@@ -47,6 +47,15 @@ processes: 4
 | `sift_nfeatures`      | int   | `0`     | Max features (0 = unlimited) |
 | `sift_octave_layers`  | int   | `3`     | Layers per octave            |
 | `sift_sigma`          | float | `1.6`   | Initial Gaussian sigma       |
+
+### DSPSIFT
+
+Domain-size-pooling SIFT — a SIFT variant that pools descriptors across scales for robustness.
+
+| Parameter                | Type  | Default | Description              |
+| ------------------------ | ----- | ------- | ------------------------ |
+| `dspsift_peak_threshold` | float | `0.006` | Smaller → more features  |
+| `dspsift_edge_threshold` | int   | `10`    | Edge rejection threshold |
 
 ### SURF
 
@@ -81,9 +90,10 @@ processes: 4
 
 | Parameter            | Type  | Default   | Description                       |
 | -------------------- | ----- | --------- | --------------------------------- |
-| `lowes_ratio`        | float | `0.8`     | Lowe's ratio test threshold       |
-| `matcher_type`       | str   | `"FLANN"` | `FLANN`, `BRUTEFORCE`, or `WORDS` |
-| `symmetric_matching` | bool  | `true`    | Match in both directions          |
+| `lowes_ratio`           | float | `0.85`             | Lowe's ratio test threshold                                        |
+| `matcher_type`          | str   | `"OPENCL_HAMMING"` | `FLANN`, `BRUTEFORCE`, `WORDS`, `OPENCL_HAMMING` or `OPENCL_BF`     |
+| `symmetric_matching`    | bool  | `true`             | Match in both directions                                           |
+| `binary_training_pairs` | int   | `100`              | Image pairs used to train the binary projection (`OPENCL_HAMMING`) |
 
 ### FLANN
 
@@ -207,6 +217,19 @@ processes: 4
 | `bundle_irls_gcp_density_ratio`   | float | `0.00001`     | IRLS density ratio for GCP residuals                 |
 | `bundle_irls_gps_density_ratio`   | float | `0.00001`     | IRLS density ratio for GPS residuals                 |
 
+### Stochastic Bundle
+
+For very large scenes, the global bundle switches to a stochastic solver that optimizes a random subset of cameras per round.
+
+| Parameter                           | Type  | Default | Description                                                               |
+| ----------------------------------- | ----- | ------- | ------------------------------------------------------------------------- |
+| `stochastic_bundle_shot_count`      | int   | `4000`  | Shot count above which the global bundle uses the stochastic solver       |
+| `stochastic_bundle_max_shots`       | int   | `500`   | Max interior cameras optimized per round                                  |
+| `stochastic_bundle_random_shots`    | int   | `20`    | Seed shots fed to each round                                              |
+| `stochastic_bundle_gcp_seeds_ratio` | float | `0.5`   | Fraction of `stochastic_bundle_max_shots` reserved for GCP-anchored shots |
+| `stochastic_bundle_radius`          | int   | `100`   | Graph-hop radius for each round                                           |
+| `stochastic_bundle_max_rounds`      | int   | `100`   | Upper bound on the number of rounds                                       |
+
 ## Incremental Reconstruction
 
 | Parameter                        | Type  | Default  | Description                                           |
@@ -223,6 +246,8 @@ processes: 4
 | `local_bundle_grid`              | int   | `12`     | Grid divisions for track selection (local BA)         |
 | `final_bundle_grid`              | int   | `32`     | Grid divisions for track selection (final BA)         |
 | `incremental_max_shots_count`    | int   | `0`      | Limit max shots (0 = unlimited, for debugging)        |
+| `incremental_bootstrap_tries`    | int   | `10`     | Initial image pairs tried for the reconstruction bootstrap |
+| `incremental_bootstrap_min_inliers_ratio` | float | `0.8` | Min average resection inlier ratio to accept a bootstrap pair |
 | `filter_final_point_cloud`       | bool  | `false`  | Remove uncertain/isolated points                      |
 | `save_partial_reconstructions`   | bool  | `false`  | Save reconstruction at every iteration                |
 
@@ -383,3 +408,10 @@ The Digital Surface Model (`dsm.tif`) and orthophoto (`ortho.tif`) are rendered 
 | `submodels_relpath`                | str   | `"submodels"`                      | Submodels directory                  |
 | `submodel_relpath_template`        | str   | `"submodels/submodel_%04d"`        | Submodel directory template          |
 | `submodel_images_relpath_template` | str   | `"submodels/submodel_%04d/images"` | Submodel images directory template   |
+
+## Report Localization
+
+| Parameter            | Type | Default    | Description                                          |
+| -------------------- | ---- | ---------- | --------------------------------------------------- |
+| `report_unit_system` | str  | `"metric"` | Units in the quality report: `metric` or `imperial` |
+| `report_language`    | str  | `"en"`     | Report language: `en`, `fr`, `es`, `de`, `it`       |
