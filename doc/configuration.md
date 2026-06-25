@@ -20,6 +20,8 @@ processes: 4
 | `unknown_camera_models_are_different` | bool  | `false`         | Treat images from unknown camera models as different cameras |
 | `default_projection_type`             | str   | `"perspective"` | Projection type when EXIF cannot determine it                |
 | `default_focal_prior`                 | float | `0.85`          | Default focal-length-to-sensor-width ratio                   |
+| `proj_cdn_enabled`                    | bool  | `true`          | Download missing datum/geoid grids from the PROJ CDN         |
+| `proj_grid_cache_dir`                 | str   | `""`            | Folder to load/store geoid files and datum grids             |
 
 ## Features
 

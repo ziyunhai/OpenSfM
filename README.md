@@ -85,6 +85,8 @@ bin\opensfm_run_all.bat path\to\dataset  # Windows
 * [Ground control points](doc/ground_control_points.md)
 * [Rig models](doc/rig.md)
 * [Large datasets](doc/large_datasets.md)
+* [Dense reconstruction & 2D maps](doc/dense.md)
+* [Georeferencing & GIS outputs](doc/georeferencing.md)
 * [Quality report](doc/quality_report.md)
 
 **Reference**
