@@ -216,6 +216,9 @@ class SVOFuser:
     ) -> None: ...
     def extract_and_bake(self) -> list: ...
 
+    # Returns (vertices N×3 float32, normals N×3 float32, faces M×3 int32).
+    def extract_mesh(self) -> tuple: ...
+
     def prune_by_visibility(
         self,
         iterations: int,

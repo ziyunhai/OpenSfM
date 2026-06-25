@@ -730,6 +730,13 @@ def fuse_clusters(
         all_points: List[NDArray] = []
         all_normals: List[NDArray] = []
         all_colors: List[NDArray] = []
+        # Per-sub-volume mesh fragments (Surface Nets of the TSDF), accumulated
+        # like the point cloud; faces are re-indexed at write time.
+        mesh_enabled = config["depthmap_fusion_mesh_enabled"]
+        all_mverts: List[NDArray] = []
+        all_mnormals: List[NDArray] = []
+        all_mcolors: List[NDArray] = []
+        all_mfaces: List[NDArray] = []
         # Leaf sub-volumes actually fused (post-split), for the Pass 2 ortho
         # bake; owner_grid[cell] = index into `leaves` of the leaf that won the
         # cell's height (MAX-z), so each cell is re-coloured by the views that
@@ -1055,6 +1062,53 @@ def fuse_clusters(
                     f"    → {len(pts)} points extracted"
                 )
 
+            # --- Surface Nets mesh (TSDF zero-set) for this sub-volume. ---
+            # Must run while `fuser` is still alive (before release/del below):
+            # extract the dual-contour mesh, keep the triangles this sub-volume
+            # owns, then bake per-vertex colour with the same multi-view IRLS
+            # consensus used for the point cloud.
+            if mesh_enabled:
+                mv_arr, mn_arr, mf_arr = fuser.extract_mesh()
+                mverts = np.asarray(mv_arr, dtype=np.float32)
+                mnrm = np.asarray(mn_arr, dtype=np.float32)
+                mfaces = np.asarray(mf_arr, dtype=np.int64)
+                if len(mfaces) > 0 and len(mverts) > 0:
+                    # Keep a triangle when its centroid falls in this leaf's
+                    # core AND an owned coarse cell — the same jagged-boundary
+                    # dedup as the point cloud, but on faces (dropping a shared
+                    # vertex would tear the surface).
+                    cent = mverts[mfaces].mean(axis=1)
+                    inside = np.all(
+                        (cent >= sv.core_min) & (cent <= sv.core_max), axis=1
+                    )
+                    ccells = np.floor(
+                        cent.astype(np.float64) * inv_coarse
+                    ).astype(np.int64)
+                    owned = np.isin(
+                        _pack_coarse_cells(ccells, owned_origin, owned_span),
+                        owned_keys,
+                    )
+                    mfaces = mfaces[inside & owned]
+                if len(mfaces) > 0:
+                    # Compact to referenced vertices and re-index the faces.
+                    used = np.unique(mfaces)
+                    remap = np.full(len(mverts), -1, dtype=np.int64)
+                    remap[used] = np.arange(len(used))
+                    mverts = mverts[used]
+                    mnrm = mnrm[used]
+                    mfaces = remap[mfaces].astype(np.int32)
+                    mclr = np.asarray(
+                        fuser.bake_colors(mverts, mnrm), dtype=np.uint8
+                    )
+                    all_mverts.append(mverts)
+                    all_mnormals.append(mnrm)
+                    all_mcolors.append(mclr)
+                    all_mfaces.append(mfaces)
+                    logger.info(
+                        f"    → mesh: {len(mverts)} verts, "
+                        f"{len(mfaces)} faces"
+                    )
+
             if not keep_for_bake:
                 del fuser
             else:
@@ -1344,6 +1398,28 @@ def fuse_clusters(
             filename = f"fused_batch_{batch_num:04d}.ply"
             data.save_point_cloud(
                 points, normals, colors, labels, filename=filename
+            )
+
+        # Concatenate the per-sub-volume mesh fragments into this cluster's
+        # mesh batch, offsetting each fragment's face indices by the running
+        # vertex count (vertices are simply stacked).
+        if mesh_enabled and all_mverts:
+            mfaces_offset: List[NDArray] = []
+            vbase = 0
+            for mv, mf in zip(all_mverts, all_mfaces):
+                mfaces_offset.append(mf.astype(np.int64) + vbase)
+                vbase += len(mv)
+            mverts_all = np.concatenate(all_mverts)
+            mnorm_all = np.concatenate(all_mnormals)
+            mcolor_all = np.concatenate(all_mcolors)
+            mfaces_all = np.concatenate(mfaces_offset).astype(np.int32)
+            data.save_mesh(
+                mverts_all, mnorm_all, mcolor_all, mfaces_all,
+                filename=f"mesh_batch_{batch_num:04d}.ply",
+            )
+            logger.info(
+                f"Cluster {batch_num}: mesh batch saved "
+                f"({len(mverts_all)} verts, {len(mfaces_all)} faces)"
             )
 
         if config.get("depthmap_save_debug_ply", False) and len(points) > 0:

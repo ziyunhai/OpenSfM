@@ -1104,6 +1104,29 @@ class UndistortedDataSet:
         with self.io_handler.open_wb(self.point_cloud_file(filename)) as fp:
             io.point_cloud_to_ply(points, normals, colors, labels, fp)
 
+    def mesh_file(self, filename: str = "mesh.ply") -> str:
+        return os.path.join(self._depthmap_path(), filename)
+
+    def load_mesh(
+        self, filename: str = "mesh.ply"
+    ) -> Tuple[NDArray, NDArray, NDArray, NDArray]:
+        """Load a dense triangle mesh PLY → (vertices, normals, colors, faces)."""
+        with self.io_handler.open_rb(self.mesh_file(filename)) as fp:
+            return io.load_mesh_from_ply(fp)
+
+    def save_mesh(
+        self,
+        vertices: NDArray,
+        normals: NDArray,
+        colors: NDArray,
+        faces: NDArray,
+        filename: str = "mesh.ply",
+    ) -> None:
+        """Save a dense triangle mesh as a binary PLY (xyz+normal+rgb + faces)."""
+        self.io_handler.mkdir_p(self._depthmap_path())
+        with self.io_handler.open_wb(self.mesh_file(filename)) as fp:
+            io.mesh_to_ply(vertices, normals, colors, faces, fp)
+
     def dsm_file(self) -> str:
         return os.path.join(self._depthmap_path(), "dsm.tif")
 

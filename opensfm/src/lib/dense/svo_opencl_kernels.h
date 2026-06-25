@@ -2725,6 +2725,155 @@ __kernel void svo_dc_median(
     }
     z_out[cell] = vals[n / 2];  // n >= 1 (self is valid)
 }
+
+// =====================================================================
+// 3-D mesh extraction by Surface Nets (dual contouring).
+//
+// Same vertex placement as svo_dc_vertex, but instead of rasterizing the
+// dual quads top-down (DSM), we *emit indexed triangles* — a true 3-D mesh.
+// Two passes:
+//   1. svo_dc_mesh_compact — for each slot that produced a Surface Nets
+//      vertex, atomically assign a compact vertex index, write its compact
+//      position + normal (from the slot's accumulated TSDF normal), and store
+//      the index in vert_idx[slot] (-1 = no vertex).
+//   2. svo_dc_mesh_faces   — mirror of svo_dc_raster, but append the two
+//      triangles of each sign-change quad to an index buffer.  NO wall cull:
+//      facades/roofs/ground are all kept (this is a full 3-D surface, not a
+//      2.5-D heightfield).  The 4 cubes around a grid edge are index-adjacent,
+//      so triangles are always ~1 voxel — no bridge triangles across gaps;
+//      absent cubes simply leave holes.
+// =====================================================================
+
+// ---- Pass 1: compact the per-slot Surface Nets vertices ---------------
+// Run svo_dc_vertex first to fill vert_pos.  One work-item per hash slot.
+__kernel void svo_dc_mesh_compact(
+    __global const VoxelSlot* table,
+    uint                      capacity,
+    __global const float*     vert_pos,   // per-slot vertex (z=NaN if none)
+    __global float*           out_pos,    // compact Nx3 positions
+    __global float*           out_nrm,    // compact Nx3 normals
+    __global int*             vert_idx,   // per-slot compact index (-1 = none)
+    __global uint*            counter,
+    uint                      max_output)
+{
+    uint i = get_global_id(0);
+    if (i >= capacity) return;
+
+    vert_idx[i] = -1;
+    if (isnan(vert_pos[i * 3 + 2])) return;  // this cube has no vertex
+    if (table[i].key_ab == EMPTY_KEY) return;
+
+    uint out_idx = atomic_add(counter, 1u);
+    if (out_idx >= max_output) return;
+    vert_idx[i] = (int)out_idx;
+
+    out_pos[out_idx * 3 + 0] = vert_pos[i * 3 + 0];
+    out_pos[out_idx * 3 + 1] = vert_pos[i * 3 + 1];
+    out_pos[out_idx * 3 + 2] = vert_pos[i * 3 + 2];
+
+    // Vertex normal = slot's weighted-average TSDF normal (same convention as
+    // svo_extract_points), normalized.  Falls back to +Z if degenerate.
+    float sw = (float)table[i].sum_weight;
+    float inv = (sw > 0.0f) ? (1.0f / (sw * (float)FP_SCALE)) : 0.0f;
+    float nx = (float)table[i].sum_nx * inv;
+    float ny = (float)table[i].sum_ny * inv;
+    float nz = (float)table[i].sum_nz * inv;
+    float nlen = sqrt(nx * nx + ny * ny + nz * nz);
+    if (nlen > 1e-6f) { nx /= nlen; ny /= nlen; nz /= nlen; }
+    else { nx = 0.0f; ny = 0.0f; nz = 1.0f; }
+    out_nrm[out_idx * 3 + 0] = nx;
+    out_nrm[out_idx * 3 + 1] = ny;
+    out_nrm[out_idx * 3 + 2] = nz;
+}
+
+// Append one triangle (3 compact vertex indices) to the index buffer.
+void mesh_emit_tri(__global int* out_idx, __global uint* tri_counter,
+                   uint max_tris, int a, int b, int c) {
+    uint t = atomic_add(tri_counter, 1u);
+    if (t >= max_tris) return;
+    out_idx[t * 3 + 0] = a;
+    out_idx[t * 3 + 1] = b;
+    out_idx[t * 3 + 2] = c;
+}
+
+// ---- Pass 2: emit the dual quads as indexed triangles -----------------
+// One work-item per hash slot that owns a vertex.  Mirrors svo_dc_raster's
+// connectivity; each interior grid edge is owned by its lower endpoint A.
+__kernel void svo_dc_mesh_faces(
+    __global const VoxelSlot* table,
+    uint                      capacity_mask,
+    uint                      capacity,
+    __global const float*     vert_pos,   // per-slot vertex (for NaN check)
+    __global const int*       vert_idx,   // per-slot compact index
+    __global int*             out_tris,   // compact Mx3 triangle indices
+    __global uint*            tri_counter,
+    uint                      max_tris)
+{
+    uint i = get_global_id(0);
+    if (i >= capacity) return;
+    if (isnan(vert_pos[i * 3 + 2])) return;  // this cube has no vertex
+
+    uint key_ab = table[i].key_ab;
+    if (key_ab == EMPTY_KEY) return;
+    int kx = (int)((key_ab >> 16) & 0xFFFF) - 32768;
+    int ky = (int)(key_ab & 0xFFFF) - 32768;
+    int kz = table[i].key_c;
+
+    float tA;
+    int wA;
+    dc_tsdf(table, i, &tA, &wA);  // present: this slot owns a vertex
+    int i00 = vert_idx[i];        // cube A's own compact vertex index
+    if (i00 < 0) return;
+
+    for (int axis = 0; axis < 3; axis++) {
+        int bx = kx, by = ky, bz = kz;
+        if (axis == 0) bx++;
+        else if (axis == 1) by++;
+        else bz++;
+
+        uint sB = hash_lookup(table, capacity_mask, bx, by, bz);
+        float tB;
+        int wB;
+        if (!dc_tsdf(table, sB, &tB, &wB)) continue;
+        if ((tA <= 0.0f) == (tB <= 0.0f)) continue;  // no crossing this edge
+
+        // Two perpendicular unit axes P, Q for this edge (match svo_dc_raster).
+        int Px, Py, Pz, Qx, Qy, Qz;
+        if (axis == 0)      { Px = 0; Py = 1; Pz = 0; Qx = 0; Qy = 0; Qz = 1; }
+        else if (axis == 1) { Px = 1; Py = 0; Pz = 0; Qx = 0; Qy = 0; Qz = 1; }
+        else                { Px = 1; Py = 0; Pz = 0; Qx = 0; Qy = 1; Qz = 0; }
+
+        // 4 cubes sharing the edge: A, A-P, A-Q, A-P-Q (by min-corner).  All
+        // must own a vertex; otherwise this corner of the surface is a hole.
+        float3 dummy;
+        if (!dc_vertex_lookup(table, capacity_mask, vert_pos,
+                              kx - Px, ky - Py, kz - Pz, &dummy)) continue;
+        if (!dc_vertex_lookup(table, capacity_mask, vert_pos,
+                              kx - Qx, ky - Qy, kz - Qz, &dummy)) continue;
+        if (!dc_vertex_lookup(table, capacity_mask, vert_pos,
+                              kx - Px - Qx, ky - Py - Qy, kz - Pz - Qz,
+                              &dummy)) continue;
+
+        int i10 = vert_idx[hash_lookup(table, capacity_mask,
+                                       kx - Px, ky - Py, kz - Pz)];
+        int i01 = vert_idx[hash_lookup(table, capacity_mask,
+                                       kx - Qx, ky - Qy, kz - Qz)];
+        int i11 = vert_idx[hash_lookup(table, capacity_mask,
+                                       kx - Px - Qx, ky - Py - Qy, kz - Pz - Qz)];
+        if (i10 < 0 || i01 < 0 || i11 < 0) continue;
+
+        // Wind the quad so the front face points toward the +TSDF (outside)
+        // half-space.  tA <= 0 means cube A is inside and the surface normal
+        // runs along +axis; flip the winding when A is outside.
+        if (tA <= 0.0f) {
+            mesh_emit_tri(out_tris, tri_counter, max_tris, i00, i10, i11);
+            mesh_emit_tri(out_tris, tri_counter, max_tris, i00, i11, i01);
+        } else {
+            mesh_emit_tri(out_tris, tri_counter, max_tris, i00, i11, i10);
+            mesh_emit_tri(out_tris, tri_counter, max_tris, i00, i01, i11);
+        }
+    }
+}
 )CL";
 
 }  // namespace dense

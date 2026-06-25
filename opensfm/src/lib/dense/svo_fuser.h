@@ -134,6 +134,15 @@ class SVOFuser {
                       std::vector<uint8_t>* ortho_out,
                       std::vector<float>* normals_out);
 
+  // Extract a 3-D triangle mesh from the fused TSDF by Surface Nets (dual
+  // contouring).  Keeps the full surface (walls + roofs + ground) — colours
+  // are baked separately (BakeColors) on |verts|.  Must be called after Fuse().
+  //   verts   : N×3 float positions.
+  //   normals : N×3 float per-vertex normals.
+  //   tris    : flat M×3 int vertex indices (0-based).
+  void ExtractMesh(std::vector<Vec3f>* verts, std::vector<Vec3f>* normals,
+                   std::vector<int>* tris);
+
   // Legacy API: Fuse + ExtractPoints in one call (backward compat).
   void Fuse(std::vector<Vec3f>* fused_points, std::vector<Vec3f>* fused_normals,
             std::vector<Vec3<uint8_t>>* fused_colors);

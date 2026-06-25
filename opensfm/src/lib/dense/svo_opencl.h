@@ -230,6 +230,19 @@ class SVOIntegratorCL {
                       std::vector<uint8_t>* ortho_out,
                       std::vector<float>* normals_out);
 
+  // Extract a 3-D triangle mesh from the (possibly refined) hash table by
+  // Surface Nets (dual contouring): one vertex per surface cube, connected
+  // into quads across each TSDF sign-change grid edge.  Unlike RenderDSMOrtho
+  // this keeps the full surface (walls + roofs + ground); colours are baked
+  // separately (BakeColors) on the returned vertices.
+  //   verts_out   : flat N×3 float positions.
+  //   normals_out : flat N×3 float per-vertex normals (TSDF gradient).
+  //   tris_out    : flat M×3 int vertex indices (0-based into verts_out).
+  void ExtractMesh(float min_weight, float voxel_size,
+                   std::vector<Vec3f>* verts_out,
+                   std::vector<Vec3f>* normals_out,
+                   std::vector<int>* tris_out);
+
  private:
   void BuildKernels();
   void EnsureFrameBuffers(int rows, int cols, bool has_normal, bool has_mask,

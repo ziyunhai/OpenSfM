@@ -523,6 +523,13 @@ class OpenSfMConfig:
     depthmap_fusion_svo_bake_reuse_max_fusers: int = 4
     # Hard ceiling, as a fraction of device VRAM, on the bytes of retained fusers (hash table + refine images) kept resident
     depthmap_fusion_svo_bake_reuse_vram_fraction: float = 0.5
+    # Extract a 3-D triangle mesh (Surface Nets / dual contouring of the fused
+    # TSDF) alongside the fused point cloud.  Writes mesh_batch_*.ply per cluster
+    # (merged into mesh.ply).  Unlike Poisson it never balloons facades — the
+    # mesh is the TSDF zero-set itself — but leaves holes where the SVO is empty.
+    depthmap_fusion_mesh_enabled: bool = True
+    # Delete the per-cluster mesh_batch_*.ply after merging into mesh.ply.
+    depthmap_fusion_mesh_delete_batches: bool = True
 
     ##################################
     # Params for octree point cloud tiling (viewer streaming)

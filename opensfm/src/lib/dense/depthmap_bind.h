@@ -404,6 +404,27 @@ class SVOFuserWrapper {
     return retn;
   }
 
+  // Extract a 3-D triangle mesh (Surface Nets) from the fused TSDF.  Returns
+  // (vertices N×3 float, normals N×3 float, faces M×3 int32).  Colours are
+  // baked separately by the caller via bake_colors() on the returned vertices.
+  py::tuple ExtractMesh() {
+    std::vector<Vec3f> verts;
+    std::vector<Vec3f> normals;
+    std::vector<int> tris;
+
+    {
+      py::gil_scoped_release release;
+      sf_.ExtractMesh(&verts, &normals, &tris);
+    }
+
+    const int nv = static_cast<int>(verts.size());
+    const int nt = static_cast<int>(tris.size() / 3);
+    return py::make_tuple(
+        foundation::py_array_from_data(verts.data()->data(), nv, 3),
+        foundation::py_array_from_data(normals.data()->data(), nv, 3),
+        foundation::py_array_from_data(tris.data(), nt, 3));
+  }
+
   void PruneByVisibility(int iterations, float carve_margin,
                          int carve_threshold, int support_min) {
     py::gil_scoped_release release;

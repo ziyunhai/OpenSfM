@@ -45,6 +45,7 @@ PYBIND11_MODULE(pydense, m) {
                std::map<std::string, std::vector<std::string>>(),
            py::arg("lambda_anchor") = 0.0f, py::arg("early_stop_rel") = 0.0f)
       .def("extract_and_bake", &dense::SVOFuserWrapper::ExtractAndBake)
+      .def("extract_mesh", &dense::SVOFuserWrapper::ExtractMesh)
       .def("prune_by_visibility", &dense::SVOFuserWrapper::PruneByVisibility,
            py::arg("iterations"), py::arg("carve_margin"),
            py::arg("carve_threshold"), py::arg("support_min"))

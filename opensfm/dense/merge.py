@@ -111,6 +111,86 @@ def merge_fusion_batches(
         logger.info(f"Removed {len(batch_files)} merged batch PLY(s)")
 
 
+def merge_mesh_batches(
+    data: UndistortedDataSet,
+    batch_nums: List[int],
+) -> None:
+    """Stream all per-cluster ``mesh_batch_*.ply`` into the final ``mesh.ply``.
+
+    A PLY lists all vertices before all faces, so this is a two-sweep stream:
+    sweep 1 writes every batch's vertices, sweep 2 writes every batch's faces
+    with their indices shifted by the running vertex base.  Peak memory is one
+    batch at a time, mirroring ``merge_fusion_batches``.
+    """
+    if not batch_nums:
+        return
+
+    def _batch_file(batch_num: int) -> str:
+        return f"mesh_batch_{batch_num:04d}.ply"
+
+    delete_batches = data.config.get("depthmap_fusion_mesh_delete_batches", True)
+
+    # Resume guard: mesh.ply only appears after a complete write, so an existing
+    # mesh.ply with missing batches means we are resuming cleanup.
+    mesh_exists = data.io_handler.isfile(data.mesh_file("mesh.ply"))
+    present = [
+        bn for bn in sorted(batch_nums)
+        if data.io_handler.isfile(data.mesh_file(_batch_file(bn)))
+    ]
+    if mesh_exists and len(present) < len(batch_nums):
+        logger.info("mesh.ply already complete; cleaning up leftover batches")
+        if delete_batches:
+            for bn in present:
+                data.io_handler.rm_if_exist(data.mesh_file(_batch_file(bn)))
+        return
+
+    # Sweep 0: header-only counts → totals.
+    batch_info: List[Tuple[str, int, int]] = []
+    total_v = 0
+    total_f = 0
+    for bn in present:
+        filename = _batch_file(bn)
+        with data.io_handler.open_rb(data.mesh_file(filename)) as fp:
+            nv, nf = io.read_mesh_ply_counts(fp)
+        if nv == 0:
+            continue
+        batch_info.append((filename, nv, nf))
+        total_v += nv
+        total_f += nf
+
+    if total_v == 0:
+        logger.warning("No vertices found in any mesh batch.")
+        return
+
+    data.io_handler.mkdir_p(data._depthmap_path())
+    with data.io_handler.open_wb(data.mesh_file("mesh.ply")) as out:
+        out.write(io.mesh_ply_header(total_v, total_f).encode("ascii"))
+        # Sweep 1: all vertices, in batch order.
+        for filename, _nv, _nf in batch_info:
+            v, n, c, _f = data.load_mesh(filename)
+            out.write(io.pack_mesh_vertex_rows(v, n, c))
+            del v, n, c, _f
+            gc.collect()
+        # Sweep 2: all faces, offset by each batch's vertex base.
+        vbase = 0
+        for filename, nv, _nf in batch_info:
+            _v, _n, _c, f = data.load_mesh(filename)
+            out.write(io.pack_mesh_face_rows(f, index_offset=vbase))
+            vbase += nv
+            del _v, _n, _c, f
+            gc.collect()
+
+    logger.info(
+        f"Merged {len(batch_info)} mesh batches → mesh.ply "
+        f"({total_v} verts, {total_f} faces)"
+    )
+
+    if delete_batches:
+        for filename, _nv, _nf in batch_info:
+            data.io_handler.rm_if_exist(data.mesh_file(filename))
+        logger.info(f"Removed {len(batch_info)} merged mesh batch PLY(s)")
+
+
 def merge_dsm_ortho_batches(
     data: UndistortedDataSet,
     batch_nums: List[int],

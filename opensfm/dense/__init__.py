@@ -318,6 +318,10 @@ def run_merge(
     # ── Merge batch PLYs into final fused.ply ──
     merge.merge_fusion_batches(data, list(range(n_clusters)))
 
+    # ── Merge per-cluster Surface Nets meshes into final mesh.ply ──
+    if config["depthmap_fusion_mesh_enabled"]:
+        merge.merge_mesh_batches(data, list(range(n_clusters)))
+
     # Composite the per-cluster DSM/ortho tiles into the final raster.  Without
     # this each cluster's save would overwrite dsm.tif / ortho.tif and only the
     # last cluster processed would appear.

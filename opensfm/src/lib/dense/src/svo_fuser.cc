@@ -684,4 +684,12 @@ void SVOFuser::RenderDSMOrtho(float origin_x, float origin_y, float gsd,
       min_weight_, dsm_wall_cull_nz_, dsm_out, ortho_out, normals_out);
 }
 
+void SVOFuser::ExtractMesh(std::vector<Vec3f>* verts,
+                           std::vector<Vec3f>* normals, std::vector<int>* tris) {
+  if (!integrator_) {
+    throw std::runtime_error("SVOFuser::ExtractMesh: must call Fuse() first");
+  }
+  integrator_->ExtractMesh(min_weight_, voxel_size_, verts, normals, tris);
+}
+
 }  // namespace dense

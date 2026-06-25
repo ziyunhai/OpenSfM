@@ -1847,6 +1847,152 @@ void SVOIntegratorCL::RenderDSMOrtho(float origin_x, float origin_y, float gsd,
                           normals_out->data());
 }
 
+void SVOIntegratorCL::ExtractMesh(float min_weight, float voxel_size,
+                                  std::vector<Vec3f>* verts_out,
+                                  std::vector<Vec3f>* normals_out,
+                                  std::vector<int>* tris_out) {
+  verts_out->clear();
+  normals_out->clear();
+  tris_out->clear();
+  if (capacity_ == 0) {
+    return;
+  }
+
+  auto& dev = opencl::CLContext::Instance().Device(device_idx_);
+  auto& ctx = dev.context();
+  auto& queue = dev.queue();
+
+  // min_weight is the RAW weight threshold (svo_dc_vertex rescales it by
+  // WEIGHT_SCALE internally — mirror the DSM path, which passes it straight
+  // through, not the pre-scaled form svo_extract_points expects).
+  const size_t global = ((static_cast<size_t>(capacity_) + 255u) / 256u) * 256u;
+
+  // ---- Pass 0: one Surface Nets vertex per surface cube (per-slot). ----
+  cl::Buffer cl_vert(ctx, CL_MEM_READ_WRITE,
+                     static_cast<size_t>(capacity_) * 3 * sizeof(float));
+  {
+    cl::Kernel k(program_, "svo_dc_vertex");
+    k.setArg(0, cl_table_);
+    k.setArg(1, capacity_mask_);
+    k.setArg(2, capacity_);
+    k.setArg(3, cl_vert);
+    k.setArg(4, voxel_size);
+    k.setArg(5, min_weight);
+    queue.enqueueNDRangeKernel(k, cl::NullRange, cl::NDRange(global),
+                               cl::NDRange(256));
+  }
+
+  // ---- Pass 1: compact the per-slot vertices + assign indices. ----
+  // Each slot yields at most one vertex, so capacity bounds the count.
+  const size_t max_alloc = dev.device().getInfo<CL_DEVICE_MAX_MEM_ALLOC_SIZE>();
+  const uint32_t mem_limit_v = static_cast<uint32_t>(std::min<size_t>(
+      max_alloc / (3 * sizeof(float)), std::numeric_limits<uint32_t>::max()));
+  const uint32_t max_verts = std::min(capacity_, mem_limit_v);
+
+  cl::Buffer cl_vidx(ctx, CL_MEM_READ_WRITE,
+                     static_cast<size_t>(capacity_) * sizeof(int));
+  cl::Buffer cl_vpos(ctx, CL_MEM_READ_WRITE,
+                     static_cast<size_t>(max_verts) * 3 * sizeof(float));
+  cl::Buffer cl_vnrm(ctx, CL_MEM_READ_WRITE,
+                     static_cast<size_t>(max_verts) * 3 * sizeof(float));
+  cl::Buffer cl_vcount(ctx, CL_MEM_READ_WRITE, sizeof(uint32_t));
+  uint32_t zero = 0;
+  queue.enqueueWriteBuffer(cl_vcount, CL_TRUE, 0, sizeof(uint32_t), &zero);
+  {
+    cl::Kernel k(program_, "svo_dc_mesh_compact");
+    k.setArg(0, cl_table_);
+    k.setArg(1, capacity_);
+    k.setArg(2, cl_vert);
+    k.setArg(3, cl_vpos);
+    k.setArg(4, cl_vnrm);
+    k.setArg(5, cl_vidx);
+    k.setArg(6, cl_vcount);
+    k.setArg(7, max_verts);
+    queue.enqueueNDRangeKernel(k, cl::NullRange, cl::NDRange(global),
+                               cl::NDRange(256));
+  }
+  queue.finish();
+
+  uint32_t n_verts = 0;
+  queue.enqueueReadBuffer(cl_vcount, CL_TRUE, 0, sizeof(uint32_t), &n_verts);
+  if (n_verts > max_verts) {
+    std::ostringstream oss;
+    oss << "[SVOIntegratorCL] Warning: mesh vertex overflow, " << n_verts
+        << " > " << max_verts << ". Clamping (mesh will have gaps).";
+    foundation::LogWarning("dense", oss.str());
+    n_verts = max_verts;
+  }
+  if (n_verts == 0) {
+    return;
+  }
+
+  // ---- Pass 2: emit dual quads as indexed triangles. ----
+  // Each vertex-owning cube emits at most 3 quads = 6 triangles.
+  const uint64_t want_tris = static_cast<uint64_t>(n_verts) * 6ull;
+  const uint64_t tri_mem_limit = max_alloc / (3 * sizeof(int));
+  const uint32_t max_tris = static_cast<uint32_t>(
+      std::min<uint64_t>(want_tris, tri_mem_limit));
+
+  cl::Buffer cl_tris(ctx, CL_MEM_READ_WRITE,
+                     static_cast<size_t>(max_tris) * 3 * sizeof(int));
+  cl::Buffer cl_tcount(ctx, CL_MEM_READ_WRITE, sizeof(uint32_t));
+  queue.enqueueWriteBuffer(cl_tcount, CL_TRUE, 0, sizeof(uint32_t), &zero);
+  {
+    cl::Kernel k(program_, "svo_dc_mesh_faces");
+    k.setArg(0, cl_table_);
+    k.setArg(1, capacity_mask_);
+    k.setArg(2, capacity_);
+    k.setArg(3, cl_vert);
+    k.setArg(4, cl_vidx);
+    k.setArg(5, cl_tris);
+    k.setArg(6, cl_tcount);
+    k.setArg(7, max_tris);
+    queue.enqueueNDRangeKernel(k, cl::NullRange, cl::NDRange(global),
+                               cl::NDRange(256));
+  }
+  queue.finish();
+
+  uint32_t n_tris = 0;
+  queue.enqueueReadBuffer(cl_tcount, CL_TRUE, 0, sizeof(uint32_t), &n_tris);
+  if (n_tris > max_tris) {
+    std::ostringstream oss;
+    oss << "[SVOIntegratorCL] Warning: mesh triangle overflow, " << n_tris
+        << " > " << max_tris << ". Clamping.";
+    foundation::LogWarning("dense", oss.str());
+    n_tris = max_tris;
+  }
+
+  {
+    std::ostringstream oss;
+    oss << "[SVOIntegratorCL] GPU extracted mesh: " << n_verts << " verts, "
+        << n_tris << " tris";
+    foundation::LogInfo("dense", oss.str());
+  }
+
+  // ---- Read back compact vertices, normals, and triangle indices. ----
+  std::vector<float> host_v(static_cast<size_t>(n_verts) * 3);
+  std::vector<float> host_n(static_cast<size_t>(n_verts) * 3);
+  queue.enqueueReadBuffer(cl_vpos, CL_FALSE, 0, host_v.size() * sizeof(float),
+                          host_v.data());
+  queue.enqueueReadBuffer(cl_vnrm, CL_FALSE, 0, host_n.size() * sizeof(float),
+                          host_n.data());
+
+  verts_out->resize(n_verts);
+  normals_out->resize(n_verts);
+  tris_out->resize(static_cast<size_t>(n_tris) * 3);
+  if (n_tris > 0) {
+    queue.enqueueReadBuffer(cl_tris, CL_FALSE, 0,
+                            tris_out->size() * sizeof(int), tris_out->data());
+  }
+  queue.finish();
+
+  for (uint32_t i = 0; i < n_verts; ++i) {
+    (*verts_out)[i] = Vec3f(host_v[i * 3], host_v[i * 3 + 1], host_v[i * 3 + 2]);
+    (*normals_out)[i] =
+        Vec3f(host_n[i * 3], host_n[i * 3 + 1], host_n[i * 3 + 2]);
+  }
+}
+
 }  // namespace dense
 
 #endif  // OPENSFM_HAVE_OPENCL
