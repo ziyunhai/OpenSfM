@@ -1,5 +1,6 @@
 # pyre-strict
 import datetime
+import logging
 import math
 import os
 import random
@@ -23,6 +24,8 @@ import numpy as np
 from numpy.typing import NDArray
 from opensfm import feature_loader, geo, geometry, report, io, multiview, pygeometry, pymap, types
 from opensfm.dataset import DataSet, DataSetBase
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 RESIDUAL_PIXEL_CUTOFF = 4
 
@@ -754,6 +757,13 @@ def compute_all_statistics(
     stats["gcp_errors"] = gcp_errors(data, reconstructions)
     stats["opk_errors"] = opk_errors(reconstructions)
     stats["overlap"] = overlap_statistics(reconstructions, tracks_manager)
+
+    # CRS the georeferenced products are written in (GCP CRS if projected, else
+    # UTM from the reference) — the single decision shared with LAS/LAZ + DSM/ortho.
+    try:
+        stats["output_coordinate_system"] = data.output_coordinate_system()
+    except Exception:
+        logger.debug("Could not determine output coordinate system", exc_info=True)
 
     return stats
 

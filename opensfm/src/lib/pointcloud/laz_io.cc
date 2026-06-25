@@ -155,16 +155,24 @@ LAZWriter::LAZWriter(const std::string& path, const PointCloudHeader& header) {
   layout_.hasNormals = header.attrs.hasNormals;
   layout_.recordLength = static_cast<uint16_t>(
       RecordLayout::kBaseSize + (layout_.hasNormals ? 12 : 0));
+  // Honor an explicit offset (e.g. projected easting/northing, which would
+  // overflow the int32 encoding around offset 0) when given; else the data bbox.
+  const bool haveOffset = header.offset[0] != 0.0 || header.offset[1] != 0.0 ||
+                          header.offset[2] != 0.0;
   for (int a = 0; a < 3; ++a) {
     layout_.scale[a] = (header.scale[a] > 0.0) ? header.scale[a] : 0.001;
-    layout_.offset[a] = header.hasAabb ? header.aabbMin[a] : 0.0;
+    layout_.offset[a] = haveOffset ? header.offset[a]
+                        : (header.hasAabb ? header.aabbMin[a] : 0.0);
   }
+
+  const bool hasWkt = !header.crsWkt.empty();
 
   laszip_header* h = nullptr;
   if (laszip_get_header_pointer(LZ(laszip_), &h) || !h) fail("get_header_pointer");
   h->version_major = 1;
   h->version_minor = 4;
-  h->global_encoding = 1;  // GPS standard time
+  // GPS standard time (bit 0) + OGC WKT CRS (bit 4) when a CRS is embedded.
+  h->global_encoding = static_cast<laszip_U16>(1 | (hasWkt ? 0x10 : 0));
   h->header_size = 375;
   // laszip_create defaults the header to LAS 1.2 (offset_to_point_data = 227).
   // It never re-derives the base offset from header_size; laszip_add_vlr only
@@ -192,6 +200,16 @@ LAZWriter::LAZWriter(const std::string& path, const PointCloudHeader& header) {
     const uint8_t* descr = vlr.data() + kVlrHeaderSize;
     laszip_U16 descrLen = static_cast<laszip_U16>(vlr.size() - kVlrHeaderSize);
     if (laszip_add_vlr(LZ(laszip_), "LASF_Spec", 4, descrLen, "normals", descr))
+      fail("add_vlr");
+  }
+
+  // CRS → OGC WKT VLR (null-terminated payload, record id 2112).
+  if (hasWkt) {
+    std::vector<laszip_U8> wkt(header.crsWkt.begin(), header.crsWkt.end());
+    wkt.push_back(0);
+    if (laszip_add_vlr(LZ(laszip_), "LASF_Projection", 2112,
+                       static_cast<laszip_U16>(wkt.size()), "OGC WKT",
+                       wkt.data()))
       fail("add_vlr");
   }
 

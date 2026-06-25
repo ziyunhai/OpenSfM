@@ -2,6 +2,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <array>
 #include <memory>
 #include <stdexcept>
 
@@ -212,7 +213,24 @@ Returns:
       .def_property(
           "has_labels",
           [](const pointcloud::PointCloudHeader& h) { return h.attrs.hasLabels; },
-          [](pointcloud::PointCloudHeader& h, bool v) { h.attrs.hasLabels = v; });
+          [](pointcloud::PointCloudHeader& h, bool v) { h.attrs.hasLabels = v; })
+      .def_readwrite("crs_wkt", &pointcloud::PointCloudHeader::crsWkt)
+      .def_property(
+          "offset",
+          [](const pointcloud::PointCloudHeader& h) {
+            return py::make_tuple(h.offset[0], h.offset[1], h.offset[2]);
+          },
+          [](pointcloud::PointCloudHeader& h, const std::array<double, 3>& v) {
+            h.offset[0] = v[0]; h.offset[1] = v[1]; h.offset[2] = v[2];
+          })
+      .def_property(
+          "scale",
+          [](const pointcloud::PointCloudHeader& h) {
+            return py::make_tuple(h.scale[0], h.scale[1], h.scale[2]);
+          },
+          [](pointcloud::PointCloudHeader& h, const std::array<double, 3>& v) {
+            h.scale[0] = v[0]; h.scale[1] = v[1]; h.scale[2] = v[2];
+          });
 
   py::class_<pointcloud::PointCloudReader>(m, "PointCloudReader")
       .def_property_readonly("total_count",

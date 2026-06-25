@@ -565,8 +565,11 @@ class Report:
              if geo_string else self.locale.t("none")],
         ]
 
-        horiz_crs, vert_crs = geo.nicify_crs(self.stats.get(
-            "gcp_errors", {}).get("coordinate_system", ""))
+        # CRS of the georeferenced products (centralized decision: GCP CRS if
+        # projected, else UTM).  Fall back to the GCP CRS for older stats files.
+        output_crs = self.stats.get("output_coordinate_system") or self.stats.get(
+            "gcp_errors", {}).get("coordinate_system", "")
+        horiz_crs, vert_crs = geo.nicify_crs(output_crs)
 
         gcp_crs = f"{horiz_crs} | {vert_crs}"
         if gcp_crs:

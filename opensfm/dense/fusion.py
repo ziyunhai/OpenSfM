@@ -1231,7 +1231,7 @@ def fuse_clusters(
                     cat[filled & ~baked_mask] = (255, 210, 0)
                     data.save_ortho(
                         cat, dsm_origin_x, dsm_origin_y, dsm_gsd,
-                        reconstruction.reference, nodata_mask=~valid,
+                        nodata_mask=~valid,
                         path=data.ortho_cluster_file(batch_num).replace(
                             "ortho_cluster_", "ortho_dbg_cluster_"),
                     )
@@ -1304,17 +1304,15 @@ def fuse_clusters(
             )
 
             # Debug: also dump this cluster's own DSM+ortho window as standalone
-            # georeferenced GeoTIFFs (they overlay the final raster in GIS), to
+            # (topocentric, untagged) GeoTIFFs that overlay the final raster, to
             # isolate per-cluster boundary / grazing-bake artefacts.
             if config.get("dsm_save_cluster_tiles", False):
                 data.save_dsm(
                     dsm_grid, dsm_origin_x, dsm_origin_y, dsm_gsd,
-                    reconstruction.reference,
                     path=data.dsm_cluster_file(batch_num),
                 )
                 data.save_ortho(
                     ortho_tile, dsm_origin_x, dsm_origin_y, dsm_gsd,
-                    reconstruction.reference,
                     nodata_mask=np.isnan(dsm_grid),
                     path=data.ortho_cluster_file(batch_num),
                 )

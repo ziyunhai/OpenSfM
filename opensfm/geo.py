@@ -1,12 +1,13 @@
 # pyre-strict
 import logging
-from typing import Any, Dict, List, Optional, overload, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, overload, Sequence, Tuple, Union
 
 import numpy as np
 import pyproj
 import warnings
 
 from numpy.typing import NDArray
+from osgeo import osr, gdal
 from opensfm import pymap
 
 Scalars = Union[float, NDArray]
@@ -595,3 +596,374 @@ def gps_distance(
     dis = np.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2 + (z1 - z2) ** 2)
 
     return dis
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#  CRS helpers and GeoTIFF raster I/O (GDAL / OSR)
+#
+#  All DSM/ortho GeoTIFF reading and writing lives here so the dataset layer
+#  only owns file *paths* and delegates the raster work.
+# ─────────────────────────────────────────────────────────────────────────
+
+#: No-data value written to (and recognised in) DSM GeoTIFF bands.
+DSM_NODATA: float = -9999.0
+
+
+def utm_zone_from_lonlat(lon: float, lat: float) -> Tuple[int, bool]:
+    """UTM zone number and hemisphere for a position in degrees.
+
+    Returns ``(zone, north)`` where ``north`` is True for the northern
+    hemisphere.
+    """
+    zone = int((lon + 180.0) / 6.0) + 1
+    return zone, lat >= 0.0
+
+
+def utm_epsg_from_lonlat(lon: float, lat: float) -> int:
+    """WGS84 / UTM EPSG code for the zone containing the given lon/lat.
+
+    Northern hemisphere → 326xx, southern → 327xx.
+    """
+    zone, north = utm_zone_from_lonlat(lon, lat)
+    return (32600 if north else 32700) + zone
+
+
+def is_projected_crs(crs_str: Optional[str]) -> bool:
+    """True if ``crs_str`` is (or has a) projected horizontal CRS.
+
+    Geographic CRS (lat/lon degrees, e.g. WGS84 / EPSG:4326 / EPSG:4979) and
+    unparseable strings return False.  Compound CRS are judged by their
+    horizontal component.
+    """
+    if not crs_str or crs_str.upper() in ("WGS84", "EPSG:4326", "EPSG:4979"):
+        return False
+    try:
+        parsed = pymap.parse_gcp_projection_string(crs_str)
+        crs = pyproj.CRS(parsed if parsed else crs_str)
+        if crs.is_projected:
+            return True
+        if crs.is_compound and crs.sub_crs_list:
+            return bool(crs.sub_crs_list[0].is_projected)
+        return False
+    except Exception:
+        return False
+
+
+def decide_output_crs(
+    gcp_crs: Optional[str], reference: "TopocentricConverter"
+) -> str:
+    """Decide the CRS for georeferenced products (LAS/LAZ, DSM/ortho, report).
+
+    Use the GCP coordinate system when it is *projected*; otherwise (no GCP, or
+    GCPs given in a geographic CRS that can't make a metric product) fall back to
+    the UTM zone of the reconstruction reference.  Returns a CRS string usable by
+    both pyproj and OSR (the GCP string verbatim, or ``"EPSG:326xx"`` for UTM).
+    """
+    if gcp_crs is not None and is_projected_crs(gcp_crs):
+        return gcp_crs
+    return f"EPSG:{utm_epsg_from_lonlat(reference.lon, reference.lat)}"
+
+
+def crs_to_wkt(crs_str: str) -> str:
+    """WKT for a CRS given as EPSG code / proj string / WKT (via OSR)."""
+
+    srs = osr.SpatialReference()
+    if srs.SetFromUserInput(crs_str) != 0:
+        parsed = pymap.parse_gcp_projection_string(crs_str)
+        if not parsed or srs.SetFromUserInput(parsed) != 0:
+            raise ValueError(f"Could not parse CRS: {crs_str}")
+    return srs.ExportToWkt()
+
+
+def _bottom_up_geotransform(
+    origin_x: float, origin_y: float, gsd: float, height: int
+) -> Tuple[float, float, float, float, float, float]:
+    """GDAL geotransform for a north-up grid whose row 0 is the BOTTOM row.
+
+    ``origin_x`` / ``origin_y`` are the left / bottom edges of the grid.  GeoTIFF
+    rows run top→bottom, so the top-left Y is ``origin_y + height * gsd`` and the
+    pixel height is negative.
+    """
+    top_left_y = origin_y + height * gsd
+    return (origin_x, gsd, 0.0, top_left_y, 0.0, -gsd)
+
+
+def save_dsm_geotiff(
+    path: str,
+    grid: NDArray,
+    origin_x: float,
+    origin_y: float,
+    gsd: float,
+    srs_wkt: Optional[str] = None,
+    nodata: float = DSM_NODATA,
+) -> None:
+    """Save a DSM grid as a single-band float32 GeoTIFF.
+
+    Args:
+        path: output file path.
+        grid: (H, W) float32 array, NaN = no data (row 0 = bottom).
+        origin_x: X coordinate of the left edge of the grid.
+        origin_y: Y coordinate of the bottom edge of the grid.
+        gsd: ground sample distance in world units per pixel.
+        srs_wkt: CRS as WKT. None = no CRS written.
+        nodata: value written for NaN cells.
+    """
+
+    h, w = grid.shape
+    driver = gdal.GetDriverByName("GTiff")
+    ds = driver.Create(path, w, h, 1, gdal.GDT_Float32)
+    ds.SetGeoTransform(_bottom_up_geotransform(origin_x, origin_y, gsd, h))
+    if srs_wkt:
+        ds.SetProjection(srs_wkt)
+
+    band = ds.GetRasterBand(1)
+    band.SetNoDataValue(nodata)
+    out = np.where(np.isnan(grid), nodata, grid).astype(np.float32)
+    # Flip vertically: GeoTIFF row 0 = top, our grid row 0 = bottom.
+    band.WriteArray(np.flipud(out))
+    band.FlushCache()
+    ds = None  # close file
+
+
+def load_dsm_geotiff(path: str) -> Tuple[NDArray, Tuple[float, ...], str]:
+    """Load a DSM GeoTIFF.
+
+    Returns:
+        (grid, geotransform, crs_wkt): grid has NaN for no-data cells and is
+        flipped back to our convention (row 0 = bottom).
+    """
+
+    ds = gdal.Open(path, gdal.GA_ReadOnly)
+    if ds is None:
+        raise FileNotFoundError(f"DSM not found: {path}")
+    band = ds.GetRasterBand(1)
+    nodata = band.GetNoDataValue()
+    arr = band.ReadAsArray().astype(np.float32)
+    # Flip back: GeoTIFF row 0 = top → our convention row 0 = bottom.
+    arr = np.flipud(arr)
+    if nodata is not None:
+        arr[arr == nodata] = np.nan
+    gt = ds.GetGeoTransform()
+    wkt = ds.GetProjection() or ""
+    ds = None
+    return arr, gt, wkt
+
+
+def save_ortho_geotiff(
+    path: str,
+    image: NDArray,
+    origin_x: float,
+    origin_y: float,
+    gsd: float,
+    srs_wkt: Optional[str] = None,
+    nodata_mask: Optional[NDArray] = None,
+) -> None:
+    """Save an ortho image as a GeoTIFF (uint8 RGB, optional alpha).
+
+    Args:
+        image: (H, W, 3) uint8 array (row 0 = bottom).
+        origin_x: X coordinate of the left edge.
+        origin_y: Y coordinate of the bottom edge.
+        gsd: ground sample distance.
+        srs_wkt: CRS as WKT. None = no CRS written.
+        nodata_mask: optional (H, W) bool, True where there is no surface.  When
+            given, a 4th alpha band is written (0 = no-data / transparent,
+            255 = valid) so no-data is distinguishable from a genuine black pixel
+            and GIS tools can fill it.
+    """
+
+    h, w = image.shape[:2]
+    n_bands = 4 if nodata_mask is not None else 3
+    driver = gdal.GetDriverByName("GTiff")
+    ds = driver.Create(path, w, h, n_bands, gdal.GDT_Byte)
+    ds.SetGeoTransform(_bottom_up_geotransform(origin_x, origin_y, gsd, h))
+    if srs_wkt:
+        ds.SetProjection(srs_wkt)
+
+    # Flip vertically and write each band.
+    flipped = np.flipud(image)
+    for band_idx in range(3):
+        band = ds.GetRasterBand(band_idx + 1)
+        band.WriteArray(flipped[:, :, band_idx])
+        band.FlushCache()
+
+    if nodata_mask is not None:
+        alpha = np.where(np.flipud(nodata_mask), 0, 255).astype(np.uint8)
+        aband = ds.GetRasterBand(4)
+        aband.SetColorInterpretation(gdal.GCI_AlphaBand)
+        aband.WriteArray(alpha)
+        aband.FlushCache()
+    ds = None
+
+
+def save_dsm_ortho_streamed_geotiff(
+    dsm_path: str,
+    ortho_path: str,
+    gh: int,
+    gw: int,
+    origin_x: float,
+    origin_y: float,
+    gsd: float,
+    fill_band: Callable[[int, int], Tuple[NDArray, NDArray]],
+    band_rows: int,
+    srs_wkt: Optional[str] = None,
+    nodata: float = DSM_NODATA,
+    geotransform: Optional[Tuple[float, float,
+                                 float, float, float, float]] = None,
+) -> int:
+    """Write dsm + ortho GeoTIFFs band-by-band, never holding the full grid.
+
+    ``fill_band(row_start, row_end)`` returns this horizontal band's
+    ``(dsm_band (bh, gw) float32 with NaN = no-data, ortho_band (bh, gw, 3)
+    uint8)`` in our grid convention (row 0 = bottom).  This function owns the
+    GeoTIFF georeferencing, the vertical flip to GeoTIFF top-down order, the DSM
+    no-data value, and the ortho alpha band.  BIGTIFF is enabled so the rasters
+    can exceed 4 GB.  Returns the count of valid (non-NaN) cells.
+
+    ``geotransform`` overrides the default north-up transform (used to bake a
+    topocentric→projected affine, including rotation, into the raster).
+    """
+
+    opts = ["BIGTIFF=IF_SAFER"]
+    drv = gdal.GetDriverByName("GTiff")
+    dsm_ds = drv.Create(
+        dsm_path, int(gw), int(gh), 1, gdal.GDT_Float32, options=opts
+    )
+    ortho_ds = drv.Create(
+        ortho_path, int(gw), int(gh), 4, gdal.GDT_Byte, options=opts
+    )
+    if dsm_ds is None or ortho_ds is None:
+        raise RuntimeError("Failed to create DSM/ortho GeoTIFF(s)")
+
+    gt = geotransform or _bottom_up_geotransform(
+        origin_x, origin_y, gsd, int(gh))
+    dsm_ds.SetGeoTransform(gt)
+    ortho_ds.SetGeoTransform(gt)
+    if srs_wkt:
+        dsm_ds.SetProjection(srs_wkt)
+        ortho_ds.SetProjection(srs_wkt)
+
+    dsm_band = dsm_ds.GetRasterBand(1)
+    dsm_band.SetNoDataValue(nodata)
+    ortho_ds.GetRasterBand(4).SetColorInterpretation(gdal.GCI_AlphaBand)
+
+    n_valid = 0
+    for rs in range(0, int(gh), int(band_rows)):
+        re_ = min(int(gh), rs + int(band_rows))
+        dsm_b, ortho_b = fill_band(rs, re_)
+        valid = ~np.isnan(dsm_b)
+        n_valid += int(np.count_nonzero(valid))
+        # GeoTIFF row 0 = top; our row 0 = bottom → flip and place this band's
+        # window at yoff = gh - re_ (see save_dsm_geotiff for the full-grid case).
+        yoff = int(gh) - re_
+        out_dsm = np.where(valid, dsm_b, nodata).astype(np.float32)
+        dsm_band.WriteArray(np.flipud(out_dsm), 0, yoff)
+        of = np.flipud(ortho_b)
+        for b in range(3):
+            ortho_ds.GetRasterBand(b + 1).WriteArray(
+                np.ascontiguousarray(of[:, :, b]), 0, yoff
+            )
+        alpha = np.where(np.flipud(valid), 255, 0).astype(np.uint8)
+        ortho_ds.GetRasterBand(4).WriteArray(alpha, 0, yoff)
+
+    dsm_ds.FlushCache()
+    ortho_ds.FlushCache()
+    dsm_ds = None
+    ortho_ds = None
+    return n_valid
+
+
+def proj_affine_from_reference(
+    reference: "TopocentricConverter", output_crs: str
+) -> Tuple[NDArray, str, NDArray]:
+    """Linear transform from topocentric (reconstruction) coords to ``output_crs``.
+
+    Returns ``(T, wkt, origin)`` where ``T`` is the 4x4 affine mapping
+    topocentric ``(x, y, z)`` to projected ``(easting, northing, altitude)``
+    (local linearization at the reference, same model as ``export_geocoords``),
+    ``wkt`` is the CRS as WKT, and ``origin`` is the projected reference origin
+    (``T[:3, 3]``).
+    """
+    transformer = construct_proj_transformer(output_crs, inverse=True)
+    T = get_proj_transform_matrix(reference, transformer)
+    return T, crs_to_wkt(output_crs), T[:3, 3].copy()
+
+
+def save_dsm_ortho_streamed_georeferenced(
+    dsm_path: str,
+    ortho_path: str,
+    gh: int,
+    gw: int,
+    origin_x: float,
+    origin_y: float,
+    gsd: float,
+    fill_band: Callable[[int, int], Tuple[NDArray, NDArray]],
+    band_rows: int,
+    reference: "TopocentricConverter",
+    output_crs: str,
+    tmp_dsm_path: str,
+    tmp_ortho_path: str,
+) -> int:
+    """Write dsm + ortho GeoTIFFs georeferenced (north-up) in ``output_crs``.
+
+    The grid is built in the topocentric east/north frame, which is rotated
+    relative to a projected grid by the meridian convergence.  We bake the
+    topocentric→projected affine into a (rotated) source raster — its pixels
+    untouched, heights transformed to projected altitude — then ``gdal.Warp`` it
+    to a standard north-up grid in ``output_crs``.  Returns the valid-cell count.
+    """
+
+    T, wkt, _ = proj_affine_from_reference(reference, output_crs)
+    a00, a01, b0 = float(T[0, 0]), float(T[0, 1]), float(T[0, 3])
+    a10, a11, b1 = float(T[1, 0]), float(T[1, 1]), float(T[1, 3])
+    tz0, tz1, tz2, tz3 = (float(T[2, 0]), float(T[2, 1]),
+                          float(T[2, 2]), float(T[2, 3]))
+
+    # Geotransform mapping source pixel (col, row top-down) → projected (E, N):
+    # compose pixel→topocentric (north-up, row 0 = top) with topocentric→proj.
+    top_left_y = origin_y + gh * gsd
+    rotated_gt = (
+        a00 * origin_x + a01 * top_left_y + b0,   # E at pixel (0, 0)
+        a00 * gsd,                                # dE/dcol
+        -a01 * gsd,                               # dE/drow
+        a10 * origin_x + a11 * top_left_y + b1,   # N at pixel (0, 0)
+        a10 * gsd,                                # dN/dcol
+        -a11 * gsd,                               # dN/drow
+    )
+
+    cols_x = origin_x + (np.arange(gw) + 0.5) * gsd  # topo x per column centre
+
+    def fill_band_geo(rs: int, re_: int) -> Tuple[NDArray, NDArray]:
+        dsm_b, ortho_b = fill_band(rs, re_)
+        bh = re_ - rs
+        rows_y = origin_y + (rs + np.arange(bh) + 0.5) * gsd  # topo y per row
+        valid = ~np.isnan(dsm_b)
+        zp = (tz2 * dsm_b + (tz0 * cols_x)[None, :]
+              + (tz1 * rows_y)[:, None] + tz3)
+        return np.where(valid, zp, np.nan).astype(np.float32), ortho_b
+
+    n_valid = save_dsm_ortho_streamed_geotiff(
+        tmp_dsm_path, tmp_ortho_path, gh, gw, origin_x, origin_y, gsd,
+        fill_band_geo, band_rows, srs_wkt=wkt, geotransform=rotated_gt,
+    )
+
+    common = dict(
+        dstSRS=wkt, xRes=gsd, yRes=gsd, multithread=True,
+        creationOptions=["BIGTIFF=IF_SAFER"],
+    )
+    gdal.Warp(
+        dsm_path, tmp_dsm_path,
+        options=gdal.WarpOptions(
+            resampleAlg="bilinear", srcNodata=DSM_NODATA, dstNodata=DSM_NODATA,
+            **common,
+        ),
+    )
+    gdal.Warp(
+        ortho_path, tmp_ortho_path,
+        options=gdal.WarpOptions(resampleAlg="bilinear", **common),
+    )
+
+    drv = gdal.GetDriverByName("GTiff")
+    drv.Delete(tmp_dsm_path)
+    drv.Delete(tmp_ortho_path)
+    return n_valid

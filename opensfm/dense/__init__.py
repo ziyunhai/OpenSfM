@@ -17,7 +17,7 @@ inputs/outputs and sequences the stages.
 
 import logging
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from opensfm import context, pymap, pysfm, types
 from opensfm.dataset import UndistortedDataSet
@@ -300,9 +300,15 @@ def run_fusion(
 def run_merge(
     data: UndistortedDataSet,
     reconstruction: types.Reconstruction,
+    output_crs: Optional[str] = None,
 ) -> None:
     """Merge per-cluster fused PLYs and DSM/ortho tiles into the final products,
-    then export LAS/LAZ and octree tiles.  Needs no tracks graph."""
+    then export LAS/LAZ and octree tiles.  Needs no tracks graph.
+
+    When ``output_crs`` is given, the LAS/LAZ and DSM/ortho products are
+    reprojected to that CRS (georeferenced); otherwise they stay in the
+    topocentric frame.  ``fused.ply`` and the octree always stay topocentric.
+    """
     config = data.config
     _require_clustering(data, need_neighbors=False)
 
@@ -317,13 +323,16 @@ def run_merge(
     # last cluster processed would appear.
     if config["dsm_enabled"]:
         merge.merge_dsm_ortho_batches(
-            data, list(range(n_clusters)), reconstruction.reference
+            data, list(range(n_clusters)), reconstruction.reference,
+            output_crs=output_crs,
         )
 
     context.log_memory("phase 4 merge done")
 
     # Optionally also export the merged cloud as LAS / LAZ (archival/interchange).
-    merge.export_pointcloud_formats(data, config)
+    merge.export_pointcloud_formats(
+        data, config, reference=reconstruction.reference, output_crs=output_crs
+    )
 
     # Build octree tiles for the viewer.
     merge.export_octree_tiles(data, config)

@@ -14,8 +14,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.ndimage import distance_transform_edt
 
-from opensfm import io, pypointcloud
+from opensfm import geo, io, pypointcloud
 from opensfm.dataset import UndistortedDataSet
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -114,6 +115,7 @@ def merge_dsm_ortho_batches(
     data: UndistortedDataSet,
     batch_nums: List[int],
     reference: Optional[Any],
+    output_crs: Optional[str] = None,
 ) -> None:
     """Composite per-cluster DSM/ortho tiles into the final dsm.tif / ortho.tif.
 
@@ -135,8 +137,7 @@ def merge_dsm_ortho_batches(
     spot from the ground (the DSM staircase).  Otherwise (legacy) tiles are
     composited by hard **max-z**.
 
-    Tiles are deleted afterwards when ``depthmap_delete_fusion_batches`` is set,
-    matching the PLY batch cleanup.
+    Tiles are deleted afterwards when ``depthmap_delete_geotiff_batches`` is set.
     """
     present = [
         bn for bn in sorted(batch_nums)
@@ -152,8 +153,6 @@ def merge_dsm_ortho_batches(
         data.load_dsm_ortho_batch(present[0])
 
     feather = data.config.get("dsm_merge_feather", True)
-    if feather:
-        from scipy.ndimage import distance_transform_edt
 
     # Metadata pass: each tile's window offset + shape (one decompress each,
     # pixel data discarded), so the band loop below knows which tiles touch
@@ -258,14 +257,16 @@ def merge_dsm_ortho_batches(
 
     n_valid = data.save_dsm_ortho_streamed(
         gh, gw, origin_x, origin_y, gsd, fill_band, band_rows,
-        reference=reference,
+        reference=reference, output_crs=output_crs,
     )
+    crs_msg = f" in {output_crs}" if output_crs else " (topocentric)"
     logger.info(
         f"Merged {len(meta)} DSM/ortho tile(s) → {data.dsm_file()} / "
         f"{data.ortho_file()} ({n_valid} valid cells, band_rows={band_rows})"
+        f"{crs_msg}"
     )
 
-    if data.config.get("depthmap_delete_fusion_batches", True):
+    if data.config.get("depthmap_delete_geotiff_batches", True):
         for bn in present:
             data.io_handler.rm_if_exist(data.dsm_ortho_batch_file(bn))
         logger.info(f"Removed {len(present)} merged DSM/ortho tile(s)")
@@ -274,15 +275,21 @@ def merge_dsm_ortho_batches(
 def export_pointcloud_formats(
     data: UndistortedDataSet,
     config: Dict[str, Any],
+    reference: Optional[Any] = None,
+    output_crs: Optional[str] = None,
 ) -> None:
     """Stream the merged ``fused.ply`` into LAS and/or LAZ when configured.
 
-    fused.ply stays the canonical product / octree input; these are additional
-    archival/interchange copies.  The PLY is read with plain buffered file reads
-    in fixed-size record chunks (NOT memory-mapped), so an arbitrarily large
-    cloud never has its page cache balloon resident — the cause of OOM on the
-    previous mmap-based reader.  The LAS/LAZ writers already stream to disk.  Any
-    failure is logged without aborting the pipeline.
+    fused.ply stays the canonical product / octree input (topocentric); these are
+    additional archival/interchange copies.  When ``output_crs`` (and
+    ``reference``) are given the points/normals are reprojected to that CRS and
+    the CRS is embedded in the LAS/LAZ header; otherwise they stay topocentric.
+
+    The PLY is read with plain buffered file reads in fixed-size record chunks
+    (NOT memory-mapped), so an arbitrarily large cloud never has its page cache
+    balloon resident — the cause of OOM on the previous mmap-based reader.  The
+    LAS/LAZ writers already stream to disk.  Any failure is logged without
+    aborting the pipeline.
     """
     formats = []
     if config.get("dense_pointcloud_export_las", False):
@@ -297,6 +304,18 @@ def export_pointcloud_formats(
         logger.warning("No fused.ply found; skipping LAS/LAZ export.")
         return
 
+    # Optional reprojection topocentric → output CRS (positions + normals).
+    crs_wkt = ""
+    offset = None
+    A = b = None
+    if output_crs is not None and reference is not None:
+        T, crs_wkt, origin = geo.proj_affine_from_reference(
+            reference, output_crs)
+        A, b = T[:3, :3], T[:3, 3]
+        # Place the LAS integer offset near the data; projected eastings/northings
+        # would otherwise overflow the int32 (value-offset)/scale encoding.
+        offset = np.floor(origin).tolist()
+
     rec = _PLY_ROW_DT.itemsize
     chunk_pts = 1_000_000
     # fused.ply always carries the full dense layout (xyz + normal + rgb + class).
@@ -310,6 +329,9 @@ def export_pointcloud_formats(
                 header.has_normals = True
                 header.has_colors = True
                 header.has_labels = True
+                if crs_wkt:
+                    header.crs_wkt = crs_wkt
+                    header.offset = offset
                 writer = pypointcloud.open_writer(out_path, header)
 
                 written = 0
@@ -322,7 +344,14 @@ def export_pointcloud_formats(
                         buf, dtype=_PLY_ROW_DT, count=len(buf) // rec
                     )
                     pos = rows["f"][:, :3].astype(np.float64)
-                    nrm = np.ascontiguousarray(rows["f"][:, 3:])
+                    nrm = np.ascontiguousarray(
+                        rows["f"][:, 3:]).astype(np.float32)
+                    if A is not None:
+                        pos = pos @ A.T + b
+                        nrm = nrm @ A.T
+                        norms = np.linalg.norm(nrm, axis=1, keepdims=True)
+                        np.divide(nrm, norms, out=nrm, where=norms > 0)
+                        nrm = np.ascontiguousarray(nrm, dtype=np.float32)
                     col = np.ascontiguousarray(rows["c"][:, :3])
                     lbl = np.ascontiguousarray(rows["c"][:, 3])
                     writer.write_chunk(
@@ -331,7 +360,10 @@ def export_pointcloud_formats(
                     written += len(rows)
                     del buf, rows, pos, nrm, col, lbl
                 writer.finalize()
-            logger.info(f"Exported {written} points to fused.{fmt} (streamed)")
+            crs_msg = f" in {output_crs}" if crs_wkt else " (topocentric)"
+            logger.info(
+                f"Exported {written} points to fused.{fmt} (streamed){crs_msg}"
+            )
         except Exception:
             logger.warning(f"Failed to export fused.{fmt}", exc_info=True)
 

@@ -48,6 +48,9 @@ struct PointCloudHeader {
   // LAS scale/offset hints (0 scale → auto-derive). Ignored by PLY.
   double scale[3]{0, 0, 0};
   double offset[3]{0, 0, 0};
+  // CRS as OGC WKT.  When non-empty the LAS/LAZ writers embed it (WKT VLR +
+  // global-encoding WKT bit) so the file is self-describing.  Ignored by PLY.
+  std::string crsWkt;
 };
 
 class PointCloudReader {

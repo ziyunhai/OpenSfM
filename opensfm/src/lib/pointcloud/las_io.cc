@@ -115,6 +115,20 @@ std::vector<uint8_t> buildNormalExtraBytesVlr() {
   return v;
 }
 
+std::vector<uint8_t> buildWktVlr(const std::string& wkt) {
+  if (wkt.empty()) return {};
+  // Payload is the null-terminated WKT string (record length includes the \0).
+  const uint16_t payload = static_cast<uint16_t>(wkt.size() + 1);
+  std::vector<uint8_t> v(kVlrHeaderSize + payload, 0);
+  std::memcpy(v.data() + 2, "LASF_Projection", 15);  // user id
+  put<uint16_t>(v.data() + 18, 2112);                 // record id = OGC WKT
+  put<uint16_t>(v.data() + 20, payload);
+  const char* desc = "OGC WKT";
+  std::memcpy(v.data() + 22, desc, std::strlen(desc));
+  std::memcpy(v.data() + kVlrHeaderSize, wkt.data(), wkt.size());  // + trailing \0
+  return v;
+}
+
 }  // namespace las_detail
 
 // ── LASReader ────────────────────────────────────────────────────────────────
@@ -229,25 +243,38 @@ LASWriter::LASWriter(const std::string& path, const PointCloudHeader& header)
   layout_.hasNormals = header.attrs.hasNormals;
   layout_.recordLength = static_cast<uint16_t>(
       RecordLayout::kBaseSize + (layout_.hasNormals ? 12 : 0));
+  // Honor an explicit offset (e.g. projected easting/northing, which would
+  // overflow the int32 encoding around offset 0) when given; otherwise place it
+  // near the data bbox, else 0 (fine for local topocentric coordinates).
+  const bool haveOffset = header.offset[0] != 0.0 || header.offset[1] != 0.0 ||
+                          header.offset[2] != 0.0;
   for (int a = 0; a < 3; ++a) {
     layout_.scale[a] = (header.scale[a] > 0.0) ? header.scale[a] : 0.001;
-    // Offset near the data when a bbox is known; else 0 (fine for local
-    // topocentric coordinates: ±2.1e6 m at 1 mm scale).
-    layout_.offset[a] = header.hasAabb ? std::floor(header.aabbMin[a]) : 0.0;
+    layout_.offset[a] = haveOffset ? header.offset[a]
+                        : (header.hasAabb ? std::floor(header.aabbMin[a]) : 0.0);
   }
 
-  numVlrs_ = layout_.hasNormals ? 1u : 0u;
+  auto wktVlr = buildWktVlr(header.crsWkt);
+  const bool hasWkt = !wktVlr.empty();
+  numVlrs_ = (layout_.hasNormals ? 1u : 0u) + (hasWkt ? 1u : 0u);
   uint32_t vlrBytes =
-      layout_.hasNormals ? (kVlrHeaderSize + 3 * kExtraByteDescrSize) : 0u;
+      (layout_.hasNormals ? (kVlrHeaderSize + 3 * kExtraByteDescrSize) : 0u) +
+      static_cast<uint32_t>(wktVlr.size());
   pointDataOffset_ = kHeaderSize + vlrBytes;
 
   auto h = buildPublicHeader(layout_, numVlrs_, pointDataOffset_);
+  // LAS 1.4 PDRF 6-10 carry their CRS as OGC WKT; flag it in global encoding.
+  if (hasWkt) h[6] = static_cast<uint8_t>(h[6] | 0x10);  // WKT bit
   out_.write(reinterpret_cast<const char*>(h.data()),
              static_cast<std::streamsize>(h.size()));
   if (layout_.hasNormals) {
     auto vlr = buildNormalExtraBytesVlr();
     out_.write(reinterpret_cast<const char*>(vlr.data()),
                static_cast<std::streamsize>(vlr.size()));
+  }
+  if (hasWkt) {
+    out_.write(reinterpret_cast<const char*>(wktVlr.data()),
+               static_cast<std::streamsize>(wktVlr.size()));
   }
   headerOk_ = out_.good();
 }

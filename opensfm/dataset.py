@@ -669,6 +669,18 @@ class DataSet(DataSetBase):
         geo.log_vertical_datum(result)
         return result
 
+    def output_coordinate_system(self) -> str:
+        """CRS used for georeferenced products (LAS/LAZ, DSM/ortho, report).
+
+        Centralizes the choice: the GCP coordinate system when it is projected,
+        otherwise the UTM zone of the reconstruction reference (see
+        ``geo.decide_output_crs``).  Returned as an EPSG/proj/WKT string usable by
+        both pyproj and OSR.
+        """
+        return geo.decide_output_crs(
+            self.load_gcp_coordinate_system(), self.load_reference()
+        )
+
     def save_ground_control_points(
         self,
         points: List[pymap.GroundControlPoint],
@@ -1101,76 +1113,23 @@ class UndistortedDataSet:
         origin_x: float,
         origin_y: float,
         gsd: float,
-        reference: Optional["geo.TopocentricConverter"] = None,
+        srs_wkt: Optional[str] = None,
         path: Optional[str] = None,
     ) -> None:
-        """Save a DSM grid as a GeoTIFF.
+        """Save a DSM grid as a GeoTIFF (see ``geo.save_dsm_geotiff``).
 
-        Args:
-            grid: (H, W) float32 array. NaN = no data.
-            origin_x: X coordinate of the left edge of the grid.
-            origin_y: Y coordinate of the bottom edge of the grid.
-            gsd: ground sample distance in world units per pixel.
-            reference: topocentric reference for CRS (UTM). None = no CRS.
-            path: output path; defaults to the final ``dsm.tif`` (override for
-                per-cluster debug tiles).
+        ``srs_wkt`` tags the raster's CRS; None leaves it untagged (topocentric).
+        ``path`` defaults to the final ``dsm.tif`` (override for per-cluster
+        debug tiles).
         """
-        from osgeo import gdal, osr
-
         self.io_handler.mkdir_p(self._depthmap_path())
-        path = path or self.dsm_file()
-        h, w = grid.shape
-
-        driver = gdal.GetDriverByName("GTiff")
-        ds = driver.Create(path, w, h, 1, gdal.GDT_Float32)
-
-        # GeoTransform: (top-left X, pixel width, 0, top-left Y, 0, -pixel height)
-        # origin_y is bottom edge, so top-left Y = origin_y + H * gsd
-        top_left_y = origin_y + h * gsd
-        ds.SetGeoTransform((origin_x, gsd, 0.0, top_left_y, 0.0, -gsd))
-
-        # Set CRS if reference available.
-        if reference is not None:
-            srs = osr.SpatialReference()
-            utm_zone = int((reference.lon + 180.0) / 6.0) + 1
-            north = reference.lat >= 0.0
-            srs.SetUTM(utm_zone, north)
-            srs.SetWellKnownGeogCS("WGS84")
-            ds.SetProjection(srs.ExportToWkt())
-
-        band = ds.GetRasterBand(1)
-        nodata = -9999.0
-        band.SetNoDataValue(nodata)
-
-        # Replace NaN with nodata value.
-        out = np.where(np.isnan(grid), nodata, grid).astype(np.float32)
-        # Flip vertically: GeoTIFF row 0 = top, our grid row 0 = bottom.
-        band.WriteArray(np.flipud(out))
-        band.FlushCache()
-        ds = None  # close file
+        geo.save_dsm_geotiff(
+            path or self.dsm_file(), grid, origin_x, origin_y, gsd, srs_wkt
+        )
 
     def load_dsm(self) -> Tuple[NDArray, Tuple[float, ...], str]:
-        """Load DSM from GeoTIFF.
-
-        Returns:
-            (grid, geotransform, crs_wkt): grid has NaN for no-data cells.
-        """
-        from osgeo import gdal
-
-        ds = gdal.Open(self.dsm_file(), gdal.GA_ReadOnly)
-        if ds is None:
-            raise FileNotFoundError(f"DSM not found: {self.dsm_file()}")
-        band = ds.GetRasterBand(1)
-        nodata = band.GetNoDataValue()
-        arr = band.ReadAsArray().astype(np.float32)
-        # Flip back: GeoTIFF row 0 = top → our convention row 0 = bottom.
-        arr = np.flipud(arr)
-        if nodata is not None:
-            arr[arr == nodata] = np.nan
-        gt = ds.GetGeoTransform()
-        wkt = ds.GetProjection() or ""
-        ds = None
-        return arr, gt, wkt
+        """Load DSM from GeoTIFF (see ``geo.load_dsm_geotiff``)."""
+        return geo.load_dsm_geotiff(self.dsm_file())
 
     def ortho_file(self) -> str:
         return os.path.join(self._depthmap_path(), "ortho.tif")
@@ -1181,60 +1140,21 @@ class UndistortedDataSet:
         origin_x: float,
         origin_y: float,
         gsd: float,
-        reference: Optional["geo.TopocentricConverter"] = None,
+        srs_wkt: Optional[str] = None,
         nodata_mask: Optional[NDArray] = None,
         path: Optional[str] = None,
     ) -> None:
-        """Save an ortho image as a GeoTIFF (uint8 RGB, optional alpha).
+        """Save an ortho image as a GeoTIFF (see ``geo.save_ortho_geotiff``).
 
-        Args:
-            image: (H, W, 3) uint8 array.
-            origin_x: X coordinate of the left edge.
-            origin_y: Y coordinate of the bottom edge.
-            gsd: ground sample distance.
-            reference: topocentric reference for CRS.
-            nodata_mask: optional (H, W) bool, True where there is no surface.
-                When given, a 4th alpha band is written (0 = no-data /
-                transparent, 255 = valid) so no-data is distinguishable from a
-                genuine black pixel and GIS tools can fill it.
-            path: output path; defaults to the final ``ortho.tif`` (override for
-                per-cluster debug tiles).
+        ``srs_wkt`` tags the raster's CRS; None leaves it untagged (topocentric).
+        ``path`` defaults to the final ``ortho.tif`` (override for per-cluster
+        tiles).
         """
-        from osgeo import gdal, osr
-
         self.io_handler.mkdir_p(self._depthmap_path())
-        path = path or self.ortho_file()
-        h, w = image.shape[:2]
-
-        n_bands = 4 if nodata_mask is not None else 3
-        driver = gdal.GetDriverByName("GTiff")
-        ds = driver.Create(path, w, h, n_bands, gdal.GDT_Byte)
-
-        top_left_y = origin_y + h * gsd
-        ds.SetGeoTransform((origin_x, gsd, 0.0, top_left_y, 0.0, -gsd))
-
-        if reference is not None:
-            srs = osr.SpatialReference()
-            utm_zone = int((reference.lon + 180.0) / 6.0) + 1
-            north = reference.lat >= 0.0
-            srs.SetUTM(utm_zone, north)
-            srs.SetWellKnownGeogCS("WGS84")
-            ds.SetProjection(srs.ExportToWkt())
-
-        # Flip vertically and write each band.
-        flipped = np.flipud(image)
-        for band_idx in range(3):
-            band = ds.GetRasterBand(band_idx + 1)
-            band.WriteArray(flipped[:, :, band_idx])
-            band.FlushCache()
-
-        if nodata_mask is not None:
-            alpha = np.where(np.flipud(nodata_mask), 0, 255).astype(np.uint8)
-            aband = ds.GetRasterBand(4)
-            aband.SetColorInterpretation(gdal.GCI_AlphaBand)
-            aband.WriteArray(alpha)
-            aband.FlushCache()
-        ds = None
+        geo.save_ortho_geotiff(
+            path or self.ortho_file(), image, origin_x, origin_y, gsd,
+            srs_wkt, nodata_mask=nodata_mask,
+        )
 
     def save_dsm_ortho_streamed(
         self,
@@ -1246,72 +1166,27 @@ class UndistortedDataSet:
         fill_band: "Any",
         band_rows: int,
         reference: Optional["geo.TopocentricConverter"] = None,
+        output_crs: Optional[str] = None,
     ) -> int:
         """Write dsm.tif + ortho.tif band-by-band, never holding the full grid.
 
-        ``fill_band(row_start, row_end)`` returns this horizontal band's
-        ``(dsm_band (bh, gw) float32 with NaN = no-data, ortho_band (bh, gw, 3)
-        uint8)`` in our grid convention (row 0 = bottom).  This method owns the
-        GeoTIFF georeferencing, the vertical flip to GeoTIFF top-down order, the
-        DSM no-data value, and the ortho alpha band.  BIGTIFF is enabled so the
-        rasters can exceed 4 GB.  Returns the count of valid (non-NaN) cells.
+        When ``output_crs`` is given (with ``reference``), the rasters are
+        reprojected to that CRS, north-up (see
+        ``geo.save_dsm_ortho_streamed_georeferenced``).  Otherwise the grid stays
+        in topocentric coordinates with no CRS tag.  Returns the valid-cell count.
         """
-        from osgeo import gdal, osr
-
         self.io_handler.mkdir_p(self._depthmap_path())
-        opts = ["BIGTIFF=IF_SAFER"]
-        drv = gdal.GetDriverByName("GTiff")
-        dsm_ds = drv.Create(
-            self.dsm_file(), int(gw), int(gh), 1, gdal.GDT_Float32, options=opts
+        if output_crs is not None and reference is not None:
+            return geo.save_dsm_ortho_streamed_georeferenced(
+                self.dsm_file(), self.ortho_file(), gh, gw, origin_x, origin_y,
+                gsd, fill_band, band_rows, reference, output_crs,
+                tmp_dsm_path=self.dsm_file() + ".topo.tif",
+                tmp_ortho_path=self.ortho_file() + ".topo.tif",
+            )
+        return geo.save_dsm_ortho_streamed_geotiff(
+            self.dsm_file(), self.ortho_file(), gh, gw, origin_x, origin_y,
+            gsd, fill_band, band_rows, srs_wkt=None,
         )
-        ortho_ds = drv.Create(
-            self.ortho_file(), int(gw), int(gh), 4, gdal.GDT_Byte, options=opts
-        )
-        if dsm_ds is None or ortho_ds is None:
-            raise RuntimeError("Failed to create DSM/ortho GeoTIFF(s)")
-
-        top_left_y = origin_y + gh * gsd
-        gt = (origin_x, gsd, 0.0, top_left_y, 0.0, -gsd)
-        dsm_ds.SetGeoTransform(gt)
-        ortho_ds.SetGeoTransform(gt)
-        if reference is not None:
-            srs = osr.SpatialReference()
-            utm_zone = int((reference.lon + 180.0) / 6.0) + 1
-            srs.SetUTM(utm_zone, reference.lat >= 0.0)
-            srs.SetWellKnownGeogCS("WGS84")
-            wkt = srs.ExportToWkt()
-            dsm_ds.SetProjection(wkt)
-            ortho_ds.SetProjection(wkt)
-
-        nodata = -9999.0
-        dsm_band = dsm_ds.GetRasterBand(1)
-        dsm_band.SetNoDataValue(nodata)
-        ortho_ds.GetRasterBand(4).SetColorInterpretation(gdal.GCI_AlphaBand)
-
-        n_valid = 0
-        for rs in range(0, int(gh), int(band_rows)):
-            re_ = min(int(gh), rs + int(band_rows))
-            dsm_b, ortho_b = fill_band(rs, re_)
-            valid = ~np.isnan(dsm_b)
-            n_valid += int(np.count_nonzero(valid))
-            # GeoTIFF row 0 = top; our row 0 = bottom → flip and place this band's
-            # window at yoff = gh - re_ (see save_dsm for the full-grid case).
-            yoff = int(gh) - re_
-            out_dsm = np.where(valid, dsm_b, nodata).astype(np.float32)
-            dsm_band.WriteArray(np.flipud(out_dsm), 0, yoff)
-            of = np.flipud(ortho_b)
-            for b in range(3):
-                ortho_ds.GetRasterBand(b + 1).WriteArray(
-                    np.ascontiguousarray(of[:, :, b]), 0, yoff
-                )
-            alpha = np.where(np.flipud(valid), 255, 0).astype(np.uint8)
-            ortho_ds.GetRasterBand(4).WriteArray(alpha, 0, yoff)
-
-        dsm_ds.FlushCache()
-        ortho_ds.FlushCache()
-        dsm_ds = None
-        ortho_ds = None
-        return n_valid
 
     # ── Per-cluster DSM/ortho tiles (composited into the final raster) ──
     def dsm_ortho_batch_file(self, batch_num: int) -> str:

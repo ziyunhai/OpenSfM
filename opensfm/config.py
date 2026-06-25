@@ -436,8 +436,9 @@ class OpenSfMConfig:
     # so this is lossless; disable to keep raw maps for inspection/re-cleaning.
     depthmap_delete_raw_after_clean: bool = True
     # Delete per-cluster fused_batch_*.ply once they are merged into fused.ply.
-    # They are fully consumed by the merge and redundant afterwards.
     depthmap_delete_fusion_batches: bool = True
+    # Delete per-cluster DSM/ortho tiles once they are merged into the final DSM/ortho.
+    depthmap_delete_geotiff_batches: bool = False
     # Additionally export the merged dense cloud as LAS / LAZ (next to fused.ply).
     dense_pointcloud_export_las: bool = True
     dense_pointcloud_export_laz: bool = True

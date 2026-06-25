@@ -49,6 +49,9 @@ std::vector<uint8_t> buildPublicHeader(const RecordLayout& layout,
                                        uint32_t offsetToPointData);
 // Build the Extra Bytes VLR (54-byte header + 3×192-byte nx/ny/nz f32 descrs).
 std::vector<uint8_t> buildNormalExtraBytesVlr();
+// Build the OGC Coordinate System WKT VLR (LASF_Projection, record id 2112).
+// The payload is the null-terminated WKT.  Empty input → empty vector.
+std::vector<uint8_t> buildWktVlr(const std::string& wkt);
 
 constexpr int kHeaderSize = 375;
 constexpr int kVlrHeaderSize = 54;
