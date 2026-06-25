@@ -33,7 +33,7 @@ Large scene support via submodel splitting/merging, rig constraints for multi-ca
 
 **Exports**
 
-COLMAP, Bundler, OpenMVS, PMVS, VisualSFM, PLY, LAS/LAZ, GeoJSON, GeoTIFF. In addition, a detailed quality report can be created and exported as a PDF file (see [Reporting](doc/reporting.md))
+COLMAP, Bundler, OpenMVS, PMVS, VisualSFM, PLY, LAS/LAZ, GeoJSON, GeoTIFF. In addition, a detailed quality report can be created and exported as a PDF file (see [reporting](doc/reporting.md) and [example report](doc/images/report.pdf))
 
 ![DSM and Ortho Extraction](doc/images/dsm_ortho.png)
 
@@ -99,3 +99,5 @@ bin\opensfm_run_all.bat path\to\dataset  # Windows
 
 ## License
 OpenSfM is BSD-style licensed, as found in the LICENSE file.
+
+Example data in the README is under [Creative Commons CC-BY 4.0 License](https://creativecommons.org/licenses/by/4.0/) by Wingtra AG, 8045 Zürich, Switzerland.
