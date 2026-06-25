@@ -1,3 +1,6 @@
+![OpenSfM](doc/images/logo_small.png)
+
+
 OpenSfM
 =======
 [![Conda](https://github.com/OpenSfM/OpenSfM/actions/workflows/conda.yml/badge.svg)](https://github.com/OpenSfM/OpenSfM/actions/workflows/conda.yml) [![Docker Ubuntu 20.04](https://github.com/OpenSfM/OpenSfM/actions/workflows/docker_ubuntu20.yml/badge.svg)](https://github.com/OpenSfM/OpenSfM/actions/workflows/docker_ubuntu20.yml) [![Docker Ubuntu 24.04](https://github.com/OpenSfM/OpenSfM/actions/workflows/docker_ubuntu24.yml/badge.svg)](https://github.com/OpenSfM/OpenSfM/actions/workflows/docker_ubuntu24.yml) [![Coverage](./badges/coverage.svg)](https://github.com/OpenSfM/OpenSfM/actions/workflows/coverage.yml)
@@ -8,18 +11,37 @@ This repository is an attempt at continuing the original [OpenSfM](https://githu
 ## Overview
 OpenSfM is an open-source Structure from Motion (SfM) library written in Python with performance-critical code in C++. It reconstructs camera poses and 3D point clouds from unordered image collections, but also produces dense point clouds, or 2D maps (DSM, Orthophotos)
 
-**Core pipeline** — feature detection (SIFT, HAHOG, AKAZE, SURF, ORB), pairwise matching (OpenCL) with geometric verification, track building, incremental and direct aerotriangulation reconstruction with robust bundle adjustment ([Ceres](http://ceres-solver.org/)-based), and GPS/GCP-constrained alignment and coordinate systems shifts compensation.
+**Core pipeline**
 
-**Camera models** — perspective, brown, fisheye (OpenCV model, and customs 62 and 624 parameters), spherical/equirectangular, and dual. See [geometry](doc/geometry.md).
+Feature detection (SIFT, HAHOG, AKAZE, SURF, ORB), pairwise matching (OpenCL) with geometric verification, track building, incremental and direct aerotriangulation reconstruction with robust bundle adjustment ([Ceres](http://ceres-solver.org/)-based), and GPS/GCP-constrained alignment and coordinate systems shifts compensation.
 
-**Dense reconstruction** — multi-view depth estimation via GPU PatchMatch (OpenCL), SVO-vased TSDF depth fusion and refinement, DSM and Orthophoto generation.
+![SfM Reconstruction](doc/images/viewer.png)
 
-**Scalability** — large scene support via submodel splitting/merging, rig constraints for multi-camera setups, and configurable multi-processing.
+**Camera models**
 
-**Exports** — COLMAP, Bundler, OpenMVS, PMVS, VisualSFM, PLY, LAS/LAZ, GeoJSON, GeoTIFF. In addition, a detailed quality report can be created and exported as a PDF file (see [Reporting](doc/reporting.md))
+Perspective, brown, fisheye (OpenCV model, and customs 62 and 624 parameters), spherical/equirectangular, and dual. See [geometry](doc/geometry.md).
 
-**Visualisation** —
+**Dense reconstruction**
+
+Multi-view depth estimation via GPU PatchMatch (OpenCL), SVO-vased TSDF depth fusion and refinement, DSM and Orthophoto generation.
+
+![Dense Reconstruction](doc/images/dense.png)
+
+**Scalability**
+
+Large scene support via submodel splitting/merging, rig constraints for multi-camera setups, and configurable multi-processing.
+
+**Exports**
+
+COLMAP, Bundler, OpenMVS, PMVS, VisualSFM, PLY, LAS/LAZ, GeoJSON, GeoTIFF. In addition, a detailed quality report can be created and exported as a PDF file (see [Reporting](doc/reporting.md))
+
+![DSM and Ortho Extraction](doc/images/dsm_ortho.png)
+
+**Visualisation**
+
 A built-in JavaScript viewer allows interactive 3D preview and pipeline debugging. In addition, the scene can also be inspected as a [Rerun](https://rerun.io/) export. 
+
+![Rerun Export](doc/images/rerun.png)
 
 **Compatibility** —
 Runs on Linux, macOS, and Windows. See [quickstart](doc/quickstart.md) to get started.
