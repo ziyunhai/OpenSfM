@@ -1,18 +1,18 @@
 # pyre-strict
 import argparse
 
-from opensfm.actions import rs_correct
+from opensfm.actions import correct_rolling_shutter
 from opensfm.dataset import DataSet
 
 from . import command
 
 
 class Command(command.CommandBase):
-    name = "rs_correct"
+    name = "correct_rolling_shutter"
     help = "Trim/correct features for rolling shutter distortion"
 
     def run_impl(self, dataset: DataSet, args: argparse.Namespace) -> None:
-        rs_correct.run_dataset(dataset, args.rolling_shutter_readout)
+        correct_rolling_shutter.run_dataset(dataset, args.rolling_shutter_readout)
 
     def add_arguments_impl(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument(
