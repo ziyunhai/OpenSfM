@@ -33,7 +33,7 @@ When done, exit with Ctrl+d. The model will be available in the `data/` director
 A web-based viewer is included. Start it with:
 
 ```bash
-python viewer/server.py path/to/dataset
+python viewer/server.py -d path/to/dataset
 ```
 
 ## Dense Point Clouds

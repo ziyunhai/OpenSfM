@@ -2,7 +2,9 @@
 
 ## Prerequisites
 
-[Conda](https://docs.conda.io/en/latest/miniconda.html) (or Miniconda) is the only prerequisite on all platforms. The conda environment installs the full toolchain including the C++ compiler, CMake, and all library dependencies.
+[Conda](https://docs.conda.io/en/latest/miniconda.html) (or Miniconda) is the only prerequisite on all platforms. The conda environment installs the full toolchain — the C++ compiler (MSVC on Windows, clang/gcc elsewhere), CMake, Ninja, and all library dependencies.
+
+> The build also needs the bundled `pybind11` git submodule. The `--recursive` clone below fetches it; in an existing clone run `git submodule update --init --recursive`.
 
 ## Installation
 
@@ -26,23 +28,21 @@ conda activate opensfm
 pip install -e .
 ```
 
+> Only Apple Silicon (`arm64`) is supported. Intel Macs (`osx-64`) are not supported — there is no lock file for them.
+
 ### Windows
 
-A single script handles everything (Miniconda download, VS Build Tools, environment creation, and build):
+Install [Miniconda](https://docs.conda.io/en/latest/miniconda.html) first, then run from the *Anaconda Prompt*:
 
 ```bat
 git clone --recursive https://github.com/OpenSfM/OpenSfM
 cd OpenSfM
-setup.bat
+conda create --name opensfm --file conda-win-64.lock --yes
+conda activate opensfm
+pip install -e .
 ```
 
-`setup.bat` will:
-1. Download and install Miniconda if conda is not found
-2. Download and install VS Build Tools with the C++ workload if MSVC is not found
-3. Create the `opensfm` conda environment from `conda-win-64.lock`
-4. Build and install OpenSfM
-
-> Admin rights are only required if VS Build Tools need to be installed.
+> The MSVC C++ compiler ships with the environment (`conda-win-64.lock` pins `vs2022_win-64`), so a separate Visual Studio / Build Tools install is **not** required.
 
 ## Running
 
@@ -66,7 +66,7 @@ See [using.md](using.md) for the full list of available commands.
 
 ## Viewer
 
-A web-based 3D viewer is included under `viewer/`. See [using.md](using.md) for details.
+A web-based 3D viewer is included under `viewer/`. See the [quickstart](quickstart.md#viewer) and [viewer/README.md](../viewer/README.md) for how to serve a dataset.
 
 ## Building Docker Images
 
