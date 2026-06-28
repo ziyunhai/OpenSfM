@@ -1095,7 +1095,7 @@ def save_dsm_ortho_streamed_georeferenced(
         dsm_b, ortho_b = fill_band(rs, re_)
         bh = re_ - rs
         rows_y = origin_y + (rs + np.arange(bh) + 0.5) * gsd  # topo y per row
-        valid = ~np.isnan(dsm_b)
+        valid = np.isfinite(dsm_b) & (dsm_b != DSM_NODATA)
         xx = np.broadcast_to(cols_x, (bh, gw))
         yy = np.broadcast_to(rows_y[:, None], (bh, gw))
         # Exact projected altitude per cell (z 0 where invalid is irrelevant).

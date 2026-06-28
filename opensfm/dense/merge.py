@@ -50,10 +50,6 @@ def merge_fusion_batches(
 
     delete_batches = data.config.get("depthmap_delete_fusion_batches", True)
 
-    # Resume guard: ``fused.ply`` is only created after a *complete* write,
-    # so if it already exists but some batches are missing we are resuming
-    # an interrupted cleanup — never rebuild the final cloud from a partial
-    # batch set (which would silently drop points).
     fused_exists = data.io_handler.isfile(data.point_cloud_file("fused.ply"))
     present = [
         bn for bn in sorted(batch_nums)
@@ -128,10 +124,8 @@ def merge_mesh_batches(
     def _batch_file(batch_num: int) -> str:
         return f"mesh_batch_{batch_num:04d}.ply"
 
-    delete_batches = data.config.get("depthmap_fusion_mesh_delete_batches", True)
+    delete_batches = data.config["depthmap_fusion_mesh_delete_batches"]
 
-    # Resume guard: mesh.ply only appears after a complete write, so an existing
-    # mesh.ply with missing batches means we are resuming cleanup.
     mesh_exists = data.io_handler.isfile(data.mesh_file("mesh.ply"))
     present = [
         bn for bn in sorted(batch_nums)

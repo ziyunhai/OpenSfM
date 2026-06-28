@@ -6,48 +6,62 @@ OpenSfM
 [![Conda](https://github.com/OpenSfM/OpenSfM/actions/workflows/conda.yml/badge.svg)](https://github.com/OpenSfM/OpenSfM/actions/workflows/conda.yml) [![Docker Ubuntu 20.04](https://github.com/OpenSfM/OpenSfM/actions/workflows/docker_ubuntu20.yml/badge.svg)](https://github.com/OpenSfM/OpenSfM/actions/workflows/docker_ubuntu20.yml) [![Docker Ubuntu 24.04](https://github.com/OpenSfM/OpenSfM/actions/workflows/docker_ubuntu24.yml/badge.svg)](https://github.com/OpenSfM/OpenSfM/actions/workflows/docker_ubuntu24.yml) [![Coverage](./badges/coverage.svg)](https://github.com/OpenSfM/OpenSfM/actions/workflows/coverage.yml)
 
 ## 🧟 Intro
-This repository is an attempt at continuing the original [OpenSfM](https://github.com/mapillary/opensfm) project, which not longer in active development. We were maintainers and contributors of the original OpenSfM, and we will do our best to keep it alive and serve the community and our users ([OpenDronemap](https://www.opendronemap.org/), [WebODM](https://webodm.org/) and many others)
+This repository continues the original [OpenSfM](https://github.com/mapillary/opensfm) project, which is no longer in active development. We were maintainers and contributors of the original OpenSfM, and we will do our best to keep it alive and serve the community and our users ([OpenDroneMap](https://www.opendronemap.org/), [WebODM](https://webodm.org/) and many others).
+
+This **1.0** release focuses on the needs of those two biggest users — OpenDroneMap and WebODM — hence the strong emphasis on **GIS / geo workflows**. See the [release notes](RELEASE.md) for the full feature list.
 
 ## 🔭 Overview
-OpenSfM is an open-source Structure from Motion (SfM) library written in Python with performance-critical code in C++. It reconstructs camera poses and 3D point clouds from unordered image collections, but also produces dense point clouds, or 2D maps (DSM, Orthophotos)
+OpenSfM is an open-source Structure-from-Motion (SfM) library written in Python with performance-critical code in C++. It reconstructs camera poses and sparse 3D points from unordered image collections, and goes all the way to **dense point clouds, meshes, and georeferenced 2D maps (DSM, orthophoto)** — with GPU acceleration throughout.
 
 **🧩 Core pipeline**
 
-Feature detection (SIFT, HAHOG, AKAZE, SURF, ORB), pairwise matching (OpenCL) with geometric verification, track building, incremental and direct aerotriangulation reconstruction with robust bundle adjustment ([Ceres](http://ceres-solver.org/)-based), and GPS/GCP-constrained alignment and coordinate systems shifts compensation.
+Feature detection (SIFT, HAHOG, DSP-SIFT, AKAZE, SURF, ORB), GPU (OpenCL) matching — both online-trained binary-quantized descriptors and classic FLANN — with geometric verification, track building, and incremental + direct aerotriangulation reconstruction. Robust [Ceres](http://ceres-solver.org/)-based bundle adjustment, switching to a stochastic solver for very large scenes. Pair selection by GPS, capture time, file order, or image similarity (BoW / VLAD). See [pipeline commands](doc/using.md) and the [configuration reference](doc/configuration.md).
 
 ![SfM Reconstruction](doc/images/viewer.png)
 
 **📐 Camera models**
 
-Perspective, brown, fisheye (OpenCV model, and customs 62 and 624 parameters), spherical/equirectangular, and dual. See [geometry](doc/geometry.md).
+Perspective, Brown, fisheye (OpenCV model and custom 62 / 624 parameters), spherical / equirectangular, and dual — with rolling-shutter correction. Lab-calibrated intrinsics can be injected and frozen, and multi-camera rigs are fully supported and can be auto-calibrated. See [camera models](doc/geometry.md) and [rig models](doc/rig.md).
+
+**🧭 Geolocation & georeferencing**
+
+GPS positions (with per-image X/Y/Z standard deviation) from EXIF or imported from a text file; ground control points and checkpoints (with per-point standard deviation) in any CRS. Horizontal + vertical coordinate systems via EPSG codes, compound EPSG, or PROJ strings, with geoids fetched on demand from the PROJ CDN, and adaptive datum-shift compensation. See [georeferencing & GIS outputs](doc/georeferencing.md) and [ground control points](doc/ground_control_points.md).
 
 **🍇 Dense reconstruction**
 
-Multi-view depth estimation via GPU PatchMatch (OpenCL), SVO-vased TSDF depth fusion and refinement, DSM and Orthophoto generation.
+Multi-view depth estimation via GPU PatchMatch (OpenCL), sparse-voxel-octree TSDF fusion with optional photometric refinement, and a Surface Nets (dual-contouring) mesh. Exports the dense cloud as PLY / LAS / LAZ, the mesh as PLY, and Potree-style octree tiles for streaming web viewers. See [dense reconstruction & 2D maps](doc/dense.md).
 
 ![Dense Reconstruction](doc/images/dense.png)
 
-**🪜 Scalability**
+**🧇 2D maps — DSM & orthophoto**
 
-Large scene support via submodel splitting/merging, rig constraints for multi-camera setups, and configurable multi-processing.
-
-**📦 Exports**
-
-COLMAP, Bundler, OpenMVS, PMVS, VisualSFM, PLY, LAS/LAZ, GeoJSON, GeoTIFF. In addition, a detailed quality report can be created and exported as a PDF file (see [reporting](doc/reporting.md) and [example report](doc/images/report.pdf))
+Direct, TSDF-based Digital Surface Model and orthophoto rendering, with hole filling, an edge-sharpening shock filter, and robust multi-view color baking. Accurately georeferenced to the output CRS (3rd-degree polynomial fit, TPS fallback) and exported as GeoTIFF. See [2D maps](doc/dense.md#2d-maps-dsm-and-orthophoto).
 
 ![DSM and Ortho Extraction](doc/images/dsm_ortho.png)
 
+**🪜 Scalability**
+
+Out-of-core submodel splitting / merging for large scenes, rig constraints for multi-camera setups, stochastic bundle adjustment, and configurable multi-processing. See [large datasets](doc/large_datasets.md).
+
+**📦 Exports**
+
+COLMAP, Bundler, OpenMVS, PMVS, VisualSFM, PLY, LAS/LAZ, GeoJSON, and GeoTIFF — see [the exporters](doc/using.md#other-exporters).
+
+**🩺 Quality report**
+
+SfM metrics, GPS/GCP and checkpoint error tables, and DSM/ortho previews, localized in metric or imperial units and in five languages (en/fr/es/de/it), exported as a PDF. See [quality report](doc/quality_report.md) and an [example report](doc/images/report.pdf).
+
 **🥽 Visualisation**
 
-A built-in JavaScript viewer allows interactive 3D preview and pipeline debugging. In addition, the scene can also be inspected as a [Rerun](https://rerun.io/) export. 
+A built-in JavaScript viewer for interactive 3D preview and pipeline debugging, a web point-cloud viewer fed by the Potree octree tiles, and a [Rerun](https://rerun.io/) export of the scene with its GPS/GCP data.
 
 ![Rerun Export](doc/images/rerun.png)
 
 **🤝 Compatibility** —
-Runs on Linux, macOS, and Windows. See [quickstart](doc/quickstart.md) to get started.
+Runs on Linux, macOS (Apple Silicon), and Windows. See the [quickstart](doc/quickstart.md) to get started.
 
 **🫶 Credits** —
-OpenSfM was created by Pau Gargallo and bootstrapped by Mapillarians : checkout this [blog post with more demos](http://blog.mapillary.com/update/2014/12/15/sfm-preview.html)
+OpenSfM was created by Pau Gargallo and bootstrapped by Mapillarians — check out this [blog post with more demos](http://blog.mapillary.com/update/2014/12/15/sfm-preview.html).
 
 
 ## 🛫 Getting Started

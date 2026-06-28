@@ -471,10 +471,7 @@ class OpenSfMConfig:
     # exceeds this factor × the median baseline, so distant cameras that merely
     # see common ground don't scatter clusters across the scene. 0 disables.
     depthmap_cluster_edge_max_factor: float = 2.0
-    # Hard cap on the total views (cluster refs + neighbours) loaded per cluster
-    # batch in the cleaning and fusion stages.  Bounds peak RAM regardless of how
-    # spread a cluster is; neighbours are picked by covisibility coverage so the
-    # most shared context is kept.
+    # Hard cap on the total views (cluster refs + neighbours) loaded per cluster batch in the cleaning and fusion stages.  Bounds peak RAM.
     depthmap_max_cluster_views: int = 48
     # Use SfM points to seed a Delaunay planar prior before PatchMatch iterations
     depthmap_sfm_planar_prior: bool = False
@@ -495,11 +492,13 @@ class OpenSfMConfig:
     # Number of multi-level fill passes (1=fine only, 3=fine+2 coarser).
     depthmap_fusion_svo_num_levels: int = 3
     # Flat-surface decimation factor for extraction (1=off, 4=keep 1/4). Reduces point density on flat surfaces while preserving sharp edges.
-    depthmap_fusion_svo_decimate_flat: int = 4
+    depthmap_fusion_svo_decimate_flat: int = 2
     # Edge detection threshold for decimation (0-1). Crossings with normal divergence above this are considered edges and never decimated.
     depthmap_fusion_svo_edge_threshold: float = 0.15
     # Minimum observation count for both voxels in a zero-crossing.
     depthmap_fusion_svo_min_count: int = 2
+    # Coverage-first view selection: minimum number of selected views that must observe each chunk cell before the per-chunk view budget (depthmap_max_cluster_views) is spent on quality. Guards against cells the SVO cannot accept (needs >= svo_min_count samples) or single-view outliers becoming completion holes. Set >= depthmap_fusion_svo_min_count; 1 = coverage only.
+    depthmap_fusion_min_cell_observers: int = 2
     # Local adaptive weight threshold for extracting surfaces : allows weak areas to self-calibrate.
     depthmap_fusion_svo_relative_min_weight: float = 0.25
     # Maximum unique voxels per SVO sub-volume : clusters are spatially split so each piece stays within this budget.
@@ -508,7 +507,9 @@ class OpenSfMConfig:
     # Adds views from outside the cluster to improve boundary quality.
     depthmap_fusion_svo_augment_neighbors: int = 4
     # Coarse grid cell size multiplier for pre-scan (cell = factor * voxel_size).
-    depthmap_fusion_svo_coarse_factor: int = 8
+    depthmap_fusion_svo_coarse_factor: int = 16
+    # Fusion chunk size: max coarse cells per chunk = the assignment granularity of the global KD-tree split (each chunk is fused by its best inverse-depth observers, points + DSM clipped to its disjoint core). 0 = auto (one GPU sub-volume's worth = svo_max_voxels / coarse_factor^3). Smaller = more, tighter chunks (smaller DSM tiles, tighter per-chunk view sets, more seams); larger = fewer chunks (bigger tiles, but the per-chunk view cap may drop coverage).
+    depthmap_fusion_chunk_max_cells: int = 0
     # Photometric TSDF refinement
     depthmap_fusion_svo_refine_enabled: bool = False
     # Number of SDF refinement iterations.
@@ -523,11 +524,8 @@ class OpenSfMConfig:
     depthmap_fusion_svo_bake_reuse_max_fusers: int = 4
     # Hard ceiling, as a fraction of device VRAM, on the bytes of retained fusers (hash table + refine images) kept resident
     depthmap_fusion_svo_bake_reuse_vram_fraction: float = 0.5
-    # Extract a 3-D triangle mesh (Surface Nets / dual contouring of the fused
-    # TSDF) alongside the fused point cloud.  Writes mesh_batch_*.ply per cluster
-    # (merged into mesh.ply).  Unlike Poisson it never balloons facades — the
-    # mesh is the TSDF zero-set itself — but leaves holes where the SVO is empty.
-    depthmap_fusion_mesh_enabled: bool = True
+    # Extract a 3-D triangle mesh (Surface Nets / dual contouring of the fused  TSDF) alongside the fused point cloud.
+    depthmap_fusion_mesh_enabled: bool = False
     # Delete the per-cluster mesh_batch_*.ply after merging into mesh.ply.
     depthmap_fusion_mesh_delete_batches: bool = True
 
@@ -552,10 +550,16 @@ class OpenSfMConfig:
     dsm_enabled: bool = True
     # Robust-to-grazing depth clamp: in the fusion pre-scan, drop depth samples farther than this multiple of the view's median depth.
     dsm_territory_depth_factor: float = 2.0
-    # Debug: also write each cluster's own DSM+ortho as georeferenced GeoTIFFs (dsm_cluster_XXXX.tif / ortho_cluster_XXXX.tif) before they are merged
+    # Debug: also write each chunk's own DSM+ortho as georeferenced GeoTIFFs (dsm_cluster_XXXX.tif / ortho_cluster_XXXX.tif) before they are merged
     dsm_save_cluster_tiles: bool = True
     # Merge per-cluster DSM/ortho tiles by distance-transform feather blending
     dsm_merge_feather: bool = True
+    # DSM/ortho feather margin (coarse cells): KD-tree chunks are disjoint, so each renders its DSM/ortho over its core cells dilated by this many coarse cells (XY only). The overlap gives the merge feather a band to cross-fade and the per-tile hole-fill neighbour context. Points/mesh stay clipped to the core (unique). 0 = no margin (hard seams).
+    dsm_feather_margin_cells: int = 2
+    # DSM/ortho completion footprint (coarse cells): the KD-tree partitions only reconstructed cells, so the empty interior of the scene (plazas, canopy gaps) belongs to no chunk. The 2D occupied plan is morphologically closed by this many coarse cells (then hole-filled) to define the completable footprint; each empty interior column is handed to its nearest chunk to own and fill. The closing is a PROPER (padded) closing bounded to the occupied bounding box: it bridges concavity mouths up to ~2x this width and (with fill_holes) encloses pockets, but does NOT balloon the footprint out to the rectangular bbox edges. So it can be raised to bridge wider gaps without runaway outward extension; it still fills genuine open bays up to ~2x this width.
+    dsm_footprint_close_cells: int = 128
+    # DSM/ortho completion footprint trim: before closing, cut each axis's sparse EXTREMITIES — leading/trailing rows/columns whose occupied-cell count is below this fraction of the axis's median (non-zero) count. This restrains the completion bounding box so a few outlier occupied cells can't inflate it and let the closing invent a wide sparse fringe. Cells outside the trimmed core are still rendered, just not completed around. 0 = off; 0.05-0.2 cuts thin tapering edges.
+    dsm_footprint_trim_fraction: float = 0.1
     # Soft RAM budget (MB) for the DSM/ortho merge: the final raster is written band-by-band, sized so each band's accumulators stay under this
     dsm_merge_max_ram_mb: int = 512
     # Wall cull for the DSM mesh: a surface-net triangle is rasterized only if |cos| of its normal from vertical >= this
@@ -572,8 +576,8 @@ class OpenSfMConfig:
     hole_fill_diffuse_iters: int = 64
     # DSM Post-process hole filling : when a hole is "tiny", it is filled by diffusion
     hole_fill_small_area_max: int = 256
-    # DSM Post-process hole filling : hole_fill_small_area_max is exceeded, the hole is filled by linear interpolation
-    hole_fill_footprint_close: int = 256
+    # DSM hole filling : pixel-closing iterations for the per-tile "local" enclosure footprint (bridges ragged render-boundary gaps before binary_fill_holes). Kept small: the closing is extensive (border_value=1), so a large value would balloon the footprint past the rendered surface. binary_fill_holes already fills every fully-enclosed void at any size; this only bridges open mouths.
+    hole_fill_footprint_close: int = 32
     # DSM large-hole fill geometry: instead of linearly interpolating across the hole (which slants ground up to a bordering roof), complete it as a gravity-aligned FLAT surface at the LOW altitude of its boundary
     hole_fill_low_percentile: float = 20.0
     # Fallback occluded-ground heuristic (superseded by ortho_bake_dsm_occlusion, so 0 = off by default).

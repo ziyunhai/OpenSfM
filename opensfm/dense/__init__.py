@@ -263,30 +263,26 @@ def run_fusion(
     data: UndistortedDataSet,
     reconstruction: types.Reconstruction,
 ) -> None:
-    """Fuse the cleaned depthmaps per cluster into ``fused_batch_*.ply`` (and,
-    when enabled, per-cluster DSM/ortho tiles).
+    """Fuse the cleaned depthmaps into ``fused_batch_*.ply`` (and, when enabled,
+    per-chunk DSM/ortho tiles).
 
-    Needs no tracks graph: the per-cluster bounding boxes are loaded from disk
-    (persisted by ``run_clustering``)."""
+    Space is partitioned by a global KD-tree split of the occupied grid, so no
+    cluster territories are needed here.  Needs no tracks graph; ``best_neighbors``
+    (used by the optional photometric refine) is loaded from disk."""
     config = data.config
 
     processable = _processable(reconstruction)
     if not processable:
         logger.warning("No processable shots found for depthmap computation")
         return
-    _require_clustering(data, need_neighbors=True, need_bboxes=True)
+    _require_clustering(data, need_neighbors=True)
 
-    clusters = data.load_clusters()
-    cluster_bboxes = data.load_cluster_bboxes()
-    context.log_memory("loaded cluster bounding boxes")
-
-    best_neighbors, all_neighbors = _load_neighbors(
+    best_neighbors, _all_neighbors = _load_neighbors(
         data, reconstruction, processable)
     depth_ranges = data.load_depth_ranges()
 
-    fusion.fuse_clusters(
-        data, all_neighbors, clusters, cluster_bboxes,
-        processable, config, reconstruction, depth_ranges,
+    fusion.fuse_chunks(
+        data, processable, config, reconstruction, depth_ranges,
         best_neighbors,
     )
     context.log_memory("phase 3 fusion done")
@@ -310,25 +306,29 @@ def run_merge(
     topocentric frame.  ``fused.ply`` and the octree always stay topocentric.
     """
     config = data.config
-    _require_clustering(data, need_neighbors=False)
 
-    clusters = data.load_clusters()
-    n_clusters = len(clusters)
+    # Fusion emits one batch per KD-tree chunk (no longer the graph-cluster
+    # count), and some chunks may yield no points/tile — so the merge discovers
+    # the actual batch indices by listing the depthmap folder per file type.
 
     # ── Merge batch PLYs into final fused.ply ──
-    merge.merge_fusion_batches(data, list(range(n_clusters)))
+    merge.merge_fusion_batches(
+        data, data.list_batch_indices("fused_batch_", ".ply")
+    )
 
-    # ── Merge per-cluster Surface Nets meshes into final mesh.ply ──
+    # ── Merge per-chunk Surface Nets meshes into final mesh.ply ──
     if config["depthmap_fusion_mesh_enabled"]:
-        merge.merge_mesh_batches(data, list(range(n_clusters)))
+        merge.merge_mesh_batches(
+            data, data.list_batch_indices("mesh_batch_", ".ply")
+        )
 
-    # Composite the per-cluster DSM/ortho tiles into the final raster.  Without
-    # this each cluster's save would overwrite dsm.tif / ortho.tif and only the
-    # last cluster processed would appear.
+    # Composite the per-chunk DSM/ortho tiles into the final raster.  Without
+    # this each chunk's save would overwrite dsm.tif / ortho.tif and only the
+    # last chunk processed would appear.
     if config["dsm_enabled"]:
         merge.merge_dsm_ortho_batches(
-            data, list(range(n_clusters)), reconstruction.reference,
-            output_crs=output_crs,
+            data, data.list_batch_indices("dsm_ortho_batch_", ".npz"),
+            reconstruction.reference, output_crs=output_crs,
         )
 
     context.log_memory("phase 4 merge done")

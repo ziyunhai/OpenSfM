@@ -1232,6 +1232,27 @@ class UndistortedDataSet:
     def dsm_ortho_batch_exists(self, batch_num: int) -> bool:
         return self.io_handler.isfile(self.dsm_ortho_batch_file(batch_num))
 
+    def list_batch_indices(self, prefix: str, suffix: str) -> List[int]:
+        """Discover fusion batch indices by listing the depthmap folder.
+
+        Returns the sorted indices ``i`` for every file named exactly
+        ``{prefix}{i:04d}{suffix}`` (e.g. ``fused_batch_0003.ply``).  Names with
+        anything between the number and suffix (``fused_batch_0003_debug.ply``)
+        are ignored.  The fusion stage emits one batch per KD-tree chunk, so the
+        merge derives the chunk count from disk rather than a persisted marker.
+        """
+        path = self._depthmap_path()
+        if not self.io_handler.isdir(path):
+            return []
+        indices: List[int] = []
+        for name in self.io_handler.ls(path):
+            base = os.path.basename(name)
+            if base.startswith(prefix) and base.endswith(suffix):
+                middle = base[len(prefix): len(base) - len(suffix)]
+                if middle.isdigit():
+                    indices.append(int(middle))
+        return sorted(indices)
+
     def save_dsm_ortho_batch(
         self,
         batch_num: int,
@@ -1278,7 +1299,8 @@ class UndistortedDataSet:
         cols = np.where(valid.any(axis=0))[0]
         r0, r1 = int(rows[0]), int(rows[-1]) + 1
         c0, c1 = int(cols[0]), int(cols[-1]) + 1
-        dsm_win = np.ascontiguousarray(dsm_grid[r0:r1, c0:c1], dtype=np.float32)
+        dsm_win = np.ascontiguousarray(
+            dsm_grid[r0:r1, c0:c1], dtype=np.float32)
         ortho_win = np.ascontiguousarray(
             ortho_grid[r0:r1, c0:c1], dtype=np.uint8
         )
@@ -1327,6 +1349,9 @@ class UndistortedDataSet:
                        float(o["geo"][2]))
         conf = o["conf"] if "conf" in o.files else None
         o.close()
+        dsm = np.where(
+            np.isfinite(dsm) & (dsm != geo.DSM_NODATA), dsm, np.nan
+        ).astype(np.float32)
         return dsm, ortho, r0, c0, (gh, gw), (ox, oy, gsd), conf
 
     def raw_depthmap_exists(self, image: str) -> bool:

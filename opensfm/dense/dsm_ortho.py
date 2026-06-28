@@ -13,6 +13,9 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 from numpy.typing import NDArray
 from scipy import ndimage
+from scipy import sparse as sp
+from scipy.sparse.linalg import cg
+from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
 
 from opensfm import pydense
 
@@ -58,7 +61,6 @@ def _linear_fill_components(
     to nearest-neighbour (outside the convex hull) — i.e. EXTRAPOLATED, hence
     geometrically unreliable (typically the open side of boundary concavities).
     """
-    from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
 
     multichannel = grid.ndim == 3
     H, W = labels.shape
@@ -132,8 +134,6 @@ def _smooth_fill_components(
     Only ``sample_valid`` cells inside the crop pin the solution (Dirichlet); the
     no-data exterior and other holes are free (Neumann), so nothing bleeds in.
     """
-    from scipy import sparse as sp
-    from scipy.sparse.linalg import splu
 
     H, W = labels.shape
     nchan = grid.shape[2]
@@ -192,11 +192,15 @@ def _smooth_fill_components(
         rows = np.concatenate([np.arange(n)] + off_r)
         cols = np.concatenate([np.arange(n)] + off_c)
         vals = np.concatenate([diag] + [-np.ones(u.size) for u in off_r])
-        amat = sp.csc_matrix((vals, (rows, cols)), shape=(n, n))
-        lu = splu(amat)
+        amat = sp.csr_matrix((vals, (rows, cols)), shape=(n, n))
+        m_inv = sp.diags(1.0 / diag)
+        maxiter = 4 * int(np.ceil(np.sqrt(n))) + 200
         out = np.empty((n, nchan))
         for ch in range(nchan):
-            out[:, ch] = lu.solve(rhs[:, ch])
+            sol, _info = cg(
+                amat, rhs[:, ch], M=m_inv, rtol=1e-3, atol=0.0, maxiter=maxiter
+            )
+            out[:, ch] = sol
         sub[ys, xs, :] = np.clip(out, 0, 255).astype(grid.dtype)
 
 
@@ -377,6 +381,44 @@ def _fill_holes_2pass(
                 out, labels, stage2_ids, stage2_valid, extrap_out=extrap
             )
 
+    ch0 = out[..., 0] if multichannel else out
+    residual = hole_mask & ~np.isfinite(ch0)
+    n_residual = int(residual.sum())
+    if n_residual:
+        src = np.isfinite(ch0) & ~residual  # every cell that now holds a value
+        if src.any():
+            pad = 64
+            H, W = out.shape[:2]
+            rlbl, n_res_comp = ndimage.label(residual)
+            boxes = ndimage.find_objects(rlbl)
+            n_mopped = 0
+            for cid in range(1, n_res_comp + 1):
+                box = boxes[cid - 1]
+                if box is None:
+                    continue
+                y0 = max(box[0].start - pad, 0)
+                y1 = min(box[0].stop + pad, H)
+                x0 = max(box[1].start - pad, 0)
+                x1 = min(box[1].stop + pad, W)
+                sub_src = src[y0:y1, x0:x1]
+                if not sub_src.any():
+                    continue  # no filled cell within reach (left as no-data)
+                sub_res = rlbl[y0:y1, x0:x1] == cid
+                _, (iy, ix) = ndimage.distance_transform_edt(
+                    ~sub_src, return_indices=True)
+                sub_out = out[y0:y1, x0:x1]
+                sub_out[sub_res] = sub_out[iy[sub_res], ix[sub_res]]
+                n_mopped += int(sub_res.sum())
+            logger.info(
+                f"Hole fill: mopped up {n_mopped}/{n_residual} residual cell(s) "
+                "(filler bailed) from nearest filled neighbour"
+            )
+        else:
+            logger.info(
+                f"Hole fill: {n_residual} residual cell(s) left as no-data "
+                "(no filled neighbour to source from)"
+            )
+
     return out, extrap
 
 
@@ -389,22 +431,33 @@ def _dsm_footprint(valid: NDArray, close_iters: int) -> NDArray:
     """
     if close_iters > 0:
         structure = ndimage.generate_binary_structure(2, 1)
+        n = int(close_iters)
+        padded = np.pad(valid, n)
         closed = ndimage.binary_closing(
-            valid, structure=structure, iterations=int(close_iters)
-        )
+            padded, structure=structure, iterations=n
+        )[n:-n, n:-n]
     else:
         closed = valid
     return ndimage.binary_fill_holes(closed)
 
 
 def _fill_dsm_holes(
-    dsm_grid: NDArray, config: Dict[str, Any]
+    dsm_grid: NDArray,
+    config: Dict[str, Any],
+    footprint: Optional[NDArray] = None,
 ) -> Tuple[NDArray, NDArray]:
-    """Fill DSM no-data holes that lie INSIDE the reconstructed footprint: tiny
+    """Fill DSM no-data holes that lie INSIDE the completable footprint: tiny
     ones by edge-aware GPU diffusion, larger ones by a gravity-aligned FLAT fill
     at the low border altitude (continues occluded ground flat, leaving a sharp
     edge under the bordering roof — not a linear slant).  The no-data EXTERIOR
     outside the footprint is kept as no-data (ortho stays transparent there).
+
+    ``footprint`` (bool ``(H, W)``) overrides which no-data is fillable.  Callers
+    pass the chunk's completion TERRITORY here: on a disjoint KD-tree chunk the
+    big cross-chunk holes touch the tile edge, so the default morphological
+    footprint (``_dsm_footprint``) treats them as exterior and never fills them;
+    the territory mask marks them fillable instead.  ``None`` → derive the
+    footprint from the reconstructed cells (legacy / full-extent behaviour).
 
     Returns ``(filled_dsm, no_relax_mask)``; the flat fill marks the OCCLUDED
     holes (ground sitting below a tall roof border, > ``hole_fill_occlusion_drop``
@@ -417,8 +470,31 @@ def _fill_dsm_holes(
     if valid.all() or not valid.any():
         return dsm_grid, empty
 
-    footprint = _dsm_footprint(valid, int(config["hole_fill_footprint_close"]))
+    # Local enclosure: holes the RENDERED surface encloses, at pixel
+    # granularity.  This alone catches the coarse-cell voids inside the surface
+    # (an empty coarse cell renders as a NaN square; binary_fill_holes encloses
+    # it) — so they never survive as coarse-grid speckle.
+    local = _dsm_footprint(valid, int(config["hole_fill_footprint_close"]))
+    # ``footprint`` (the chunk's completion territory) EXTENDS the local
+    # enclosure to the big cross-chunk holes that touch the tile edge and thus
+    # look "exterior" locally.  Union, so a cell is fillable if locally enclosed
+    # OR in the territory — neither bucket can drop an interior hole.
+    footprint = local if footprint is None else (local | footprint)
     fillable = (~valid) & footprint
+    # Diagnostic: split the no-data into FILLABLE (inside the completion
+    # footprint — local enclosure or territory) vs genuine EXTERIOR (outside it,
+    # kept transparent).  If the void squares you see correspond to the
+    # "exterior" count, the cause is the MASK (render produced an empty coarse
+    # cell the footprint doesn't reach); if to "fillable" residual after the
+    # fill, the cause is the FILLER bailing (mopped up below).
+    n_nd = int((~valid).sum())
+    n_fill = int(fillable.sum())
+    n_local = int(((~valid) & local).sum())
+    logger.info(
+        f"DSM holes: {n_nd} no-data → {n_fill} fillable "
+        f"({n_local} via local enclosure) + {n_nd - n_fill} exterior (kept)"
+    )
+
     if not fillable.any():
         return dsm_grid, empty
 
