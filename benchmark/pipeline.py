@@ -23,6 +23,35 @@ PIPELINE_STEPS: List[str] = [
     "export_report",
 ]
 
+# Dense-reconstruction stages (opt-in via --dense).  ``undistort`` is the
+# prerequisite that produces the undistorted dataset the dense stages consume.
+# They are inserted right before ``compute_statistics`` so the latter picks up
+# their per-stage timing reports into stats.json (and thus the HTML report).
+DENSE_STEPS: List[str] = [
+    "undistort",
+    "dense_clustering",
+    "compute_depthmaps",
+    "fuse_depthmaps",
+    "dense_merging",
+]
+
+
+def build_pipeline_steps(dense: bool = False) -> List[str]:
+    """Return the ordered pipeline steps for a run.
+
+    When ``dense`` is True the dense stages (and their ``undistort``
+    prerequisite) are spliced in just before ``compute_statistics`` so their
+    timings flow into stats.json like every other step.
+    """
+    if not dense:
+        return list(PIPELINE_STEPS)
+    idx = PIPELINE_STEPS.index("compute_statistics")
+    return PIPELINE_STEPS[:idx] + DENSE_STEPS + PIPELINE_STEPS[idx:]
+
+
+# Superset of every step that can appear in any run (used for argparse choices).
+ALL_PIPELINE_STEPS: List[str] = build_pipeline_steps(dense=True)
+
 # For each step, the path relative to dataset_path that indicates completion.
 # Directories are considered complete when non-empty.
 STEP_OUTPUT_FILES: Dict[str, str] = {
@@ -31,20 +60,39 @@ STEP_OUTPUT_FILES: Dict[str, str] = {
     "match_features": "reports/matches.json",
     "create_tracks": "tracks.csv",
     "reconstruct": "reconstruction.json",
+    "undistort": "undistorted/reconstruction.json",
+    "dense_clustering": "reports/dense_clustering.json",
+    "compute_depthmaps": "reports/dense_depthmaps.json",
+    "fuse_depthmaps": "reports/dense_fusion.json",
+    "dense_merging": "reports/dense_merging.json",
     "compute_statistics": "stats/stats.json",
     "export_report": "stats/report.pdf",
 }
 
 # All files/directories a step produces that a subsequent step may need.
-# Used to bootstrap a new run from an existing one.
+# Used to bootstrap a new run from an existing one.  The dense stages write
+# their artefacts inside ``undistorted/`` (carried over wholesale by the
+# undistort symlink), so only their report files are listed here.
 STEP_OUTPUTS: Dict[str, List[str]] = {
     "extract_metadata": ["exif", "camera_models.json"],
     "detect_features": ["features"],
     "match_features": ["matches", "reports/matches.json"],
     "create_tracks": ["tracks.csv", "reports/tracks.json"],
     "reconstruct": ["reconstruction.json", "reports/reconstruction.json"],
+    "undistort": ["undistorted"],
+    "dense_clustering": ["reports/dense_clustering.json"],
+    "compute_depthmaps": ["reports/dense_depthmaps.json"],
+    "fuse_depthmaps": ["reports/dense_fusion.json"],
+    "dense_merging": ["reports/dense_merging.json"],
     "compute_statistics": ["stats"],
     "export_report": [],
+}
+
+# Extra CLI arguments appended to specific steps' invocation.  dense_merging is
+# run georeferenced so the LAS/LAZ and DSM/ortho products land in the output
+# coordinate system.
+STEP_EXTRA_ARGS: Dict[str, List[str]] = {
+    "dense_merging": ["--georeferenced"],
 }
 
 
@@ -92,14 +140,20 @@ def _refresh_disk_cache(dataset_path: str) -> None:
         pass
 
 
-def bootstrap_dataset(source_dataset_dir: str, target_dataset_dir: str, from_step: str) -> None:
+def bootstrap_dataset(
+    source_dataset_dir: str,
+    target_dataset_dir: str,
+    from_step: str,
+    dense: bool = False,
+) -> None:
     """Populate target_dataset_dir with outputs of all steps before from_step.
 
     Directories are symlinked; individual files are copied.
     The target dataset directory must already exist (image_list.txt etc. in place).
     """
-    from_idx = PIPELINE_STEPS.index(from_step)
-    steps_to_copy = PIPELINE_STEPS[:from_idx]
+    steps = build_pipeline_steps(dense)
+    from_idx = steps.index(from_step)
+    steps_to_copy = steps[:from_idx]
 
     old_umask = os.umask(0o000)
     try:
@@ -158,6 +212,7 @@ def run_pipeline(
     conda_env: str,
     resume: bool = False,
     from_step: Optional[str] = None,
+    dense: bool = False,
 ) -> Dict[str, Any]:
     """Run the SfM pipeline on a single dataset.
 
@@ -167,10 +222,12 @@ def run_pipeline(
         from_step: If set, steps *before* this step are skipped unconditionally
                    (assumed bootstrapped or already complete); this step and all
                    subsequent steps are always run.
+        dense:     If True, also run the dense-reconstruction stages.
 
     Returns a dict with per-step timings and success/failure status.
     """
-    from_idx = PIPELINE_STEPS.index(from_step) if from_step else 0
+    steps = build_pipeline_steps(dense)
+    from_idx = steps.index(from_step) if from_step else 0
 
     result: Dict[str, Any] = {
         "success": True,
@@ -178,8 +235,8 @@ def run_pipeline(
         "failed_step": None,
     }
 
-    for step in PIPELINE_STEPS:
-        step_idx = PIPELINE_STEPS.index(step)
+    for step in steps:
+        step_idx = steps.index(step)
         ds_name = os.path.basename(dataset_path)
 
         # Steps before from_step: skip unconditionally
@@ -204,12 +261,17 @@ def run_pipeline(
         # Force disk attribute-cache refresh
         _refresh_disk_cache(dataset_path)
 
+        extra_args = STEP_EXTRA_ARGS.get(step, [])
+        cmd = f"{opensfm_bin} {step} {dataset_path}"
+        if extra_args:
+            cmd += " " + " ".join(extra_args)
+
         try:
             subprocess.run(
                 [
                     "conda", "run", "--name", conda_env,
                     "bash", "-c",
-                    f"umask 0000 && {opensfm_bin} {step} {dataset_path}",
+                    f"umask 0000 && {cmd}",
                 ],
                 capture_output=True,
                 text=True,
@@ -253,12 +315,14 @@ def run_all_datasets(
     from_step: Optional[str] = None,
     existing_meta: Optional[Dict[str, Any]] = None,
     bootstrap_run_dir: Optional[str] = None,
+    dense: bool = False,
 ) -> Dict[str, Any]:
     """Run the pipeline on all datasets, saving run_meta.json after each one.
 
     Args:
         bootstrap_run_dir: When from_step is set on a fresh run, copy/symlink
                            outputs of steps before from_step from this directory.
+        dense:             If True, also run the dense-reconstruction stages.
 
     Returns the final run metadata dict.
     """
@@ -266,6 +330,7 @@ def run_all_datasets(
         "commit": commit_hash,
         "date": datetime.now(timezone.utc).isoformat(),
         "status": "in_progress",
+        "dense": dense,
         "config": {
             "root": config.root,
             "datasets": config.datasets,
@@ -275,6 +340,7 @@ def run_all_datasets(
     }
     # Ensure status is reset when re-running
     run_meta["status"] = "in_progress"
+    run_meta["dense"] = dense
     save_run_meta(run_meta, run_dir)
 
     total_t0 = time.monotonic()
@@ -287,11 +353,12 @@ def run_all_datasets(
             src_ds = os.path.join(bootstrap_run_dir, dataset_name)
             if os.path.isdir(src_ds):
                 logger.info("  Bootstrapping %s from %s", dataset_name, src_ds)
-                bootstrap_dataset(src_ds, dataset_path, from_step)
+                bootstrap_dataset(src_ds, dataset_path, from_step, dense=dense)
         pipeline_result = run_pipeline(
             opensfm_bin, dataset_path, conda_env,
             resume=resume,
             from_step=from_step,
+            dense=dense,
         )
         run_meta["datasets"][dataset_name] = pipeline_result
         # Persist after each dataset so a crash is recoverable

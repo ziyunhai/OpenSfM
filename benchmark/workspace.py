@@ -18,6 +18,7 @@ COPYABLE_FILES = [
     "gcp_list.txt",
     "ground_control_points.json",
     "camera_models_overrides.json",
+    "exif_overrides.json",
 ]
 
 COPYABLE_DIRS = [

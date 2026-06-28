@@ -176,6 +176,18 @@ TIMING_METRICS: List[MetricDef] = [
     ("Features Matching (s)", "processing_statistics.steps_times.Features Matching", True),
     ("Tracks Merging (s)", "processing_statistics.steps_times.Tracks Merging", True),
     ("Reconstruction (s)", "processing_statistics.steps_times.Reconstruction", True),
+]
+
+DENSE_TIMING_METRICS: List[MetricDef] = [
+    ("Dense Clustering (s)",
+     "processing_statistics.steps_times.Dense Clustering", True),
+    ("Dense Depthmaps (s)",
+     "processing_statistics.steps_times.Dense Depthmaps", True),
+    ("Dense Fusion (s)", "processing_statistics.steps_times.Dense Fusion", True),
+    ("Dense Merging (s)", "processing_statistics.steps_times.Dense Merging", True),
+]
+
+TOTAL_TIMING_METRIC: List[MetricDef] = [
     ("Total Time (s)", "processing_statistics.steps_times.Total Time", True),
 ]
 
@@ -367,6 +379,13 @@ def generate_comparison_html(
             f"Reference: <strong>{escape(ref_commit)}</strong> &mdash; {escape(ref_date or '')}"
         )
 
+    # Append dense-stage timings to the timing table when either run executed
+    # the dense pipeline, so they can be compared like every other step.
+    dense_run = bool(current_meta.get("dense")) or bool(
+        (reference_meta or {}).get("dense"))
+    timing_metrics = TIMING_METRICS + (
+        DENSE_TIMING_METRICS if dense_run else []) + TOTAL_TIMING_METRIC
+
     sections = [
         ("Reconstruction Summary", RECONSTRUCTION_METRICS),
         ("Reprojection Errors", REPROJECTION_METRICS),
@@ -374,7 +393,7 @@ def generate_comparison_html(
         ("Feature Statistics", FEATURE_METRICS),
         ("GPS Errors", GPS_METRICS),
         ("GCP Errors", GCP_METRICS),
-        ("Processing Times", TIMING_METRICS),
+        ("Processing Times", timing_metrics),
     ]
 
     tables_html = ""
