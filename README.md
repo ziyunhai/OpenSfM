@@ -86,6 +86,9 @@ conda activate opensfm
 ./bin/opensfm_run_all path/to/dataset   # Linux/macOS
 bin\opensfm_run_all.bat path\to\dataset  # Windows
 ```
+
+**Workflow presets** — ready-made `config.yaml` files tuned for common capture types live in [`configs/`](configs/) (`aerial`, `terrestrial`, `object`). Copy one into your dataset to start from sensible defaults: `cp configs/aerial.yaml path/to/dataset/config.yaml`. See [workflow presets](doc/using.md#workflow-presets-configs).
+
 ## 📚 Documentation
 
 **Getting Started**

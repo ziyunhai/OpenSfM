@@ -17,6 +17,8 @@ This release is a big jump and the first major so here is the list of features :
 
 > 📚 Full documentation lives in [`doc/`](doc/) — new users should start with the [quickstart](doc/quickstart.md), then the [pipeline command reference](doc/using.md) and the [configuration reference](doc/configuration.md) (the doc mirror of every option in [`opensfm/config.py`](opensfm/config.py)).
 
+> 🧰 Ready-made `config.yaml` presets tuned for common capture types ship under [`configs/`](configs/) — `aerial`, `terrestrial` and `object`. Copy one into your dataset to start from sensible defaults; see [workflow presets](doc/using.md#workflow-presets-configs).
+
 ### 🧭 Geolocation
 
 > Guide: [Georeferencing & GIS outputs](doc/georeferencing.md)

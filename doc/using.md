@@ -323,6 +323,22 @@ SfM options are set in `DATASET_PATH/config.yaml`. Any key present overrides the
 
 See the full [configuration reference](configuration.md) for all parameters, defaults, and descriptions.
 
+### Workflow presets (`configs/`)
+
+The repository ships ready-made `config.yaml` presets, tuned for common capture types, in the `configs/` folder. A preset is just a normal `config.yaml`: copy the one that matches your data into the dataset, then tweak individual keys as needed.
+
+```bash
+cp configs/aerial.yaml path/to/dataset/config.yaml
+```
+
+| Preset | Capture type | Tuned for |
+| ------ | ------------ | --------- |
+| `aerial.yaml` | Nadir / oblique drone & aerial mapping | GPS-tagged flights: `vertical` orientation prior, GPS-preempted VLAD pair selection, triangulation-based matching rounds, DSM/ortho enabled |
+| `terrestrial.yaml` | Ground-level / walk-around capture | `horizontal` orientation prior, SfM planar prior, more sequential (time/order) neighbours, DSM/ortho enabled |
+| `object.yaml` | Close-range single object / turntable | Unordered all-around matching (no GPS preemption), planar prior, TSDF photometric refinement, DSM/ortho disabled |
+
+All three share large feature budgets (`feature_min_frames: 20000`, `feature_process_size: 4096`) and the `brown` default projection; they differ mainly in pair selection, alignment prior, and the dense/DSM settings above. See the [configuration reference](configuration.md) for every parameter they set.
+
 
 ## Ground Control Points
 
