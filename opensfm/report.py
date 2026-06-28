@@ -637,13 +637,43 @@ class Report:
 
         self.pdf.set_xy(MARGIN, self.pdf.get_y() + TABLE_GAP)
 
+    def _grouped_steps_times(self) -> Dict[str, float]:
+        """Collapse the fine-grained per-stage timings into the few buckets shown
+        in the report table, so it stays readable as stages are added.
+
+        ``stats.json`` keeps the full breakdown; only the displayed table is
+        grouped: Tracks Merging + Reconstruction become a single Reconstruction
+        column and the four dense stages a single Dense column. A group is
+        dropped entirely when none of its source stages ran (e.g. no dense run).
+        """
+        steps_times = self.stats["processing_statistics"]["steps_times"]
+
+        groups = [
+            ("Features", ["Feature Extraction"]),
+            ("Matching", ["Features Matching"]),
+            ("Reconstruction", ["Tracks Merging", "Reconstruction"]),
+            ("Dense", ["Dense Clustering", "Dense Depthmaps",
+                       "Dense Fusion", "Dense Merging"]),
+            ("Statistics", ["Statistics"]),
+            ("Total Time", ["Total Time"]),
+        ]
+
+        grouped: Dict[str, float] = {}
+        for display_name, source_keys in groups:
+            present = [steps_times[k] for k in source_keys if k in steps_times]
+            if not present:
+                continue
+            valid = [v for v in present if v >= 0]
+            grouped[display_name] = sum(valid) if valid else -1
+        return grouped
+
     def make_processing_time_details(self) -> None:
         self._make_section(self.locale.t("processing_time_details"))
 
-        columns_names = list(
-            self.stats["processing_statistics"]["steps_times"].keys())
+        steps_times = self._grouped_steps_times()
+        columns_names = list(steps_times.keys())
         formatted_floats = []
-        for v in self.stats["processing_statistics"]["steps_times"].values():
+        for v in steps_times.values():
             formatted_floats.append(self.locale.format_time(v))
         rows = [formatted_floats]
         self._make_table(columns_names, rows)

@@ -89,8 +89,7 @@ def _gps_gcp_opk_errors_stats(errors: Optional[NDArray], names: List[str]) -> Di
     average = np.average(np.linalg.norm(errors, axis=1))
 
     stats["mean"] = {names[0]: mean[0], names[1]: mean[1], names[2]: mean[2]}
-    stats["std"] = {names[0]: std_dev[0], names[1]
-        : std_dev[1], names[2]: std_dev[2]}
+    stats["std"] = {names[0]: std_dev[0], names[1]                    : std_dev[1], names[2]: std_dev[2]}
     stats["error"] = {
         names[0]: math.sqrt(m_squared[0]),
         names[1]: math.sqrt(m_squared[1]),
@@ -565,6 +564,13 @@ def processing_statistics(
         "Reconstruction": "reconstruction.json",
     }
 
+    optional_steps = {
+        "Dense Clustering": "dense_clustering.json",
+        "Dense Depthmaps": "dense_depthmaps.json",
+        "Dense Fusion": "dense_fusion.json",
+        "Dense Merging": "dense_merging.json",
+    }
+
     steps_times = {}
     for step_name, report_file in steps.items():
         try:
@@ -578,6 +584,17 @@ def processing_statistics(
             steps_times[step_name] = sum(obj["wall_times"].values())
         else:
             steps_times[step_name] = -1
+
+    for step_name, report_file in optional_steps.items():
+        try:
+            report_str = data.load_report(report_file)
+            obj = io.json_loads(report_str)
+        except (IOError, OSError):
+            continue
+        if "wall_time" in obj:
+            steps_times[step_name] = obj["wall_time"]
+        elif "wall_times" in obj:
+            steps_times[step_name] = sum(obj["wall_times"].values())
 
     stats = {}
     stats["steps_times"] = steps_times
@@ -763,7 +780,8 @@ def compute_all_statistics(
     try:
         stats["output_coordinate_system"] = data.output_coordinate_system()
     except Exception:
-        logger.debug("Could not determine output coordinate system", exc_info=True)
+        logger.debug(
+            "Could not determine output coordinate system", exc_info=True)
 
     return stats
 
