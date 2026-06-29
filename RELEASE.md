@@ -101,7 +101,7 @@ This release is a big jump and the first major so here is the list of features :
 ## 🩹 Bugfixes
 
 ## 🫣 Known Issues
-- Mesh support is experimental and still very sub-optimal — the Surface Nets mesh (config: [`depthmap_fusion_mesh_enabled`](doc/configuration.md#fusion)) is on by default but can leave holes in empty regions
+- Mesh support is experimental and still very sub-optimal — the Surface Nets mesh (config: [`depthmap_fusion_mesh_enabled`](doc/configuration.md#fusion)) is off by default (opt-in) and can leave holes in empty regions
 - TSDF photometric refinement doesn't bring substantial improvement (config: [`depthmap_fusion_svo_refine_enabled`](doc/configuration.md#fusion), `false` by default)
 - Orthophoto and DSM still suffers from different exposure compensation and specular surfaces (metals, asphalt).
 - The split-merge is the old one and not out-of-core, neither is the dense/ortho/DSM

@@ -70,7 +70,7 @@ See the [Depth Estimation](configuration.md#depth-estimation-patchmatch-opencl) 
 Fuses the cleaned depthmaps into a surface using a **sparse-voxel-octree (SVO) TSDF** integrator, one cluster at a time over disjoint territories (so two clusters never fuse the same surface twice).
 
 - **Voxel size is automatic**, derived from the data's median per-pixel ground footprint (`depth/focal`); `depthmap_fusion_svo_voxel_level` selects `fine` / `half` / `quarter` of that resolution.
-- **Mesh** — when `depthmap_fusion_mesh_enabled` (default), a **Surface Nets** (dual-contouring) triangle mesh is extracted from the same TSDF zero-set. Unlike Poisson it never balloons facades, but it leaves holes where the volume is empty.
+- **Mesh** — when `depthmap_fusion_mesh_enabled` is set (opt-in, **off by default**), a **Surface Nets** (dual-contouring) triangle mesh is extracted from the same TSDF zero-set. Unlike Poisson it never balloons facades, but it leaves holes where the volume is empty.
 - **2D tiles** — when `dsm_enabled` (default), each cluster also renders its slice of the DSM and orthophoto.
 
 Outputs per cluster: `fused_batch_*.ply` (xyz + normal + rgb), `mesh_batch_*.ply`, `dsm_ortho_batch_*.npz`. See the [Fusion](configuration.md#fusion) config.
@@ -80,7 +80,7 @@ Outputs per cluster: `fused_batch_*.ply` (xyz + normal + rgb), `mesh_batch_*.ply
 Merges the per-cluster batches into the final products and exports them:
 
 - **`fused.ply`** — the merged dense point cloud (always topocentric).
-- **`mesh.ply`** — the merged Surface Nets mesh (always topocentric).
+- **`mesh.ply`** — the merged Surface Nets mesh, when `depthmap_fusion_mesh_enabled` is set (always topocentric).
 - **`dsm.tif` / `ortho.tif`** — the merged DSM and orthophoto GeoTIFFs (per-cluster tiles are feather-blended, `dsm_merge_feather`).
 - **`fused.las` / `fused.laz`** — the dense cloud as LAS/LAZ, when `dense_pointcloud_export_las` / `_laz` are enabled.
 - **`point_cloud/`** — Potree-style octree tiles for streaming in a web/point-cloud viewer (see [Octree Tiling](configuration.md#octree-tiling)).
@@ -111,7 +111,7 @@ All paths are relative to `undistorted/depthmaps/`.
 
 The **DSM** (`dsm.tif`) is a top-down height raster; the **orthophoto** (`ortho.tif`) is a top-down, perspective-corrected color image on the same grid. Both are rendered from the fused surface during stage 3 and finalized in stage 4. The ground sample distance is derived automatically from the fused voxel size.
 
-DSM/ortho quality is shaped by a dedicated config group ([DSM and Orthophoto](configuration.md#dsm-and-orthophoto)): hole filling (diffusion for small holes, flat-fill for large ones), a coherence-enhancing shock filter that sharpens edges, robust multi-view color baking for the ortho, and feather blending across cluster tiles. Set `dsm_enabled: false` to skip 2D maps entirely.
+DSM/ortho quality is shaped by a dedicated config group ([DSM and Orthophoto](configuration.md#dsm-and-orthophoto)): shape-aware hole filling (compact gaps flat-filled, elongated ones edge-aware diffused), a coherence-enhancing shock filter that sharpens edges, robust multi-view color baking with detail injection for the ortho, and feather blending across cluster tiles. Set `dsm_enabled: false` to skip 2D maps entirely.
 
 ---
 

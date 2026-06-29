@@ -284,6 +284,7 @@ OpenSfM computes dense depthmaps with a GPU PatchMatch estimator (run by `comput
 
 | Parameter                          | Type  | Default  | Description                                                       |
 | ---------------------------------- | ----- | -------- | ---------------------------------------------------------------- |
+| `opencl_ignore_intel_gpu_device`   | bool  | `true`   | Skip Intel GPUs for OpenCL (slow/buggy); set `false` to use them |
 | `depthmap_num_neighbors`           | int   | `10`     | Candidate neighboring views per image                            |
 | `depthmap_num_matching_views`      | int   | `8`      | Views actually used to estimate each depthmap                    |
 | `depthmap_min_depth`               | float | `0`      | Min depth (m). `0` = auto-infer from the reconstruction          |
@@ -326,13 +327,15 @@ Cleaned depthmaps are fused into a point cloud (and optional mesh) by a sparse-v
 | `depthmap_fusion_svo_trunc_factor`            | float | `8`          | TSDF truncation distance = factor × voxel size                       |
 | `depthmap_fusion_svo_min_weight`              | float | `2.0`        | Min voxel weight to extract a surface point                          |
 | `depthmap_fusion_svo_num_levels`              | int   | `3`          | Multi-level fill passes (`1` = fine only)                            |
-| `depthmap_fusion_svo_decimate_flat`           | int   | `4`          | Flat-surface decimation (`1` = off, `4` = keep 1/4)                  |
+| `depthmap_fusion_svo_decimate_flat`           | int   | `2`          | Flat-surface decimation (`1` = off; `N` keeps 1/N of flat points)   |
 | `depthmap_fusion_svo_edge_threshold`          | float | `0.15`       | Normal-divergence threshold protecting edges from decimation         |
 | `depthmap_fusion_svo_min_count`               | int   | `2`          | Min observation count for both voxels of a zero-crossing             |
+| `depthmap_fusion_min_cell_observers`          | int   | `2`          | Coverage-first view selection: min selected views observing a chunk cell before the per-chunk view budget is spent on quality |
 | `depthmap_fusion_svo_relative_min_weight`     | float | `0.25`       | Local adaptive weight threshold for extraction                       |
 | `depthmap_fusion_svo_max_voxels`              | int   | `80000000`   | Max voxels per SVO sub-volume (clusters are split to fit)            |
 | `depthmap_fusion_svo_augment_neighbors`       | int   | `4`          | Extra neighbor shots per cluster shot (boundary quality)             |
-| `depthmap_fusion_svo_coarse_factor`           | int   | `8`          | Coarse pre-scan cell size = factor × voxel size                      |
+| `depthmap_fusion_svo_coarse_factor`           | int   | `16`         | Coarse pre-scan cell size = factor × voxel size                      |
+| `depthmap_fusion_chunk_max_cells`             | int   | `0`          | Fusion chunk size (max coarse cells per chunk); `0` = auto (one GPU sub-volume) |
 | `depthmap_fusion_svo_refine_enabled`          | bool  | `false`      | Photometric TSDF refinement                                          |
 | `depthmap_fusion_svo_refine_iters`            | int   | `50`         | SDF refinement iterations                                            |
 | `depthmap_fusion_svo_refine_lambda_reg`       | float | `0.3`        | Laplacian regularization weight (`0` = disabled)                     |
@@ -340,7 +343,7 @@ Cleaned depthmaps are fused into a point cloud (and optional mesh) by a sparse-v
 | `depthmap_fusion_svo_refine_early_stop_rel`   | float | `0.2`        | Early-stop once RMS surface motion drops below this fraction of peak |
 | `depthmap_fusion_svo_bake_reuse_max_fusers`   | int   | `4`          | Max fusers kept resident on the GPU at once                          |
 | `depthmap_fusion_svo_bake_reuse_vram_fraction`| float | `0.5`        | VRAM fraction ceiling for retained fusers                            |
-| `depthmap_fusion_mesh_enabled`                | bool  | `true`       | Also extract a Surface Nets mesh (`mesh.ply`) from the fused TSDF    |
+| `depthmap_fusion_mesh_enabled`                | bool  | `false`      | Also extract a Surface Nets mesh (`mesh.ply`) from the fused TSDF (opt-in) |
 | `depthmap_fusion_mesh_delete_batches`         | bool  | `true`       | Delete per-cluster `mesh_batch_*.ply` after merging                 |
 
 ### Dense disk reclamation and export
@@ -365,28 +368,58 @@ Streaming tiles for the point-cloud/web viewer, built by `dense_merging` into th
 | `octree_split_depth`         | int  | `4`       | Out-of-core build: depth at which points are bucketed to disk    |
 | `octree_max_bucket_points`   | int  | `8000000` | Out-of-core build: clouds larger than this are bucketed to disk  |
 
+## Dense Colour Equalization
+
+`dense_equalize` estimates a per-image gain, white balance and radial vignetting from the SfM tracks (log-domain IRLS + PCG) so the dense colour bake (ortho, point cloud, mesh) is seam-free. Computed by the `dense_equalize` command; consumed during the bake when an `equalization.json` is present.
+
+| Parameter                          | Type  | Default    | Description                                                                  |
+| ---------------------------------- | ----- | ---------- | --------------------------------------------------------------------------- |
+| `equalize_apply_in_bake`           | bool  | `true`     | Apply the saved equalization during the dense colour bake (when `equalization.json` exists) |
+| `equalize_highlight_knee`          | float | `235.0`    | Highlight protection: correction rolls off toward identity above this luminance (`255` = disable) |
+| `equalize_vignette_order`          | int   | `2`        | Number of radial vignetting coefficients (basis ρ², ρ⁴, …)                   |
+| `equalize_min_track_length`        | int   | `3`        | A track must be seen by at least this many reconstructed images to be used   |
+| `equalize_max_observations`        | int   | `4000000`  | Cap on observations fed to the solver (whole tracks subsampled beyond it)    |
+| `equalize_saturation_margin`       | float | `2.0`      | Drop measurements within this many levels of 0/255 (clipped → unreliable)    |
+| `equalize_irls_iterations`         | int   | `5`        | IRLS (Huber) reweighting iterations for robustness to specular/moving outliers |
+| `equalize_huber_delta`             | float | `2.0`      | Huber transition, in robust-sigma units                                      |
+| `equalize_vignette_regularization` | float | `0.1`      | Ridge on the vignetting coefficients (prior toward a flat lens)              |
+| `equalize_gain_regularization`     | float | `0.001`    | Tiny ridge on the per-image gains (conditioning only)                        |
+| `equalize_gauge_weight`            | float | `1.0`      | Soft constraint `sum(log-gain)=0`, fixing the global scale and mean brightness |
+| `equalize_pcg_tol`                 | float | `0.000001` | PCG (conjugate-gradient) solver tolerance per IRLS step                      |
+| `equalize_pcg_max_iterations`      | int   | `2000`     | PCG iteration cap per IRLS step                                              |
+
 ## DSM and Orthophoto
 
 The Digital Surface Model (`dsm.tif`) and orthophoto (`ortho.tif`) are rendered during fusion and finalized by `dense_merging`. The ground sample distance is derived automatically from the fused voxel size.
 
-| Parameter                    | Type  | Default | Description                                                                       |
-| ---------------------------- | ----- | ------- | --------------------------------------------------------------------------------- |
-| `dsm_enabled`                | bool  | `true`  | Render the DSM + orthophoto during fusion                                          |
-| `dsm_territory_depth_factor` | float | `2.0`   | Drop depth samples farther than this × the view's median depth                     |
-| `dsm_save_cluster_tiles`     | bool  | `true`  | Also write each cluster's own DSM/ortho GeoTIFF before merging (debug)             |
-| `dsm_merge_feather`          | bool  | `true`  | Merge per-cluster tiles by distance-transform feather blending                     |
-| `dsm_merge_max_ram_mb`       | int   | `512`   | Soft RAM budget (MB) for the band-by-band merge                                    |
-| `dsm_wall_cull_nz`           | float | `0.5`   | Rasterize a surface triangle only if \|cos\| of its normal from vertical ≥ this    |
-| `ortho_bake_n_final_views`   | int   | `3`     | Sharpest inlier views blended for the final ortho color                            |
-| `ortho_bake_irls_iterations` | int   | `5`     | Tukey-biweight reweighting iterations for the color consensus                      |
-| `ortho_bake_dsm_occlusion`   | bool  | `true`  | Drop views occluded by a taller surface when baking hole-filled cells              |
-| `ortho_median_threshold`     | float | `24.0`  | Gated 3×3 median despeckle: replace a pixel only if it differs by more than this   |
-| `hole_fill_diffuse_iters`    | int   | `64`    | Diffusion iterations used to fill tiny DSM holes                                   |
-| `hole_fill_small_area_max`   | int   | `256`   | Holes with ≤ this many cells are "tiny" (filled by diffusion)                      |
-| `hole_fill_footprint_close`  | int   | `256`   | Morphological closing of the footprint before large-hole filling                  |
-| `hole_fill_low_percentile`   | float | `20.0`  | Large holes filled as a flat surface at this boundary-height percentile            |
-| `hole_fill_occlusion_drop`   | float | `0.0`   | Fallback occluded-ground heuristic (superseded by ortho occlusion; `0` = off)     |
-| `dsm_shock_iterations`       | int   | `6`     | Coherence-enhancing shock-filter iterations sharpening DSM edges                   |
+| Parameter                       | Type  | Default  | Description                                                                       |
+| ------------------------------- | ----- | -------- | --------------------------------------------------------------------------------- |
+| `dsm_enabled`                   | bool  | `true`   | Render the DSM + orthophoto during fusion                                          |
+| `dense_crop_to_sfm_hull`        | bool  | `true`   | Crop dense outputs (cloud + DSM/ortho) to the PCA-trimmed convex hull of the SfM ground points |
+| `dense_crop_percentile`         | float | `1.0`    | Outlier trim (percent) cut off each extremity along each PCA axis before hulling (`0` = plain hull) |
+| `dsm_territory_depth_factor`    | float | `2.0`    | Drop depth samples farther than this × the view's median depth                     |
+| `dsm_save_cluster_tiles`        | bool  | `true`   | Also write each cluster's own DSM/ortho GeoTIFF before merging (debug)             |
+| `dsm_merge_feather`             | bool  | `true`   | Merge per-cluster tiles by distance-transform feather blending                     |
+| `dsm_feather_margin_cells`      | int   | `2`      | Overlap (coarse cells) each chunk renders beyond its core for the feather/hole-fill band (`0` = hard seams) |
+| `dsm_footprint_close_cells`     | int   | `128`    | Morphological closing (coarse cells) of the occupied plan to define the completable footprint (bridges interior gaps) |
+| `dsm_footprint_trim_fraction`   | float | `0.1`    | Trim sparse axis extremities below this fraction of the median occupied count before closing (`0` = off) |
+| `dsm_merge_max_ram_mb`          | int   | `512`    | Soft RAM budget (MB) for the band-by-band merge                                    |
+| `dsm_wall_cull_nz`              | float | `0.5`    | Rasterize a surface triangle only if \|cos\| of its normal from vertical ≥ this    |
+| `ortho_bake_n_final_views`      | int   | `3`      | Sharpest inlier views blended for the final ortho color                            |
+| `ortho_bake_irls_iterations`    | int   | `5`      | Tukey-biweight reweighting iterations for the color consensus                      |
+| `ortho_bake_dsm_occlusion`      | bool  | `true`   | Drop views occluded by a taller surface when baking hole-filled cells              |
+| `ortho_detail_injection`        | bool  | `true`   | Inject the high-frequency texture the multi-view blend low-passes away             |
+| `ortho_detail_sigma`            | float | `2.0`    | Gaussian sigma (ortho pixels) splitting the low/high bands for detail injection    |
+| `ortho_detail_strength`         | float | `1.0`    | Amount of high-pass added back (`1.0` = full; `>1` over-sharpens)                  |
+| `ortho_median_threshold`        | float | `24.0`   | Gated 3×3 median despeckle: replace a pixel only if it differs by more than this   |
+| `hole_fill_diffuse_iters`       | int   | `1024`   | Diffusion iterations used to fill DSM holes routed to edge-aware diffusion         |
+| `hole_fill_small_area_max`      | int   | `262144` | Area (cells) below which a hole is "small"; larger holes use the footprint logic   |
+| `hole_fill_low_flat_max_aspect` | float | `8.0`    | Flat-fill a hole only if compact (bbox aspect ≤ this); elongated holes are diffused (`0` = off) |
+| `hole_fill_low_flat_min_thickness` | float | `15.0` | Flat-fill a hole only if thick (max inscribed-disk radius ≥ this); thin holes are diffused (`0` = off) |
+| `hole_fill_footprint_close`     | int   | `32`     | Pixel-closing iterations for the per-tile enclosure footprint before `fill_holes`  |
+| `hole_fill_low_percentile`      | float | `20.0`   | Flat holes filled at this boundary-height percentile (gravity-aligned, low edge)   |
+| `hole_fill_occlusion_drop`      | float | `0.0`    | Fallback occluded-ground heuristic (superseded by `ortho_bake_dsm_occlusion`; `0` = off) |
+| `dsm_shock_iterations`          | int   | `6`      | Coherence-enhancing shock-filter iterations sharpening DSM edges                   |
 | `dsm_shock_window`           | int   | `5`     | Structure-tensor half-window (cells); larger = straighter edges                    |
 | `dsm_shock_dt`               | float | `0.25`  | Shock-filter time step (keep ≤ 0.5 for stability)                                  |
 | `dsm_shock_coherence`        | float | `0.1`   | Along-edge diffusion weight (straightens jittered boundaries)                      |
