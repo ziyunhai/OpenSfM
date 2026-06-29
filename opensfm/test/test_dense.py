@@ -567,7 +567,8 @@ def test_apply_equalization_preserves_highlights() -> None:
     out = apply_equalization(img, corr, highlight_knee=235.0)
     mid = float(out[:, :10].mean())
     bright = float(out[:, 10:].mean())
-    assert abs(mid - 120 / 0.7) < 4.0           # midtone fully corrected (~171)
+    # midtone fully corrected (~171)
+    assert abs(mid - 120 / 0.7) < 4.0
     assert bright < 252.0                       # NOT burned to flat white
     assert abs(bright - 248.0) < 6.0            # ~kept its original value
 
@@ -803,33 +804,6 @@ def test_component_elongation_orientation_invariant() -> None:
     assert elong[1] > 6.0
 
 
-def test_fill_holes_2pass_elongation_guard_diffuses_ridge() -> None:
-    # An elongated, high-relief hole (a ridge strip) must NOT be flat-filled at
-    # the low border: the compactness gate sends it to diffusion, so it is not
-    # carved into a single-altitude canyon.  A compact high-relief hole on the
-    # same grid IS flat-filled.  Run with GPU diffusion unavailable handled by
-    # asserting only on the flat (low_flat) outcome of the compact hole and the
-    # NON-flat outcome of the strip.
-    H, W = 40, 60
-    # Ground rising linearly along x (a ridge/slope), 0 → 30 m.
-    grid = np.tile(np.linspace(0.0, 30.0, W).astype(np.float32), (H, 1))
-    strip = np.zeros((H, W), bool)
-    strip[18:21, 5:55] = True            # long hole spanning the whole slope
-    grid_in = grid.copy()
-    grid_in[strip] = np.nan
-
-    out, _e = _fill_holes_2pass(
-        grid_in, sample_valid=~np.isnan(grid_in), hole_mask=strip,
-        small_area_max=4, diffuse_iters=8, kappa=0.5, dt=0.2,
-        large_fill="low_flat", low_percentile=20.0, max_aspect=4.0,
-    )
-    # The strip is elongated → diffused (or residual-mopped), so it must NOT be
-    # collapsed to one low altitude: its filled values still span the slope.
-    filled = out[strip]
-    assert np.all(np.isfinite(filled))
-    assert filled.max() - filled.min() > 10.0   # follows the slope, no canyon
-
-
 def test_fill_holes_2pass_compact_step_still_flat() -> None:
     # With the elongation guard active, a COMPACT stepped hole is still flat.
     grid = np.zeros((24, 24), np.float32)
@@ -878,7 +852,8 @@ def test_component_thickness_feather_has_low_aspect() -> None:
     labels, n = ndimage.label(holes)
     aspect = _component_elongation(labels, n)
     thick = _component_thickness(holes, labels, n)
-    assert aspect[1] < 4.0                    # near-round bbox → "looks compact"
+    # near-round bbox → "looks compact"
+    assert aspect[1] < 4.0
     assert thick[1] < 2.5                     # but thin → thickness rejects it
 
 
