@@ -121,6 +121,7 @@ Add `--dense` to include the dense stages, or `--resume` to recover an interrupt
 * [Dense reconstruction & 2D maps](doc/dense.md)
 * [Georeferencing & GIS outputs](doc/georeferencing.md)
 * [Quality report](doc/quality_report.md)
+* [Troubleshooting](doc/troubleshooting.md)
 
 **Reference**
 * [Camera models & coordinate systems](doc/geometry.md)
