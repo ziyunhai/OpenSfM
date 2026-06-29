@@ -1286,9 +1286,12 @@ void SVOIntegratorCL::RefineGeometry(int iters, float lambda_reg,
     // ---- Step 3: Adam update on SDF ----
     if (track_step) {
       // Zero this iteration's motion accumulator before the update writes it.
-      const float zero = 0.0f;
-      queue.enqueueFillBuffer(cl_step_accum, zero, 0,
-                              2 * kStepBuckets * sizeof(float));
+      // enqueueWriteBuffer, not enqueueFillBuffer (no-ops on Apple — see
+      // svo_fill_i32 in the kernel source).
+      std::fill(step_cpu.begin(), step_cpu.end(), 0.0f);
+      queue.enqueueWriteBuffer(cl_step_accum, CL_FALSE, 0,
+                               2 * kStepBuckets * sizeof(float),
+                               step_cpu.data());
     }
     {
       int arg = 0;
@@ -1363,16 +1366,12 @@ void SVOIntegratorCL::RefineGeometry(int iters, float lambda_reg,
   cl_refine_adam_ = cl::Buffer();
 }
 
-void SVOIntegratorCL::BakeColors(const std::vector<Vec3f>& points,
-                                 const std::vector<Vec3f>& normals,
-                                 std::vector<Vec3<uint8_t>>* out_colors,
-                                 int n_final, int irls_iters,
-                                 const std::vector<uint8_t>* relax_occ,
-                                 const std::vector<float>* dsm_occ, int dsm_w,
-                                 int dsm_h, float dsm_origin_x,
-                                 float dsm_origin_y, float dsm_gsd,
-                                 float dsm_max_z,
-                                 std::vector<uint8_t>* out_sharp) {
+void SVOIntegratorCL::BakeColors(
+    const std::vector<Vec3f>& points, const std::vector<Vec3f>& normals,
+    std::vector<Vec3<uint8_t>>* out_colors, int n_final, int irls_iters,
+    const std::vector<uint8_t>* relax_occ, const std::vector<float>* dsm_occ,
+    int dsm_w, int dsm_h, float dsm_origin_x, float dsm_origin_y, float dsm_gsd,
+    float dsm_max_z, std::vector<uint8_t>* out_sharp) {
   if (!refine_prepared_) {
     throw std::runtime_error(
         "SVOIntegratorCL::BakeColors: PrepareRefinement() not called");
@@ -1415,9 +1414,9 @@ void SVOIntegratorCL::BakeColors(const std::vector<Vec3f>& points,
   }
 
   // Optional DSM heightfield for per-view horizon occlusion of filled cells.
-  const bool has_dsm_occ = dsm_occ && dsm_w > 0 && dsm_h > 0 &&
-                           dsm_occ->size() ==
-                               static_cast<size_t>(dsm_w) * dsm_h;
+  const bool has_dsm_occ =
+      dsm_occ && dsm_w > 0 && dsm_h > 0 &&
+      dsm_occ->size() == static_cast<size_t>(dsm_w) * dsm_h;
   cl::Buffer cl_dsm;
   if (has_dsm_occ) {
     cl_dsm = cl::Buffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
@@ -1719,7 +1718,15 @@ void SVOIntegratorCL::RenderDSMOrtho(float origin_x, float origin_y, float gsd,
                         float vsize, const cl::Buffer& zbuf) {
     cl::Buffer vert(ctx, CL_MEM_READ_WRITE,
                     static_cast<size_t>(cap) * 3 * sizeof(float));
-    queue.enqueueFillBuffer(zbuf, kEmptyZ, 0, ncells * sizeof(int32_t));
+    {
+      cl::Kernel kfill(program_, "svo_fill_i32");
+      kfill.setArg(0, zbuf);
+      kfill.setArg(1, kEmptyZ);
+      kfill.setArg(2, static_cast<uint32_t>(ncells));
+      const size_t gf = ((ncells + 255) / 256) * 256;
+      queue.enqueueNDRangeKernel(kfill, cl::NullRange, cl::NDRange(gf),
+                                 cl::NDRange(256));
+    }
     // Cap a triangle's cell footprint generously above the cube pitch (1
     // voxel) to kill degenerate triangles; scales with the level's voxel.
     const int max_tri_cells = std::max(4, static_cast<int>(4.0f * vsize / gsd));
@@ -1779,7 +1786,7 @@ void SVOIntegratorCL::RenderDSMOrtho(float origin_x, float origin_y, float gsd,
                                  cl::NDRange(256));
     }
     const uint32_t zero = 0;
-    queue.enqueueFillBuffer(cl_overflow, zero, 0, sizeof(uint32_t));
+    queue.enqueueWriteBuffer(cl_overflow, CL_FALSE, 0, sizeof(uint32_t), &zero);
     {
       cl::Kernel k(program_, "svo_dc_downsample");
       k.setArg(0, cl_table_);
@@ -1946,8 +1953,8 @@ void SVOIntegratorCL::ExtractMesh(float min_weight, float voxel_size,
   // Each vertex-owning cube emits at most 3 quads = 6 triangles.
   const uint64_t want_tris = static_cast<uint64_t>(n_verts) * 6ull;
   const uint64_t tri_mem_limit = max_alloc / (3 * sizeof(int));
-  const uint32_t max_tris = static_cast<uint32_t>(
-      std::min<uint64_t>(want_tris, tri_mem_limit));
+  const uint32_t max_tris =
+      static_cast<uint32_t>(std::min<uint64_t>(want_tris, tri_mem_limit));
 
   cl::Buffer cl_tris(ctx, CL_MEM_READ_WRITE,
                      static_cast<size_t>(max_tris) * 3 * sizeof(int));
@@ -2003,7 +2010,8 @@ void SVOIntegratorCL::ExtractMesh(float min_weight, float voxel_size,
   queue.finish();
 
   for (uint32_t i = 0; i < n_verts; ++i) {
-    (*verts_out)[i] = Vec3f(host_v[i * 3], host_v[i * 3 + 1], host_v[i * 3 + 2]);
+    (*verts_out)[i] =
+        Vec3f(host_v[i * 3], host_v[i * 3 + 1], host_v[i * 3 + 2]);
     (*normals_out)[i] =
         Vec3f(host_n[i * 3], host_n[i * 3 + 1], host_n[i * 3 + 2]);
   }

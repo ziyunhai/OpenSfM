@@ -173,6 +173,18 @@ __kernel void svo_clear_table(__global VoxelSlot* table, uint capacity) {
     table[i]._pad       = 0;
 }
 
+// Fill an int32 buffer with a constant.  Used in place of clEnqueueFillBuffer,
+// which is unreliable on some OpenCL drivers — notably Apple's, where it can
+// silently no-op.  That left the DSM z-buffer uninitialised instead of set to
+// the -1 "empty" sentinel, so svo_dc_finalize read every cell as a valid flat
+// height (~z_min) → a flat DSM + an all-black ortho bake.  The rest of this
+// file already initialises buffers via enqueueWriteBuffer for the same reason.
+__kernel void svo_fill_i32(__global int* buf, int value, uint n) {
+    uint i = get_global_id(0);
+    if (i >= n) return;
+    buf[i] = value;
+}
+
 
 #define COS_THETA_MIN 0.15f   // ~81° — skip pixels at more grazing angles
 
