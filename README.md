@@ -93,6 +93,18 @@ bin\opensfm_run_all.bat path\to\dataset  # Windows
 
 **Workflow presets** — ready-made `config.yaml` files tuned for common capture types live in [`configs/`](configs/) (`aerial`, `terrestrial`, `object`). Copy one into your dataset to start from sensible defaults: `cp configs/aerial.yaml path/to/dataset/config.yaml`. See [workflow presets](doc/using.md#workflow-presets-configs).
 
+## ⏱️ Benchmarking
+
+A built-in harness measures the impact of a change on **speed and quality across commits**. It builds any commit in an isolated git worktree + conda env, runs the pipeline on your datasets, and produces an HTML report that diffs the run against a reference commit (green = better, red = worse).
+
+```bash
+# Baseline, then your branch compared against it
+python -m benchmark.run --config benchmark/benchmark_example.json --commit master
+python -m benchmark.run --config benchmark/benchmark_example.json --commit my-feature --reference master
+```
+
+Add `--dense` to include the dense stages, or `--resume` to recover an interrupted run. See the [benchmarking guide](doc/benchmark.md) for the full workflow — resuming, report-only regeneration, and partial re-runs.
+
 ## 📚 Documentation
 
 **Getting Started**
@@ -119,6 +131,9 @@ bin\opensfm_run_all.bat path\to\dataset  # Windows
 **Mathematical Notes**
 * [Dense matching](doc/dense_matching.md)
 * [Reconstruction merging](doc/merging_notes.md)
+
+**Development**
+* [Benchmarking](doc/benchmark.md)
 
 ## ⚖️ License
 OpenSfM is BSD-style licensed, as found in the LICENSE file.

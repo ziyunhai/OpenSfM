@@ -74,9 +74,11 @@ def _initialize_declared_submodules(worktree_path: str) -> None:
         logger.info("No declared submodules found in worktree")
         return
 
-    logger.info("Initializing %d declared submodule(s) in worktree", len(submodule_paths))
+    logger.info("Initializing %d declared submodule(s) in worktree",
+                len(submodule_paths))
     subprocess.run(
-        ["git", "submodule", "update", "--init", "--recursive", "--", *submodule_paths],
+        ["git", "submodule", "update", "--init",
+            "--recursive", "--", *submodule_paths],
         cwd=worktree_path,
         check=True,
     )
@@ -281,3 +283,59 @@ def _setup_dataset_inner(source_dir: str, target_dir: str, config_file: Optional
         if os.path.isdir(src):
             shutil.copytree(src, os.path.join(
                 target_dir, dirname), dirs_exist_ok=True)
+
+
+def stage_dataset_local(nas_dataset_dir: str, local_dataset_dir: str) -> None:
+    """Create ``local_dataset_dir`` seeded from the NAS dataset directory.
+
+    Copies whatever already exists on the NAS — the lightweight setup files for
+    a fresh run, or prior step outputs when resuming — so the pipeline can then
+    run entirely against local disk.  Symlinks (e.g. bootstrapped step outputs)
+    are preserved as-is.
+    """
+    old_umask = os.umask(0o000)
+    try:
+        parent = os.path.dirname(local_dataset_dir)
+        if parent:
+            os.makedirs(parent, exist_ok=True, mode=0o777)
+        # Start from a clean slate in case a previous staging was interrupted.
+        if os.path.lexists(local_dataset_dir):
+            shutil.rmtree(local_dataset_dir, ignore_errors=True)
+        if os.path.isdir(nas_dataset_dir):
+            shutil.copytree(nas_dataset_dir, local_dataset_dir, symlinks=True)
+        else:
+            os.makedirs(local_dataset_dir, exist_ok=True, mode=0o777)
+    finally:
+        os.umask(old_umask)
+
+
+def sync_dataset_to_nas(local_dataset_dir: str, nas_dataset_dir: str) -> None:
+    """Mirror the locally-processed dataset back to its NAS location.
+
+    The local tree is the source of truth after a run, so the NAS copy is
+    replaced wholesale — this also propagates files deleted during processing
+    (e.g. reclaimed raw depthmaps).  Refuses to wipe the NAS copy if the local
+    directory is missing, guarding against destroying results on a staging bug.
+    """
+    if not os.path.isdir(local_dataset_dir):
+        logger.warning(
+            "Local staging dir %s missing; leaving NAS copy untouched.",
+            local_dataset_dir,
+        )
+        return
+
+    old_umask = os.umask(0o000)
+    try:
+        parent = os.path.dirname(nas_dataset_dir)
+        if parent:
+            os.makedirs(parent, exist_ok=True, mode=0o777)
+        if os.path.isdir(nas_dataset_dir):
+            shutil.rmtree(nas_dataset_dir)
+        shutil.copytree(local_dataset_dir, nas_dataset_dir, symlinks=True)
+    finally:
+        os.umask(old_umask)
+
+
+def cleanup_local_dir(local_dir: str) -> None:
+    """Remove a local staging directory, ignoring errors."""
+    shutil.rmtree(local_dir, ignore_errors=True)

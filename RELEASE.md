@@ -89,6 +89,15 @@ This release is a big jump and the first major so here is the list of features :
 - Web/point-cloud viewer via streaming octree tiles (`point_cloud/`) — config: [Octree tiling](doc/configuration.md#octree-tiling)
 - Rerun export (SfM) with GPS/GCP data, and quality report. — [`export_rerun`](doc/using.md#export_rerun)
 
+### ⏱️ Benchmarking
+
+> Guide: [Benchmarking](doc/benchmark.md)
+
+- Reproducible per-commit benchmarks — each run builds a chosen commit in an isolated git worktree + dedicated conda env, leaving your checkout untouched
+- Runs the pipeline on a configurable set of datasets, SfM-only or with the full dense stages (`--dense`)
+- HTML A/B report comparing quality (reconstruction, reprojection, tracks, features, GPS/GCP errors) and per-step timings against a reference commit
+- Crash-safe and resumable — resume an interrupted run, re-run from a given step, bootstrap early steps from a previous run, or regenerate the report only
+
 ## 🩹 Bugfixes
 
 ## 🫣 Known Issues

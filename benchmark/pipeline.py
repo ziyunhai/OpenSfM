@@ -4,12 +4,19 @@
 import json
 import logging
 import os
+import shutil
 import subprocess
+import tempfile
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from benchmark.config import BenchmarkConfig
+from benchmark.workspace import (
+    cleanup_local_dir,
+    stage_dataset_local,
+    sync_dataset_to_nas,
+)
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -319,6 +326,8 @@ def run_all_datasets(
     existing_meta: Optional[Dict[str, Any]] = None,
     bootstrap_run_dir: Optional[str] = None,
     dense: bool = False,
+    local_staging: bool = False,
+    scratch_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run the pipeline on all datasets, saving run_meta.json after each one.
 
@@ -326,9 +335,21 @@ def run_all_datasets(
         bootstrap_run_dir: When from_step is set on a fresh run, copy/symlink
                            outputs of steps before from_step from this directory.
         dense:             If True, also run the dense-reconstruction stages.
+        local_staging:     If True, process each dataset on a local scratch disk
+                           and mirror the result tree back to ``run_dir`` once,
+                           so NAS I/O does not dominate the timings.
+        scratch_dir:       Base directory for local staging (default: $TMPDIR).
 
     Returns the final run metadata dict.
     """
+    staging_root: Optional[str] = None
+    if local_staging:
+        base = scratch_dir or tempfile.gettempdir()
+        staging_root = os.path.join(
+            base, "opensfm-bench-" + os.path.basename(os.path.normpath(run_dir))
+        )
+        os.makedirs(staging_root, exist_ok=True)
+        logger.info("Local staging enabled — scratch root: %s", staging_root)
     run_meta: Dict[str, Any] = existing_meta or {
         "commit": commit_hash,
         "date": datetime.now(timezone.utc).isoformat(),
@@ -349,20 +370,42 @@ def run_all_datasets(
     total_t0 = time.monotonic()
 
     for dataset_name in config.datasets:
-        dataset_path = os.path.join(run_dir, dataset_name)
+        nas_dataset_path = os.path.join(run_dir, dataset_name)
         logger.info("Running pipeline on %s", dataset_name)
 
-        if from_step and bootstrap_run_dir:
-            src_ds = os.path.join(bootstrap_run_dir, dataset_name)
-            if os.path.isdir(src_ds):
-                logger.info("  Bootstrapping %s from %s", dataset_name, src_ds)
-                bootstrap_dataset(src_ds, dataset_path, from_step, dense=dense)
-        pipeline_result = run_pipeline(
-            opensfm_bin, dataset_path, conda_env,
-            resume=resume,
-            from_step=from_step,
-            dense=dense,
-        )
+        # Process on local disk when staging; otherwise straight on the NAS.
+        dataset_path = nas_dataset_path
+        local_dir: Optional[str] = None
+        if staging_root is not None:
+            local_dir = os.path.join(staging_root, dataset_name)
+            logger.info("  Staging %s on local disk: %s",
+                        dataset_name, local_dir)
+            stage_dataset_local(nas_dataset_path, local_dir)
+            dataset_path = local_dir
+
+        try:
+            if from_step and bootstrap_run_dir:
+                src_ds = os.path.join(bootstrap_run_dir, dataset_name)
+                if os.path.isdir(src_ds):
+                    logger.info("  Bootstrapping %s from %s",
+                                dataset_name, src_ds)
+                    bootstrap_dataset(
+                        src_ds, dataset_path, from_step, dense=dense)
+            pipeline_result = run_pipeline(
+                opensfm_bin, dataset_path, conda_env,
+                resume=resume,
+                from_step=from_step,
+                dense=dense,
+            )
+        finally:
+            # Always mirror results back (even on failure) so partial outputs
+            # and reports are preserved on the NAS, then drop the local copy.
+            if local_dir is not None:
+                logger.info("  Moving %s results to %s",
+                            dataset_name, nas_dataset_path)
+                sync_dataset_to_nas(local_dir, nas_dataset_path)
+                cleanup_local_dir(local_dir)
+
         run_meta["datasets"][dataset_name] = pipeline_result
         # Persist after each dataset so a crash is recoverable
         save_run_meta(run_meta, run_dir)
@@ -371,5 +414,8 @@ def run_all_datasets(
     run_meta["status"] = "complete"
     save_run_meta(run_meta, run_dir)
     logger.info("Run metadata written to %s/run_meta.json", run_dir)
+
+    if staging_root is not None:
+        shutil.rmtree(staging_root, ignore_errors=True)
 
     return run_meta
