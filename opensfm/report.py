@@ -821,7 +821,7 @@ class Report:
                     self.locale.format_distance(r_le90, precision=3) if r_le90 > 0 else "-",
                 ],
             ]
-            self._make_table(["", self.locale.t("absolute"), self.locale.t("relative")], rows, True)
+            self._make_table(["", self.locale.t("absolute"), self.locale.t("relative")], rows, False)
             self.pdf.set_xy(MARGIN, self.pdf.get_y() + TABLE_GAP)
 
         rows = []
