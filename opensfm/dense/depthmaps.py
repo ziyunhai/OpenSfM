@@ -32,7 +32,7 @@ _MAX_PARALLEL_PER_DEVICE: int = 1
 def discover_gpu_devices(config: Dict[str, Any]) -> List[int]:
     """Return the ordered list of usable GPU device indices.
 
-    Intel devices are skipped when ``opencl_ignore_intel_device`` is set.
+    Intel devices are skipped when ``opencl_ignore_intel_gpu_device`` is set.
     Returns an empty list when no OpenCL GPU is available.
     """
     num_devices = 0
@@ -42,7 +42,7 @@ def discover_gpu_devices(config: Dict[str, Any]) -> List[int]:
         logger.warning("No OpenCL devices found — cannot compute depthmaps")
         return []
 
-    ignore_intel_device = config["opencl_ignore_intel_device"]
+    ignore_intel_device = config["opencl_ignore_intel_gpu_device"]
 
     # Build ordered device list: GPUs only
     gpu_devs: List[int] = []

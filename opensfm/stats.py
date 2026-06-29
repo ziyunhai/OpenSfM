@@ -566,6 +566,7 @@ def processing_statistics(
 
     optional_steps = {
         "Dense Clustering": "dense_clustering.json",
+        "Dense Equalize": "dense_equalize.json",
         "Dense Depthmaps": "dense_depthmaps.json",
         "Dense Fusion": "dense_fusion.json",
         "Dense Merging": "dense_merging.json",

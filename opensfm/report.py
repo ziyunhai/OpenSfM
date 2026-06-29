@@ -652,7 +652,7 @@ class Report:
             ("Features", ["Feature Extraction"]),
             ("Matching", ["Features Matching"]),
             ("Reconstruction", ["Tracks Merging", "Reconstruction"]),
-            ("Dense", ["Dense Clustering", "Dense Depthmaps",
+            ("Dense", ["Dense Clustering", "Dense Equalize", "Dense Depthmaps",
                        "Dense Fusion", "Dense Merging"]),
             ("Statistics", ["Statistics"]),
             ("Total Time", ["Total Time"]),

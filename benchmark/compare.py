@@ -181,6 +181,8 @@ TIMING_METRICS: List[MetricDef] = [
 DENSE_TIMING_METRICS: List[MetricDef] = [
     ("Dense Clustering (s)",
      "processing_statistics.steps_times.Dense Clustering", True),
+    ("Dense Equalize (s)",
+     "processing_statistics.steps_times.Dense Equalize", True),
     ("Dense Depthmaps (s)",
      "processing_statistics.steps_times.Dense Depthmaps", True),
     ("Dense Fusion (s)", "processing_statistics.steps_times.Dense Fusion", True),

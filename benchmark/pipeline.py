@@ -30,6 +30,7 @@ PIPELINE_STEPS: List[str] = [
 DENSE_STEPS: List[str] = [
     "undistort",
     "dense_clustering",
+    "dense_equalize",
     "compute_depthmaps",
     "fuse_depthmaps",
     "dense_merging",
@@ -61,6 +62,7 @@ STEP_OUTPUT_FILES: Dict[str, str] = {
     "create_tracks": "tracks.csv",
     "reconstruct": "reconstruction.json",
     "undistort": "undistorted/reconstruction.json",
+    "dense_equalize": "reports/dense_equalize.json",
     "dense_clustering": "reports/dense_clustering.json",
     "compute_depthmaps": "reports/dense_depthmaps.json",
     "fuse_depthmaps": "reports/dense_fusion.json",
@@ -80,6 +82,7 @@ STEP_OUTPUTS: Dict[str, List[str]] = {
     "create_tracks": ["tracks.csv", "reports/tracks.json"],
     "reconstruct": ["reconstruction.json", "reports/reconstruction.json"],
     "undistort": ["undistorted"],
+    "dense_equalize": ["reports/dense_equalize.json"],
     "dense_clustering": ["reports/dense_clustering.json"],
     "compute_depthmaps": ["reports/dense_depthmaps.json"],
     "fuse_depthmaps": ["reports/dense_fusion.json"],
