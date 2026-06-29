@@ -77,7 +77,7 @@ def _gps_errors(reconstruction: types.Reconstruction) -> List[NDArray]:
 
 def _compute_value_at_p_level(samples: NDArray, p: float = 0.90) -> float:
     """Based on the method described in "Computation of scalar accuracy metrics LE, CE, and SE as both predictive and sample-based statistics"
-    # https://masseranolabs.com/IGTF2016-000255.pdf"""
+    https://masseranolabs.com/IGTF2016-000255.pdf"""
     n = len(samples)
     if n < 1:
         return -1
