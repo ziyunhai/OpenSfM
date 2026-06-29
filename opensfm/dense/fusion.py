@@ -1000,7 +1000,8 @@ def fuse_chunks(
                 if equalization is not None and sid in equalization:
                     color = apply_equalization(
                         color, equalization[sid],
-                        highlight_knee=float(config["equalize_highlight_knee"]),
+                        highlight_knee=float(
+                            config["equalize_highlight_knee"]),
                     )
                 return sid, color
 
@@ -1611,7 +1612,7 @@ def fuse_chunks(
             )
 
             dsm_grid, dsm_extrap = _fill_dsm_holes(
-                dsm_grid, config, footprint=terr_mask
+                dsm_grid, config, footprint=terr_mask,
             )
             logger.info(
                 "  Filled DSM territory holes (diffuse tiny + flat-low pockets)"

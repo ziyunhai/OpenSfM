@@ -9,6 +9,8 @@ from opensfm.dense.equalize import estimate_image_corrections, apply_equalizatio
 from opensfm.dense import crop
 from opensfm.dataset import UndistortedDataSet
 from opensfm.dense.dsm_ortho import (
+    _component_elongation,
+    _component_thickness,
     _dsm_footprint,
     _fill_holes_2pass,
     _inject_ortho_detail,
@@ -752,3 +754,154 @@ def test_crop_hull_too_few_points_returns_none() -> None:
     # Collinear points are degenerate → no crop.
     line = np.column_stack([np.arange(10.0), np.zeros(10), np.zeros(10)])
     assert crop.crop_hull_from_points(line, percentile=2.0) is None
+
+
+# ────────────── DSM hole-fill routing by hole shape (elongation) ─────────────
+
+
+def test_fill_holes_2pass_area_split_when_no_aspect() -> None:
+    # max_aspect = 0 (off) keeps the legacy AREA split: a large hole is sent to
+    # low_flat (filled flat at the single border altitude), not diffused.
+    grid = np.full((30, 30), 5.0, np.float32)
+    hole = np.zeros((30, 30), bool)
+    hole[5:25, 5:25] = True                   # 400-cell hole
+    grid[hole] = np.nan
+
+    out, _extrap = _fill_holes_2pass(
+        grid, sample_valid=~np.isnan(grid), hole_mask=hole,
+        small_area_max=16, diffuse_iters=8, kappa=0.5, dt=0.2,
+        large_fill="low_flat", low_percentile=20.0, max_aspect=0.0,
+    )
+    assert np.allclose(out[hole], 5.0, atol=1e-3)
+
+
+def test_component_elongation_compact_vs_elongated() -> None:
+    from scipy import ndimage
+
+    holes = np.zeros((40, 40), bool)
+    holes[5:11, 5:11] = True            # 6x6 compact blob   → aspect ~1
+    holes[20:22, 5:35] = True           # 2x30 long strip    → aspect large
+    labels, n = ndimage.label(holes)
+    elong = _component_elongation(labels, n)
+    # Identify the two components by their bbox.
+    blob = labels[7, 7]
+    strip = labels[20, 20]
+    assert elong[blob] < 2.0
+    assert elong[strip] > 8.0
+
+
+def test_component_elongation_orientation_invariant() -> None:
+    from scipy import ndimage
+
+    # A diagonal strip (square bbox) must still read as elongated.
+    holes = np.zeros((40, 40), bool)
+    for i in range(30):
+        holes[5 + i, 5 + i] = True
+        holes[5 + i, 6 + i] = True
+    labels, n = ndimage.label(holes)
+    elong = _component_elongation(labels, n)
+    assert elong[1] > 6.0
+
+
+def test_fill_holes_2pass_elongation_guard_diffuses_ridge() -> None:
+    # An elongated, high-relief hole (a ridge strip) must NOT be flat-filled at
+    # the low border: the compactness gate sends it to diffusion, so it is not
+    # carved into a single-altitude canyon.  A compact high-relief hole on the
+    # same grid IS flat-filled.  Run with GPU diffusion unavailable handled by
+    # asserting only on the flat (low_flat) outcome of the compact hole and the
+    # NON-flat outcome of the strip.
+    H, W = 40, 60
+    # Ground rising linearly along x (a ridge/slope), 0 → 30 m.
+    grid = np.tile(np.linspace(0.0, 30.0, W).astype(np.float32), (H, 1))
+    strip = np.zeros((H, W), bool)
+    strip[18:21, 5:55] = True            # long hole spanning the whole slope
+    grid_in = grid.copy()
+    grid_in[strip] = np.nan
+
+    out, _e = _fill_holes_2pass(
+        grid_in, sample_valid=~np.isnan(grid_in), hole_mask=strip,
+        small_area_max=4, diffuse_iters=8, kappa=0.5, dt=0.2,
+        large_fill="low_flat", low_percentile=20.0, max_aspect=4.0,
+    )
+    # The strip is elongated → diffused (or residual-mopped), so it must NOT be
+    # collapsed to one low altitude: its filled values still span the slope.
+    filled = out[strip]
+    assert np.all(np.isfinite(filled))
+    assert filled.max() - filled.min() > 10.0   # follows the slope, no canyon
+
+
+def test_fill_holes_2pass_compact_step_still_flat() -> None:
+    # With the elongation guard active, a COMPACT stepped hole is still flat.
+    grid = np.zeros((24, 24), np.float32)
+    grid[:, 12:] = 10.0
+    hole = np.zeros((24, 24), bool)
+    hole[9:15, 9:15] = True              # compact, straddles the step
+    grid[hole] = np.nan
+    out, _e = _fill_holes_2pass(
+        grid, sample_valid=~np.isnan(grid), hole_mask=hole,
+        small_area_max=4, diffuse_iters=8, kappa=0.5, dt=0.2,
+        large_fill="low_flat", low_percentile=20.0, max_aspect=4.0,
+    )
+    assert out[hole].max() < 3.0          # flat at ground, not slanted to roof
+
+
+def test_component_thickness_blob_vs_feather() -> None:
+    from scipy import ndimage
+
+    holes = np.zeros((60, 60), bool)
+    holes[5:25, 5:25] = True                 # 20x20 chunky blob → thick
+    # A wiggly, BRANCHING thin tendril (1-2 px wide): near-round bbox (low
+    # aspect) but thin everywhere.
+    for i in range(30):
+        r = 35 + int(3 * np.sin(i / 3.0))
+        holes[r, 10 + i] = True
+        holes[r + 1, 10 + i] = True
+    holes[40:55, 25] = True                  # a branch off the tendril
+    labels, n = ndimage.label(holes)
+    thick = _component_thickness(holes, labels, n)
+    blob = labels[15, 15]
+    feather = labels[35, 12]
+    assert thick[blob] > 6.0                 # big inscribed disk
+    assert thick[feather] < 2.5              # thin everywhere
+
+
+def test_component_thickness_feather_has_low_aspect() -> None:
+    # The branching feather that thickness catches is NOT caught by aspect — its
+    # bounding box is near-round.  This is exactly why the thickness gate exists.
+    from scipy import ndimage
+
+    holes = np.zeros((60, 60), bool)
+    for i in range(30):
+        r = 30 + int(10 * np.sin(i / 4.0))   # wiggles across 20 rows
+        holes[r, 10 + i] = True
+        holes[r + 1, 10 + i] = True
+    labels, n = ndimage.label(holes)
+    aspect = _component_elongation(labels, n)
+    thick = _component_thickness(holes, labels, n)
+    assert aspect[1] < 4.0                    # near-round bbox → "looks compact"
+    assert thick[1] < 2.5                     # but thin → thickness rejects it
+
+
+def test_fill_holes_2pass_thickness_diffuses_feather() -> None:
+    # A thin feather on a slope must be diffused (follows the slope), NOT flat-
+    # filled into a canyon — even though its aspect ratio is modest.
+    H, W = 50, 50
+    grid = np.tile(np.linspace(0.0, 30.0, W).astype(np.float32), (H, 1))
+    feather = np.zeros((H, W), bool)
+    for i in range(40):
+        r = 25 + int(8 * np.sin(i / 5.0))
+        feather[r, 5 + i] = True
+        feather[r + 1, 5 + i] = True
+    grid_in = grid.copy()
+    grid_in[feather] = np.nan
+
+    out, _e = _fill_holes_2pass(
+        grid_in, sample_valid=~np.isnan(grid_in), hole_mask=feather,
+        small_area_max=4, diffuse_iters=16, kappa=0.5, dt=0.2,
+        large_fill="low_flat", low_percentile=20.0,
+        max_aspect=8.0, min_thickness=3.0,
+    )
+    filled = out[feather]
+    assert np.all(np.isfinite(filled))
+    # Follows the slope (spread), not collapsed to one low altitude (canyon).
+    assert filled.max() - filled.min() > 10.0

@@ -614,9 +614,13 @@ class OpenSfMConfig:
     # Gated 3x3 median despeckle of the baked ortho: a pixel is replaced by the local median only when it differs from it by more than this
     ortho_median_threshold: float = 24.0
     # DSM Post-process hole filling : a hole's connected component is "tiny" when it has <= hole_fill_small_area_max cells
-    hole_fill_diffuse_iters: int = 64
+    hole_fill_diffuse_iters: int = 1024
     # DSM Post-process hole filling : when a hole is "tiny", it is filled by diffusion
-    hole_fill_small_area_max: int = 256
+    hole_fill_small_area_max: int = 2 ** 18
+    # DSM hole routing by hole SHAPE (not area, not boundary height): a hole is filled FLAT (low_flat occluded-ground model, sharp roof edge) only when it is COMPACT — its aspect ratio (major/minor principal axis of its cells, orientation-invariant) is <= this; more-elongated holes are filled by smooth edge-aware diffusion (follows the terrain) instead. This is the geometric guard against the "ridge canyon": an elongated hole running along a ridge/valley spans a wide altitude range, so flat-filling it at the lowest border altitude carves a flat canyon where that altitude is unrelated to the far end. Shape distinguishes a genuine occlusion STEP (compact man-made → flat is right) from terrain VARIATION (elongated → diffuse), which a boundary-height test cannot (a slope spans as much height as a roof). Independent of hole area, so the diffusion can be made strong enough (diffuse_iters / small_area_max) to fill large soil holes while compact man-made holes still get the sharp flat fill. 0 = disable the gate (route by hole_fill_small_area_max area instead, legacy). Lower = stricter (more diffusion); ~3-5 is typical.
+    hole_fill_low_flat_max_aspect: float = 8.0
+    # DSM low_flat THINNESS gate (complements the aspect gate above): a hole is only flat-filled if it is also THICK — its largest inscribed-disk radius (max of the distance transform = local half-width, in cells) is >= this; thinner holes are diffused instead. This catches morphologically THIN / feathery / branching holes that the bbox aspect ratio misses: a wiggly or branching feather has a near-round bounding box (low aspect → looks "compact") yet is thin everywhere, and flat-filling it carves a thin canyon. 0 = disable. Raise to diffuse thicker structures; ~2-4 cells is typical.
+    hole_fill_low_flat_min_thickness: float = 15.0
     # DSM hole filling : pixel-closing iterations for the per-tile "local" enclosure footprint (bridges ragged render-boundary gaps before binary_fill_holes). Kept small: the closing is extensive (border_value=1), so a large value would balloon the footprint past the rendered surface. binary_fill_holes already fills every fully-enclosed void at any size; this only bridges open mouths.
     hole_fill_footprint_close: int = 32
     # DSM large-hole fill geometry: instead of linearly interpolating across the hole (which slants ground up to a bordering roof), complete it as a gravity-aligned FLAT surface at the LOW altitude of its boundary

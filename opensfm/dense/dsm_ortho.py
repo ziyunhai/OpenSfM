@@ -262,6 +262,56 @@ def _low_flat_fill_components(
                 no_relax_out[y0:y1, x0:x1][comp] = True
 
 
+def _component_elongation(labels: NDArray, n_comp: int) -> NDArray:
+    """Per-component elongation: ratio of the MAJOR to MINOR principal-axis
+    extent of each hole's cells (≈ aspect ratio; 1 = round/compact, large = long
+    and thin).
+    """
+    elong = np.ones(n_comp + 1, dtype=np.float64)
+    ys, xs = np.nonzero(labels)
+    if ys.size == 0:
+        return elong
+    lab = labels[ys, xs]
+    ml = n_comp + 1
+    yf = ys.astype(np.float64)
+    xf = xs.astype(np.float64)
+    n = np.bincount(lab, minlength=ml).astype(np.float64)
+    nn = np.where(n >= 1.0, n, 1.0)
+    my = np.bincount(lab, weights=yf, minlength=ml) / nn
+    mx = np.bincount(lab, weights=xf, minlength=ml) / nn
+    cyy = np.bincount(lab, weights=yf * yf, minlength=ml) / nn - my * my
+    cxx = np.bincount(lab, weights=xf * xf, minlength=ml) / nn - mx * mx
+    cxy = np.bincount(lab, weights=xf * yf, minlength=ml) / nn - mx * my
+    # Eigenvalues of the 2x2 symmetric covariance [[cyy, cxy], [cxy, cxx]].
+    tr = 0.5 * (cyy + cxx)
+    disc = np.sqrt(np.maximum(0.0, (0.5 * (cyy - cxx)) ** 2 + cxy * cxy))
+    lam1 = tr + disc                                    # major-axis variance
+    lam2 = tr - disc                                    # minor-axis variance
+    eps = 1e-6
+    ratio = np.sqrt(np.maximum(lam1, 0.0) / np.maximum(lam2, eps))
+    use = (n >= 2.0) & (lam1 > eps)
+    elong[use] = ratio[use]
+    return elong
+
+
+def _component_thickness(
+    hole_mask: NDArray, labels: NDArray, n_comp: int
+) -> NDArray:
+    """Per-component morphological THICKNESS: the radius (in cells) of the largest
+    disk that fits inside each hole — the maximum of the Euclidean distance
+    transform (distance to the nearest non-hole cell) over the component.
+
+    Returns ``(n_comp + 1,)`` indexed by label id (0.0 for label 0 / absent).
+    """
+    thick = np.zeros(n_comp + 1, dtype=np.float64)
+    if not hole_mask.any():
+        return thick
+    dt = ndimage.distance_transform_edt(np.pad(hole_mask, 1))[1:-1, 1:-1]
+    maxes = ndimage.maximum(dt, labels=labels, index=np.arange(1, n_comp + 1))
+    thick[1:] = np.asarray(maxes, dtype=np.float64)
+    return thick
+
+
 def _fill_holes_2pass(
     values: NDArray,
     sample_valid: NDArray,
@@ -274,16 +324,30 @@ def _fill_holes_2pass(
     large_fill: str = "linear",
     low_percentile: float = 20.0,
     occlusion_drop: float = 0.0,
+    max_aspect: float = 0.0,
+    min_thickness: float = 0.0,
     device: int = 0,
 ) -> Tuple[NDArray, NDArray]:
     """Two-stage hole fill on a float grid (post-process).
 
-    Stage 1 — tiny holes (connected components <= ``small_area_max`` cells):
-    bounded GPU Perona-Malik diffusion seeded from the surrounding data.
-    Stage 2 — larger holes: ``large_fill="linear"`` per-component linear
-    (Delaunay) interpolation from their boundary ring, or ``"low_flat"`` a
-    gravity-aligned flat fill at the ``low_percentile`` border altitude
-    (DSM only — continues occluded ground flat with a sharp roof edge).
+    Stage 1 — bounded GPU Perona-Malik diffusion seeded from the surrounding
+    data (smooth, edge-aware fill that follows the local terrain).
+    Stage 2 — per-component fill of the remaining holes: ``large_fill="linear"``
+    per-component linear (Delaunay) interpolation from their boundary ring, or
+    ``"low_flat"`` a gravity-aligned flat fill at the ``low_percentile`` border
+    altitude (DSM only — continues occluded ground flat with a sharp roof edge).
+
+    Which hole goes to which stage (DSM ``low_flat`` path): a hole is flat-filled
+    (Stage 2) only if it passes EVERY active geometric gate, else it is diffused
+    (Stage 1 — follows the terrain).  Flat-filling at the single low border
+    altitude is only valid for a CHUNKY, COMPACT hole; on a long or thin one that
+    altitude is unrelated to the far end and carves a canyon.  The gates:
+      * COMPACT — ``max_aspect > 0``: cell aspect ratio (major/minor axis) <=
+        ``max_aspect``.  Rejects long elongated holes.
+      * THICK — ``min_thickness > 0``: largest inscribed-disk radius (max distance
+        transform, in cells) >= ``min_thickness``.  Rejects THIN / feathery /
+        branching holes that the aspect ratio misses — a wiggly feather has a
+        near-round bounding box but is thin everywhere.
 
     ``values``      : float ``(H,W)`` or ``(H,W,C)``.
     ``sample_valid``: bool ``(H,W)``, True where real data exists (samples,
@@ -309,20 +373,35 @@ def _fill_holes_2pass(
         return out, extrap
 
     comp_size = np.bincount(labels.ravel())
-    small_mask = hole_mask & (comp_size[labels] <= small_area_max)
-
-    # Every hole in ``hole_mask`` is fillable here — the genuine no-data exterior
-    # was already excluded by the caller (DSM footprint / ortho ``has_dsm``).
-    large_ids = np.nonzero(comp_size > small_area_max)[0]
-    large_ids = large_ids[large_ids != 0]  # drop the non-hole label 0
-
     multichannel = out.ndim == 3
     nchan = out.shape[2] if multichannel else 1
 
-    # Stage 1: GPU diffusion for tiny holes.  Only sample cells are frozen;
-    # holes and ignored cells are NaN so they neither seed nor bleed.
+    # ── Route each hole to one of the two stages ──
+    if large_fill == "low_flat" and (max_aspect > 0.0 or min_thickness > 0.0):
+        to_flat = np.ones(n_comp + 1, dtype=bool)
+        to_flat[0] = False                              # label 0 = background
+        if max_aspect > 0.0:
+            to_flat &= _component_elongation(labels, n_comp) <= max_aspect
+        if min_thickness > 0.0:
+            to_flat &= _component_thickness(
+                hole_mask, labels, n_comp) >= min_thickness
+        large_ids = np.nonzero(to_flat)[0]
+        diffuse_comp = ~to_flat
+        diffuse_comp[0] = False
+        diffuse_mask = hole_mask & diffuse_comp[labels]
+    else:
+        # Every hole in ``hole_mask`` is fillable here — the genuine no-data
+        # exterior was already excluded by the caller (DSM footprint / ortho
+        # ``has_dsm``).
+        diffuse_mask = hole_mask & (comp_size[labels] <= small_area_max)
+        large_ids = np.nonzero(comp_size > small_area_max)[0]
+        large_ids = large_ids[large_ids != 0]  # drop the non-hole label 0
+
+    # Stage 1: GPU diffusion for the smooth (or, legacy, tiny) holes.  Only
+    # sample cells are frozen; holes and ignored cells are NaN so they neither
+    # seed nor bleed.
     diffuse_ok = True
-    if small_mask.any():
+    if diffuse_mask.any():
         frozen = ~sample_valid
         for c in range(nchan):
             ch = out[..., c] if multichannel else out
@@ -339,28 +418,28 @@ def _fill_holes_2pass(
                 diffuse_ok = False
                 break
             if multichannel:
-                out[..., c][small_mask] = filled[small_mask]
+                out[..., c][diffuse_mask] = filled[diffuse_mask]
             else:
-                out[small_mask] = filled[small_mask]
+                out[diffuse_mask] = filled[diffuse_mask]
 
-    # Stage 2: per-component linear interpolation for enclosed large holes
-    # (and enclosed tiny holes too if the diffusion pass was unavailable).
+    # Stage 2: per-component fill for the remaining (large / stepped) holes
+    # (and the diffused holes too if the diffusion pass was unavailable).
     if diffuse_ok:
         stage2_ids = large_ids
-        stage2_valid = sample_valid | small_mask  # tiny holes now hold values
+        stage2_valid = sample_valid | diffuse_mask  # diffused holes now hold values
     else:
         all_ids = np.nonzero(comp_size != 0)[0]
         stage2_ids = all_ids[all_ids != 0]
         stage2_valid = sample_valid
 
-    n_tiny = int(small_mask.sum()) if diffuse_ok else 0
+    n_diffused = int(diffuse_mask.sum()) if diffuse_ok else 0
     n_large = int(comp_size[stage2_ids].sum()) if stage2_ids.size else 0
-    n_nodata = int(hole_mask.sum()) - n_tiny - n_large
+    n_nodata = int(hole_mask.sum()) - n_diffused - n_large
     mode = {"low_flat": "flat-low", "inpaint": "inpaint"}.get(
         large_fill, "linear")
     logger.info(
-        f"Hole fill: {n_tiny} tiny cells (diffusion), {n_large} enclosed "
-        f"cells ({mode}), {n_nodata} cells left as no-data"
+        f"Hole fill: {n_diffused} cells (diffusion), {n_large} cells "
+        f"({mode}), {n_nodata} cells left as no-data"
     )
 
     if stage2_ids.size:
@@ -460,6 +539,13 @@ def _fill_dsm_holes(
     the territory mask marks them fillable instead.  ``None`` → derive the
     footprint from the reconstructed cells (legacy / full-extent behaviour).
 
+    Each hole is routed between the smooth diffusion fill and the flat-low fill
+    by its SHAPE: only a COMPACT (``hole_fill_low_flat_max_aspect``) and THICK
+    (``hole_fill_low_flat_min_thickness``) hole gets the flat fill (sharp
+    occluded-ground edge); elongated OR thin/feathery holes are diffused (follow
+    the terrain; avoids carving a ridge or a thin string into a flat canyon).
+    See ``_fill_holes_2pass``.
+
     Returns ``(filled_dsm, no_relax_mask)``; the flat fill marks the OCCLUDED
     holes (ground sitting below a tall roof border, > ``hole_fill_occlusion_drop``
     m) so the bake keeps the strict mask there — no roof-colour ghosting; those
@@ -510,6 +596,8 @@ def _fill_dsm_holes(
         large_fill="low_flat",  # continue occluded ground flat, sharp roof edge
         low_percentile=float(config["hole_fill_low_percentile"]),
         occlusion_drop=float(config["hole_fill_occlusion_drop"]),
+        max_aspect=float(config["hole_fill_low_flat_max_aspect"]),
+        min_thickness=float(config["hole_fill_low_flat_min_thickness"]),
     )
 
 
