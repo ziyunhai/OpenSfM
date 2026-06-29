@@ -4,8 +4,9 @@
 
 ## 🧟 Why Now ?
 It's been a long way since OpenSfM was created by Pau Gargallo in 2013 and Mapillary. Since then, OpenSfM has been internally used as the pipeline that powers
-Mapillary's planet-scale 3D reconstruction, and has been used as the core SfM of OpenDroneMap and WebODM since 2016. Through these
-many years, development had its high and lows, mainly focused on supporting Mapillary platform. While at Meta, development continued, but support has been stalled in the past few years, until it was announced as no longer in active development.
+Mapillary's planet-scale 3D reconstruction, and has been used as the core SfM of OpenDroneMap and WebODM since 2016. 
+
+Through these many years, development had its high and lows, mainly focused on supporting Mapillary platform. While at Meta, development continued, but support has been stalled in the past few years, until it was announced as no longer in active development.
 
 We loved this project and did not want it to die, so we rolled out sleeves and went back to work, eliminating major bottlenecks (speed), while adding new features. 
 
@@ -103,7 +104,9 @@ This release is a big jump and the first major so here is the list of features :
 ## 🫣 Known Issues
 - Performance on Macs is suboptimal : PatchMatch kernels needs proper Metal reimplementation, as the OpenCL kernels (mostly the PatchMatch ones in `src/lib/dense/opencl_kernels.h`) are not optimized for Apple Silicon (M1/.../M5).
 - Mesh support is experimental and still very sub-optimal — the Surface Nets mesh (config: [`depthmap_fusion_mesh_enabled`](doc/configuration.md#fusion)) is off by default (opt-in) and can leave holes in empty regions
-- TSDF photometric refinement doesn't bring substantial improvement (config: [`depthmap_fusion_svo_refine_enabled`](doc/configuration.md#fusion), `false` by default)s
+- TSDF photometric refinement doesn't bring substantial improvement (config: [`depthmap_fusion_svo_refine_enabled`](doc/configuration.md#fusion), `false` by default)
+- The global equaliser flatten a bit much the dynamic in case of highlights
+- Windows conda locks are out-of-date and Windows support is unknown (although it's easily fixable)
 - The split-merge is the old one and not out-of-core, neither is the dense/ortho/DSM
 
 🛸 There is more on the table :
