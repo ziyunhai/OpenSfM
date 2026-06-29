@@ -92,6 +92,7 @@ wheel.packages = ["opensfm"]
 sdist.include = [
     "opensfm/data/**",          # sensor_data.json, camera_calibration.yaml, bow/*.npz
     "opensfm/src/**",           # CMake source files
+    "configs/**",               # Add configs
     "bin/**",                   # All utility scripts
 ]
 

@@ -28,6 +28,7 @@ import argparse
 import logging
 import os
 import sys
+import tempfile
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -38,7 +39,13 @@ from benchmark.compare import (
     load_run_stats,
 )
 from benchmark.config import load_config
-from benchmark.pipeline import PIPELINE_STEPS, run_all_datasets, save_run_meta, protect_self_from_oom
+from benchmark.pipeline import (
+    ALL_PIPELINE_STEPS,
+    DENSE_STEPS,
+    run_all_datasets,
+    save_run_meta,
+    protect_self_from_oom,
+)
 from benchmark.workspace import (
     build_in_worktree,
     cleanup_worktree,
@@ -102,7 +109,7 @@ def main() -> None:
 
     parser.add_argument(
         "--from-step",
-        choices=PIPELINE_STEPS,
+        choices=ALL_PIPELINE_STEPS,
         default=None,
         metavar="STEP",
         help=(
@@ -110,7 +117,16 @@ def main() -> None:
             "With --resume: re-run from this step in the same directory. "
             "With --commit: creates a new run and bootstraps prior step outputs "
             "from an existing run (auto-detected or specified via --bootstrap). "
-            f"Choices: {', '.join(PIPELINE_STEPS)}"
+            f"Choices: {', '.join(ALL_PIPELINE_STEPS)}"
+        ),
+    )
+    parser.add_argument(
+        "--dense",
+        action="store_true",
+        help=(
+            "Also run the dense-reconstruction stages (undistort, "
+            "dense_clustering, compute_depthmaps, fuse_depthmaps, dense_merging) "
+            "before compute_statistics, so their timings appear in the report."
         ),
     )
     parser.add_argument(
@@ -121,6 +137,26 @@ def main() -> None:
             "Only valid with --commit --from-step. Path to an existing run directory "
             "to symlink/copy prior step outputs from. If omitted, the most recent "
             "run for the same commit is used automatically."
+        ),
+    )
+    parser.add_argument(
+        "--local-staging",
+        action="store_true",
+        help=(
+            "Process each dataset on a local scratch disk (see --scratch-dir) "
+            "and move the results back to the run directory at the end.  Use "
+            "when the run directory is on a network share (NAS) so its I/O does "
+            "not dominate the timings."
+        ),
+    )
+    parser.add_argument(
+        "--scratch-dir",
+        metavar="DIR",
+        default=None,
+        help=(
+            "Base directory for --local-staging (default: $TMPDIR, usually "
+            "/tmp).  Point it at a fast local disk with room for the dataset's "
+            "intermediate artefacts."
         ),
     )
     parser.add_argument(
@@ -225,6 +261,22 @@ def main() -> None:
         existing_meta = None
 
     # -----------------------------------------------------------------------
+    # Decide whether to run the dense stages.  Explicit --dense always wins; a
+    # resume inherits the resumed run's setting; selecting a dense --from-step
+    # implies --dense (otherwise that step would not be in the pipeline).
+    # -----------------------------------------------------------------------
+    dense = args.dense or bool((existing_meta or {}).get("dense", False))
+    if args.from_step in DENSE_STEPS and not dense:
+        logger.info("--from-step '%s' is a dense stage; enabling --dense.",
+                    args.from_step)
+        dense = True
+
+    # Resolve the local-staging scratch directory once (used in run_meta + run).
+    scratch_dir = os.path.abspath(args.scratch_dir or tempfile.gettempdir())
+    if args.local_staging:
+        logger.info("Local staging enabled (scratch base: %s)", scratch_dir)
+
+    # -----------------------------------------------------------------------
     # Setup worktree, conda env, build, and run pipeline
     # (skipped entirely when --report-only is set)
     # -----------------------------------------------------------------------
@@ -254,6 +306,8 @@ def main() -> None:
                     "commit": full_hash,
                     "date": datetime.now(timezone.utc).isoformat(),
                     "status": "in_progress",
+                    "dense": dense,
+                    "local_staging": args.local_staging,
                     "config": {
                         "root": config.root,
                         "datasets": config.datasets,
@@ -297,6 +351,9 @@ def main() -> None:
                 from_step=args.from_step,
                 existing_meta=existing_meta,
                 bootstrap_run_dir=bootstrap_run_dir,
+                dense=dense,
+                local_staging=args.local_staging,
+                scratch_dir=scratch_dir,
             )
         finally:
             cleanup_worktree(worktree_path, repo_root, conda_env)

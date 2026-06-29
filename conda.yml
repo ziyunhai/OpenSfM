@@ -6,9 +6,8 @@ dependencies:
     - ninja
     - make
     - libxcrypt # [linux] [osx]
-    - libvorbis # [osx]
-    - libopencv *=headless*
-    - py-opencv
+    - libopencv<5.0 *=headless*
+    - py-opencv<5.0
     - anaconda::metis
     - conda-forge::suitesparse=7.10.*
     - conda-forge::llvm-openmp
@@ -18,3 +17,8 @@ dependencies:
     - conda-forge::ceres-solver=2.2
     - conda-forge::fast_float
     - conda-forge::gdal
+    - conda-forge::laszip
+    - conda-forge::libvorbis # [osx]
+    - conda-forge::ocl-icd # [linux]
+    - conda-forge::opencl-headers
+    - conda-forge::khronos-opencl-icd-loader # [win]

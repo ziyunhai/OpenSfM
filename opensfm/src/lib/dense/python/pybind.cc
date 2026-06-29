@@ -13,42 +13,53 @@ PYBIND11_MODULE(pydense, m) {
       .def("add_point", &dense::OpenMVSExporter::AddPoint)
       .def("export", &dense::OpenMVSExporter::Export);
 
-  py::class_<dense::DepthmapFuserWrapper>(m, "DepthmapFuser")
-      .def(py::init())
-      .def("set_min_num_consistent",
-           &dense::DepthmapFuserWrapper::SetMinNumConsistent)
-      .def("set_max_reproj_error",
-           &dense::DepthmapFuserWrapper::SetMaxReprojError)
-      .def("set_max_depth_error",
-           &dense::DepthmapFuserWrapper::SetMaxDepthError)
-      .def("set_max_normal_error",
-           &dense::DepthmapFuserWrapper::SetMaxNormalError)
-      .def("set_border_margin", &dense::DepthmapFuserWrapper::SetBorderMargin)
-      .def("set_num_threads", &dense::DepthmapFuserWrapper::SetNumThreads)
-      .def("set_sor_params", &dense::DepthmapFuserWrapper::SetSORParams)
-      .def("set_behind_depth_factor",
-           &dense::DepthmapFuserWrapper::SetBehindDepthFactor)
-      .def("add_view", &dense::DepthmapFuserWrapper::AddView, py::arg("K"),
-           py::arg("R"), py::arg("t"), py::arg("depth"), py::arg("normal"),
-           py::arg("color"), py::arg("mask"), py::arg("neighbor_ids"),
-           py::arg("primary") = true)
-      .def("fuse", &dense::DepthmapFuserWrapper::Fuse);
-
   py::class_<dense::SVOFuserWrapper>(m, "SVOFuser")
       .def(py::init())
       .def("set_voxel_size", &dense::SVOFuserWrapper::SetVoxelSize)
       .def("set_trunc_factor", &dense::SVOFuserWrapper::SetTruncFactor)
       .def("set_min_weight", &dense::SVOFuserWrapper::SetMinWeight)
       .def("set_device", &dense::SVOFuserWrapper::SetDevice)
+      .def("set_num_levels", &dense::SVOFuserWrapper::SetNumLevels)
+      .def("set_decimate_flat", &dense::SVOFuserWrapper::SetDecimateFat)
+      .def("set_edge_threshold", &dense::SVOFuserWrapper::SetEdgeThreshold)
+      .def("set_min_count", &dense::SVOFuserWrapper::SetMinCount)
+      .def("set_relative_min_weight",
+           &dense::SVOFuserWrapper::SetRelativeMinWeight)
+      .def("set_dsm_wall_cull_nz", &dense::SVOFuserWrapper::SetDSMWallCullNz)
       .def("set_bbox", &dense::SVOFuserWrapper::SetBBox, py::arg("min_world"),
            py::arg("max_world"))
       .def_static("is_gpu_available", &dense::SVOFuserWrapper::IsGPUAvailable)
+      .def("capacity", &dense::SVOFuserWrapper::Capacity)
+      .def("release_refine_buffers",
+           &dense::SVOFuserWrapper::ReleaseRefineBuffers)
       .def("count_voxels", &dense::SVOFuserWrapper::CountVoxels)
       .def("add_view", &dense::SVOFuserWrapper::AddView, py::arg("K"),
            py::arg("R"), py::arg("t"), py::arg("depth"), py::arg("normal"),
            py::arg("color"), py::arg("mask"),
            py::arg("confidence") = py::none(), py::arg("name") = "")
-      .def("fuse", &dense::SVOFuserWrapper::Fuse);
+      .def("fuse", &dense::SVOFuserWrapper::Fuse)
+      .def("fuse_only", &dense::SVOFuserWrapper::FuseOnly)
+      .def("refine_geometry", &dense::SVOFuserWrapper::RefineGeometry,
+           py::arg("iters"), py::arg("lambda_reg"),
+           py::arg("neighbors") =
+               std::map<std::string, std::vector<std::string>>(),
+           py::arg("lambda_anchor") = 0.0f, py::arg("early_stop_rel") = 0.0f)
+      .def("extract_and_bake", &dense::SVOFuserWrapper::ExtractAndBake)
+      .def("extract_mesh", &dense::SVOFuserWrapper::ExtractMesh)
+      .def("prune_by_visibility", &dense::SVOFuserWrapper::PruneByVisibility,
+           py::arg("iterations"), py::arg("carve_margin"),
+           py::arg("carve_threshold"), py::arg("support_min"))
+      .def("extract_points", &dense::SVOFuserWrapper::ExtractPoints)
+      .def("render_dsm_ortho", &dense::SVOFuserWrapper::RenderDSMOrtho,
+           py::arg("origin_x"), py::arg("origin_y"), py::arg("gsd"),
+           py::arg("width"), py::arg("height"), py::arg("z_min"),
+           py::arg("z_max"))
+      .def("bake_colors", &dense::SVOFuserWrapper::BakeColorsStandalone,
+           py::arg("points"), py::arg("normals"), py::arg("n_final") = 2,
+           py::arg("irls_iters") = 3, py::arg("relax_occlusion") = py::none(),
+           py::arg("dsm_occ") = py::none(), py::arg("dsm_origin_x") = 0.0f,
+           py::arg("dsm_origin_y") = 0.0f, py::arg("dsm_gsd") = 0.0f,
+           py::arg("dsm_max_z") = 0.0f, py::arg("with_sharp") = false);
 
   py::class_<dense::DepthmapClusterEstimatorWrapper>(m,
                                                      "DepthmapClusterEstimator")
@@ -66,10 +77,18 @@ PYBIND11_MODULE(pydense, m) {
       .def("set_sigma_color",
            &dense::DepthmapClusterEstimatorWrapper::SetSigmaColor)
       .def("set_top_k", &dense::DepthmapClusterEstimatorWrapper::SetTopK)
-      .def("set_census_weight",
-           &dense::DepthmapClusterEstimatorWrapper::SetCensusWeight)
+      .def("set_use_census",
+           &dense::DepthmapClusterEstimatorWrapper::SetUseCensus)
       .def("set_smooth_weight",
            &dense::DepthmapClusterEstimatorWrapper::SetSmoothWeight)
+      .def("set_anchor_views",
+           &dense::DepthmapClusterEstimatorWrapper::SetAnchorViews)
+      .def("set_checkerboard_filter",
+           &dense::DepthmapClusterEstimatorWrapper::SetCheckerboardFilter)
+      .def("set_speckle_min_size",
+           &dense::DepthmapClusterEstimatorWrapper::SetSpeckleMinSize)
+      .def("set_gap_max_size",
+           &dense::DepthmapClusterEstimatorWrapper::SetGapMaxSize)
       .def("set_geom_consistency_weight",
            &dense::DepthmapClusterEstimatorWrapper::SetGeomConsistencyWeight)
       .def("set_device", &dense::DepthmapClusterEstimatorWrapper::SetDevice)
@@ -109,40 +128,33 @@ PYBIND11_MODULE(pydense, m) {
            &dense::DepthmapCleanerWrapper::SetSameDepthThreshold)
       .def("set_min_consistent_views",
            &dense::DepthmapCleanerWrapper::SetMinConsistentViews)
+      .def("set_device", &dense::DepthmapCleanerWrapper::SetDevice)
       .def("set_carving_threshold",
            &dense::DepthmapCleanerWrapper::SetCarvingThreshold)
       .def("set_max_carved_views",
            &dense::DepthmapCleanerWrapper::SetMaxCarvedViews)
-      .def("set_device", &dense::DepthmapCleanerWrapper::SetDevice)
+      .def("set_grazing_cos_threshold",
+           &dense::DepthmapCleanerWrapper::SetGrazingCosThreshold)
       .def("add_view", &dense::DepthmapCleanerWrapper::AddView)
+      .def("add_view_with_normal",
+           &dense::DepthmapCleanerWrapper::AddViewWithNormal)
       .def("clean", &dense::DepthmapCleanerWrapper::Clean)
       .def("clear", &dense::DepthmapCleanerWrapper::Clear)
       .def_static("is_available", &dense::DepthmapCleanerWrapper::IsAvailable);
 
-  py::class_<dense::DSMRasterizerWrapper>(m, "DSMRasterizer")
+  py::class_<dense::GPUDiffuserWrapper>(m, "GPUDiffuser")
       .def(py::init())
-      .def("set_gsd", &dense::DSMRasterizerWrapper::SetGSD)
-      .def("set_bbox", &dense::DSMRasterizerWrapper::SetBBox, py::arg("min_xy"),
-           py::arg("max_xy"))
-      .def("set_device", &dense::DSMRasterizerWrapper::SetDevice)
-      .def("set_outlier_threshold",
-           &dense::DSMRasterizerWrapper::SetOutlierThreshold)
-      .def("set_min_count", &dense::DSMRasterizerWrapper::SetMinCount)
-      .def("set_z_bias", &dense::DSMRasterizerWrapper::SetZBias)
-      .def("set_bilateral", &dense::DSMRasterizerWrapper::SetBilateral,
-           py::arg("enabled"), py::arg("radius"), py::arg("range_sigma"))
-      .def("begin", &dense::DSMRasterizerWrapper::Begin)
-      .def("scatter", &dense::DSMRasterizerWrapper::Scatter, py::arg("K"),
-           py::arg("R"), py::arg("t"), py::arg("depth"), py::arg("normal"),
-           py::arg("confidence"))
-      .def("begin_pass2", &dense::DSMRasterizerWrapper::BeginPass2)
-      .def("finish", &dense::DSMRasterizerWrapper::Finish)
-      .def("scatter_cpu", &dense::DSMRasterizerWrapper::ScatterCPU,
-           py::arg("K"), py::arg("R"), py::arg("t"), py::arg("depth"),
-           py::arg("normal"), py::arg("confidence"))
-      .def("finish_percentile", &dense::DSMRasterizerWrapper::FinishPercentile,
-           py::arg("percentile"))
-      .def("set_reference_z", &dense::DSMRasterizerWrapper::SetReferenceZ,
-           py::arg("ref_z"))
-      .def_static("is_available", &dense::DSMRasterizerWrapper::IsAvailable);
+      .def("set_device", &dense::GPUDiffuserWrapper::SetDevice)
+      .def("diffuse", &dense::GPUDiffuserWrapper::Diffuse, py::arg("guide"),
+           py::arg("iterations"), py::arg("kappa"), py::arg("dt"))
+      .def("upload_grid", &dense::GPUDiffuserWrapper::UploadGrid,
+           py::arg("grid"))
+      .def("snap_edges", &dense::GPUDiffuserWrapper::SnapEdges, py::arg("dsm"),
+           py::arg("guide"), py::arg("iterations"), py::arg("radius"),
+           py::arg("sigma_spatial"), py::arg("sigma_range"))
+      .def("shock_filter", &dense::GPUDiffuserWrapper::ShockFilter,
+           py::arg("dsm"), py::arg("iterations"), py::arg("win"), py::arg("dt"),
+           py::arg("coherence"), py::arg("gsd"), py::arg("edge_slope"))
+      .def("gated_median", &dense::GPUDiffuserWrapper::GatedMedian,
+           py::arg("ortho"), py::arg("valid"), py::arg("threshold"));
 }

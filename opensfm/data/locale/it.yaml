@@ -13,6 +13,8 @@ gps_gcp_errors_details: "Dettagli errori GPS/GCP"
 gcp_details: "Dettagli GCP"
 orientation_details: "Dettagli errori di orientamento"
 processing_time_details: "Dettagli tempi di elaborazione"
+digital_surface_model: "Modello digitale di superficie"
+orthophoto: "Ortofoto"
 
 # Title
 quality_report: "Rapporto di Qualità"

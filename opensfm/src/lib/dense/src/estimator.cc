@@ -4,11 +4,21 @@
 
 #include <dense/opencl_kernels.h>
 
+// CL_DEVICE_IMAGE_PITCH_ALIGNMENT is part of cl_khr_image2d_from_buffer
+// but only formally in OpenCL 2.0+ headers.  Apple's 1.2 driver supports
+// the extension, so define the enum value if the header doesn't provide it.
+#ifndef CL_DEVICE_IMAGE_PITCH_ALIGNMENT
+#define CL_DEVICE_IMAGE_PITCH_ALIGNMENT 0x104A
+#endif
+
+#include <foundation/logging.h>
+
 #include <Eigen/SVD>
 #include <algorithm>
 #include <cmath>
-#include <iostream>
 #include <numeric>
+#include <set>
+#include <sstream>
 #include <unordered_map>
 
 namespace dense {
@@ -113,8 +123,12 @@ void DepthmapEstimator::SetSfMPoints(
   for (int i = 0; i < num_points; ++i) {
     sfm_points_.push_back(points.row(i).transpose());
   }
-  std::cerr << "[PatchMatch] Received " << sfm_points_.size()
-            << " SfM points for planar prior\n";
+  {
+    std::ostringstream oss;
+    oss << "[PatchMatch] Received " << sfm_points_.size()
+        << " SfM points for planar prior";
+    foundation::LogDebug("dense", oss.str());
+  }
 }
 
 void DepthmapEstimator::Run(DepthmapResult* result) {
@@ -205,16 +219,17 @@ void DepthmapEstimator::RunLevel(int level, int total_levels,
   }
 
   // ---- PatchMatch iterations with prior re-seeding ----
+  PriorReinit(w, h);
   for (int i = 0; i < params_.max_iterations; ++i) {
-    // TODO : fix re-initialisation logic. For jow, it produces worse results
-    // if (have_prior) {
-    //   PriorReinit(w, h);
-    // }
     RunIteration(i, w, h);
+  }
+  if (params_.checkerboard_filter) {
     RunCheckerboardFilter(w, h);
   }
 
   auto& dev = opencl::CLContext::Instance().Device(device_idx_);
+  dev.queue().finish();
+
   const int npix = w * h;
   std::vector<float> costs_dbg(npix);
   dev.queue().enqueueReadBuffer(cl_costs_, CL_TRUE, 0, sizeof(float) * npix,
@@ -232,7 +247,7 @@ void DepthmapEstimator::RunLevel(int level, int total_levels,
     // Restore original data.
     images_ = orig_images_;
     Ks_ = orig_Ks_;
-    ReadBackResults(result, full_w, full_h, /*apply_median=*/true);
+    ReadBackResults(result, full_w, full_h, /*apply_median=*/false);
   } else {
     // Return intermediate result (useful for cluster orchestration).
     ReadBackResults(result, w, h, /*apply_median=*/false);
@@ -244,7 +259,14 @@ void DepthmapEstimator::RunLevel(int level, int total_levels,
 // =====================================================================
 void DepthmapEstimator::BuildKernels() {
   auto& dev = opencl::CLContext::Instance().Device(device_idx_);
-  program_ = dev.GetOrBuildProgram("patchmatch", kPatchMatchKernelSource);
+  // Bake the patch half-size into the program (-DPM_HALF_PATCH) so the
+  // per-pixel reference-patch cache in the kernel is sized exactly, and key
+  // the program cache by it so distinct patch sizes get their own build.
+  const int half_patch = params_.patch_size / 2;
+  const std::string pm_opts = " -DPM_HALF_PATCH=" + std::to_string(half_patch);
+  program_ = dev.GetOrBuildProgram(
+      "patchmatch_hp" + std::to_string(half_patch), kPatchMatchKernelSource,
+      pm_opts);
 
   cl_int err;
   k_random_init_ = cl::Kernel(program_, "acmmp_random_init", &err);
@@ -287,37 +309,55 @@ void DepthmapEstimator::UploadData() {
 
   const int kTotalSlots = 1 + kMaxSources;  // 1 ref + MAX_SOURCES src
 
-  // Create image objects (CL_R + CL_FLOAT for linear interpolation).
-  cl_images_.clear();
-  for (int i = 0; i < num && i < kTotalSlots; i++) {
-    // Convert to float [0,1].
+  // Upload reference image as a separate Image2D.
+  {
     cv::Mat fimg;
-    images_[i].convertTo(fimg, CV_32F, 1.0 / 255.0);
+    images_[0].convertTo(fimg, CV_32F, 1.0 / 255.0);
+    cv::Mat himg;
+    fimg.convertTo(himg, CV_16F);
 
-    cl::ImageFormat fmt(CL_R, CL_FLOAT);
-    cl::Image2D img(ctx, CL_MEM_READ_ONLY, fmt, fimg.cols, fimg.rows, 0,
-                    nullptr, &err);
-    opencl::CheckCL(err, "Image2D upload");
+    cl::ImageFormat fmt(CL_R, CL_HALF_FLOAT);
+    cl_ref_img_ = cl::Image2D(ctx, CL_MEM_READ_ONLY, fmt, himg.cols, himg.rows,
+                              0, nullptr, &err);
+    opencl::CheckCL(err, "Image2D ref upload (half)");
     cl::array<cl::size_type, 3> origin = {{0, 0, 0}};
     cl::array<cl::size_type, 3> region = {
-        {static_cast<cl::size_type>(fimg.cols),
-         static_cast<cl::size_type>(fimg.rows), 1}};
-    queue.enqueueWriteImage(img, CL_TRUE, origin, region, fimg.step[0], 0,
-                            fimg.data);
-    cl_images_.push_back(std::move(img));
+        {static_cast<cl::size_type>(himg.cols),
+         static_cast<cl::size_type>(himg.rows), 1}};
+    queue.enqueueWriteImage(cl_ref_img_, CL_TRUE, origin, region, himg.step[0],
+                            0, himg.data);
   }
 
-  // Pad to kTotalSlots images (source images passed as individual kernel args).
-  while (static_cast<int>(cl_images_.size()) < kTotalSlots) {
-    // Create a 1x1 dummy image.
-    float dummy = 0.0f;
-    cl::ImageFormat fmt(CL_R, CL_FLOAT);
-    cl::Image2D img(ctx, CL_MEM_READ_ONLY, fmt, 1, 1, 0, nullptr, &err);
-    opencl::CheckCL(err, "Image2D dummy");
-    cl::array<cl::size_type, 3> origin = {{0, 0, 0}};
-    cl::array<cl::size_type, 3> region = {{1, 1, 1}};
-    queue.enqueueWriteImage(img, CL_TRUE, origin, region, 0, 0, &dummy);
-    cl_images_.push_back(std::move(img));
+  // Upload source images as Image2DArray (branchless texture indexing).
+  // Always allocate kMaxSources layers; unused layers are zeroed.
+  // Format: CL_HALF_FLOAT — halves texture bandwidth, enables read_imageh,
+  // and unlocks double-rate FP16 texture units on Apple Silicon.
+  {
+    cl::ImageFormat fmt(CL_R, CL_HALF_FLOAT);
+    cl_src_images_array_ = cl::Image2DArray(
+        ctx, CL_MEM_READ_ONLY, fmt, static_cast<cl::size_type>(kMaxSources),
+        static_cast<cl::size_type>(w), static_cast<cl::size_type>(h), 0, 0,
+        nullptr, &err);
+    opencl::CheckCL(err, "Image2DArray src_images (half)");
+
+    // Write each source image to its layer.
+    for (int i = 0; i < kMaxSources; i++) {
+      cv::Mat fimg;
+      if (i + 1 < num) {
+        images_[i + 1].convertTo(fimg, CV_32F, 1.0 / 255.0);
+      } else {
+        // Unused layer: zero-filled image at correct size.
+        fimg = cv::Mat::zeros(h, w, CV_32F);
+      }
+      cv::Mat himg;
+      fimg.convertTo(himg, CV_16F);
+      cl::array<cl::size_type, 3> origin = {
+          {0, 0, static_cast<cl::size_type>(i)}};
+      cl::array<cl::size_type, 3> region = {
+          {static_cast<cl::size_type>(w), static_cast<cl::size_type>(h), 1}};
+      queue.enqueueWriteImage(cl_src_images_array_, CL_TRUE, origin, region,
+                              himg.step[0], 0, himg.data);
+    }
   }
 
   // Upload cameras.
@@ -337,14 +377,96 @@ void DepthmapEstimator::UploadData() {
   queue.enqueueWriteBuffer(cl_cameras_, CL_TRUE, 0,
                            sizeof(CLCamera) * cams.size(), cams.data());
 
-  // Allocate plane hypotheses, costs, rand states.
-  cl_plane_hypotheses_ = cl::Buffer(ctx, CL_MEM_READ_WRITE,
-                                    sizeof(cl_float4) * npix, nullptr, &err);
-  opencl::CheckCL(err, "plane_hypotheses buffer");
+  // Compute per-source-view angle weights.
+  // Weight = sin(triangulation_angle) so that wide-baseline views dominate.
+  // Camera center = -R^T * t.
+  {
+    Vec3d c0 = -Rs_[0].transpose() * ts_[0];
+    std::vector<float> aw(kMaxSources, 0.0f);
+    for (int i = 0; i < std::min(num - 1, kMaxSources); i++) {
+      Vec3d ci = -Rs_[i + 1].transpose() * ts_[i + 1];
+      Vec3d baseline = ci - c0;
+      double blen = baseline.norm();
+      if (blen < 1e-12) {
+        aw[i] = 0.01f;  // degenerate: near-zero baseline
+      } else {
+        // Optical axis of ref camera is 3rd row of R (z-axis in cam frame).
+        Vec3d z0 = Rs_[0].row(2).transpose();
+        // Angle between baseline direction and ref optical axis.
+        double cos_angle = std::abs(z0.dot(baseline / blen));
+        // sin(angle) emphasises views with perpendicular baselines.
+        double sin_angle = std::sqrt(1.0 - cos_angle * cos_angle);
+        aw[i] = static_cast<float>(std::max(sin_angle, 0.01));
+      }
+    }
+    cl_angle_weights_ = cl::Buffer(ctx, CL_MEM_READ_ONLY,
+                                   sizeof(float) * kMaxSources, nullptr, &err);
+    opencl::CheckCL(err, "angle_weights buffer");
+    queue.enqueueWriteBuffer(cl_angle_weights_, CL_TRUE, 0,
+                             sizeof(float) * kMaxSources, aw.data());
+  }
 
-  cl_costs_ =
-      cl::Buffer(ctx, CL_MEM_READ_WRITE, sizeof(float) * npix, nullptr, &err);
-  opencl::CheckCL(err, "costs buffer");
+  // Allocate plane hypotheses, costs, rand states.
+  // Detect cl_khr_image2d_from_buffer for zero-copy buffer↔image aliasing.
+  // {
+  //   std::string extensions = dev.device().getInfo<CL_DEVICE_EXTENSIONS>();
+  //   use_image_from_buffer_ =
+  //       (extensions.find("cl_khr_image2d_from_buffer") != std::string::npos);
+  // }
+
+  if (use_image_from_buffer_) {
+    // Query row pitch alignment (in pixels).  Buffer rows must be aligned.
+    cl_uint pitch_align = 1;
+    dev.device().getInfo(CL_DEVICE_IMAGE_PITCH_ALIGNMENT, &pitch_align);
+    if (pitch_align < 1) {
+      pitch_align = 1;
+    }
+
+    size_t aligned_w_planes =
+        ((w + pitch_align - 1) / pitch_align) * pitch_align;
+    size_t aligned_w_costs =
+        ((w + pitch_align - 1) / pitch_align) * pitch_align;
+    size_t planes_pitch = aligned_w_planes * sizeof(cl_float4);
+    size_t costs_pitch = aligned_w_costs * sizeof(cl_float);
+
+    // Allocate buffers with pitch-aligned rows.
+    cl_plane_hypotheses_ =
+        cl::Buffer(ctx, CL_MEM_READ_WRITE, planes_pitch * h, nullptr, &err);
+    opencl::CheckCL(err, "plane_hypotheses buffer (aliased)");
+
+    cl_costs_ =
+        cl::Buffer(ctx, CL_MEM_READ_WRITE, costs_pitch * h, nullptr, &err);
+    opencl::CheckCL(err, "costs buffer (aliased)");
+
+    // Create Image2D objects aliasing the buffer memory (zero-copy).
+    cl::ImageFormat fmt_rgba(CL_RGBA, CL_FLOAT);
+    cl_planes_img_ = cl::Image2D(ctx, fmt_rgba, cl_plane_hypotheses_, w, h,
+                                 planes_pitch, &err);
+    opencl::CheckCL(err, "planes_img from buffer");
+
+    cl::ImageFormat fmt_r(CL_R, CL_FLOAT);
+    cl_costs_img_ = cl::Image2D(ctx, fmt_r, cl_costs_, w, h, costs_pitch, &err);
+    opencl::CheckCL(err, "costs_img from buffer");
+  } else {
+    // Fallback: separate buffer + image, synced via enqueueCopyBufferToImage.
+    cl_plane_hypotheses_ = cl::Buffer(ctx, CL_MEM_READ_WRITE,
+                                      sizeof(cl_float4) * npix, nullptr, &err);
+    opencl::CheckCL(err, "plane_hypotheses buffer");
+
+    cl_costs_ =
+        cl::Buffer(ctx, CL_MEM_READ_WRITE, sizeof(float) * npix, nullptr, &err);
+    opencl::CheckCL(err, "costs buffer");
+
+    cl::ImageFormat fmt_rgba(CL_RGBA, CL_FLOAT);
+    cl_planes_img_ =
+        cl::Image2D(ctx, CL_MEM_READ_WRITE, fmt_rgba, w, h, 0, nullptr, &err);
+    opencl::CheckCL(err, "planes_img");
+
+    cl::ImageFormat fmt_r(CL_R, CL_FLOAT);
+    cl_costs_img_ =
+        cl::Image2D(ctx, CL_MEM_READ_WRITE, fmt_r, w, h, 0, nullptr, &err);
+    opencl::CheckCL(err, "costs_img");
+  }
 
   cl_rand_states_ = cl::Buffer(ctx, CL_MEM_READ_WRITE, sizeof(cl_uint2) * npix,
                                nullptr, &err);
@@ -401,10 +523,8 @@ void DepthmapEstimator::RandomInit(int width, int height) {
   k_random_init_.setArg(arg++, cl_rand_states_);
   k_random_init_.setArg(arg++, cl_selected_views_);
   k_random_init_.setArg(arg++, cl_cameras_);
-  k_random_init_.setArg(arg++, cl_images_[0]);  // ref
-  for (int i = 0; i < kMaxSources; i++) {
-    k_random_init_.setArg(arg++, cl_images_[1 + i]);  // src i
-  }
+  k_random_init_.setArg(arg++, cl_ref_img_);
+  k_random_init_.setArg(arg++, cl_src_images_array_);
   k_random_init_.setArg(arg++, width);
   k_random_init_.setArg(arg++, height);
   k_random_init_.setArg(arg++, params_.depth_min);
@@ -414,13 +534,37 @@ void DepthmapEstimator::RandomInit(int width, int height) {
   k_random_init_.setArg(arg++, params_.sigma_spatial);
   k_random_init_.setArg(arg++, params_.sigma_color);
   k_random_init_.setArg(arg++, params_.top_k);
-  k_random_init_.setArg(arg++, params_.census_weight);
+  k_random_init_.setArg(arg++, params_.use_census ? 1.0f : 0.0f);
 
   cl::NDRange global(static_cast<size_t>((width + 15) / 16 * 16),
                      static_cast<size_t>((height + 15) / 16 * 16));
   cl::NDRange local(16, 16);
   queue.enqueueNDRangeKernel(k_random_init_, cl::NullRange, global, local);
-  queue.finish();
+  // queue.finish();
+
+  SyncBuffersToImages(width, height);
+}
+
+// =====================================================================
+// Copy plane/cost buffers to their image2d_t counterparts for texture
+// cache reads.  When cl_khr_image2d_from_buffer is active, the images
+// alias the buffers directly — no copy needed, in-order queue ordering
+// guarantees visibility between kernels.
+// =====================================================================
+void DepthmapEstimator::SyncBuffersToImages(int width, int height) {
+  if (use_image_from_buffer_) {
+    return;  // zero-copy: images alias buffers
+  }
+
+  auto& queue = opencl::CLContext::Instance().Device(device_idx_).queue();
+  cl::array<cl::size_type, 3> origin = {{0, 0, 0}};
+  cl::array<cl::size_type, 3> region = {{static_cast<cl::size_type>(width),
+                                         static_cast<cl::size_type>(height),
+                                         1}};
+
+  queue.enqueueCopyBufferToImage(cl_plane_hypotheses_, cl_planes_img_, 0,
+                                 origin, region);
+  queue.enqueueCopyBufferToImage(cl_costs_, cl_costs_img_, 0, origin, region);
 }
 
 // =====================================================================
@@ -431,17 +575,19 @@ void DepthmapEstimator::PriorReinit(int width, int height) {
   auto& dev = opencl::CLContext::Instance().Device(device_idx_);
   auto& queue = dev.queue();
 
+  SyncBuffersToImages(width, height);
+
   int half_patch = params_.patch_size / 2;
   int arg = 0;
   k_prior_reinit_.setArg(arg++, cl_plane_hypotheses_);
   k_prior_reinit_.setArg(arg++, cl_costs_);
+  k_prior_reinit_.setArg(arg++, cl_planes_img_);
+  k_prior_reinit_.setArg(arg++, cl_costs_img_);
   k_prior_reinit_.setArg(arg++, cl_rand_states_);
   k_prior_reinit_.setArg(arg++, cl_selected_views_);
   k_prior_reinit_.setArg(arg++, cl_cameras_);
-  k_prior_reinit_.setArg(arg++, cl_images_[0]);
-  for (int i = 0; i < kMaxSources; i++) {
-    k_prior_reinit_.setArg(arg++, cl_images_[1 + i]);
-  }
+  k_prior_reinit_.setArg(arg++, cl_ref_img_);
+  k_prior_reinit_.setArg(arg++, cl_src_images_array_);
   k_prior_reinit_.setArg(arg++, width);
   k_prior_reinit_.setArg(arg++, height);
   k_prior_reinit_.setArg(arg++, params_.depth_min);
@@ -451,7 +597,7 @@ void DepthmapEstimator::PriorReinit(int width, int height) {
   k_prior_reinit_.setArg(arg++, params_.sigma_spatial);
   k_prior_reinit_.setArg(arg++, params_.sigma_color);
   k_prior_reinit_.setArg(arg++, params_.top_k);
-  k_prior_reinit_.setArg(arg++, params_.census_weight);
+  k_prior_reinit_.setArg(arg++, params_.use_census ? 1.0f : 0.0f);
   k_prior_reinit_.setArg(arg++, cl_prior_planes_);
   k_prior_reinit_.setArg(arg++, cl_plane_masks_);
   // Cost-parity arguments: match acmmp_patchmatch's total cost.
@@ -464,7 +610,7 @@ void DepthmapEstimator::PriorReinit(int width, int height) {
                      static_cast<size_t>((height + 15) / 16 * 16));
   cl::NDRange local(16, 16);
   queue.enqueueNDRangeKernel(k_prior_reinit_, cl::NullRange, global, local);
-  queue.finish();
+  // queue.finish();
 }
 
 // =====================================================================
@@ -478,13 +624,13 @@ void DepthmapEstimator::RunIteration(int iter, int width, int height) {
     int arg = 0;
     k.setArg(arg++, cl_plane_hypotheses_);
     k.setArg(arg++, cl_costs_);
+    k.setArg(arg++, cl_planes_img_);
+    k.setArg(arg++, cl_costs_img_);
     k.setArg(arg++, cl_rand_states_);
     k.setArg(arg++, cl_selected_views_);
     k.setArg(arg++, cl_cameras_);
-    k.setArg(arg++, cl_images_[0]);
-    for (int i = 0; i < kMaxSources; i++) {
-      k.setArg(arg++, cl_images_[1 + i]);
-    }
+    k.setArg(arg++, cl_ref_img_);
+    k.setArg(arg++, cl_src_images_array_);
     k.setArg(arg++, width);
     k.setArg(arg++, height);
     k.setArg(arg++, params_.depth_min);
@@ -494,10 +640,13 @@ void DepthmapEstimator::RunIteration(int iter, int width, int height) {
     k.setArg(arg++, params_.sigma_spatial);
     k.setArg(arg++, params_.sigma_color);
     k.setArg(arg++, params_.top_k);
-    k.setArg(arg++, params_.census_weight);
+    k.setArg(arg++, params_.use_census ? 1.0f : 0.0f);
     k.setArg(arg++, color_flag);
     k.setArg(arg++, iter);
-    k.setArg(arg++, params_.smooth_weight);
+    float decay =
+        1.0f - 0.9f * static_cast<float>(iter) /
+                   static_cast<float>(std::max(params_.max_iterations - 1, 1));
+    k.setArg(arg++, params_.smooth_weight * decay);
     // Geometric consistency arguments.
     k.setArg(arg++, cl_prev_depths_);
     k.setArg(arg++, cl_prev_depth_mask_);
@@ -505,21 +654,29 @@ void DepthmapEstimator::RunIteration(int iter, int width, int height) {
     // Planar prior arguments.
     k.setArg(arg++, cl_prior_planes_);
     k.setArg(arg++, cl_plane_masks_);
+    // View-selection anchoring and far-propagation gradient gate.
+    k.setArg(arg++, params_.anchor_views);
+    // Per-source-view angle weights (sin of triangulation angle).
+    k.setArg(arg++, cl_angle_weights_);
   };
 
-  cl::NDRange global(static_cast<size_t>((width + 15) / 16 * 16),
+  // Dense checkerboard: launch half-width grid so all SIMD lanes are active.
+  int half_width = (width + 1) / 2;
+  cl::NDRange global(static_cast<size_t>((half_width + 15) / 16 * 16),
                      static_cast<size_t>((height + 15) / 16 * 16));
   cl::NDRange local(16, 16);
 
   // Red pass (x+y even)
+  SyncBuffersToImages(width, height);
   set_pm_args(k_patchmatch_red_, 0);
   queue.enqueueNDRangeKernel(k_patchmatch_red_, cl::NullRange, global, local);
-  queue.finish();
+  // queue.finish();
 
   // Black pass (x+y odd)
+  SyncBuffersToImages(width, height);
   set_pm_args(k_patchmatch_black_, 1);
   queue.enqueueNDRangeKernel(k_patchmatch_black_, cl::NullRange, global, local);
-  queue.finish();
+  // queue.finish();
 }
 
 // =====================================================================
@@ -532,27 +689,33 @@ void DepthmapEstimator::RunCheckerboardFilter(int width, int height) {
     int arg = 0;
     k.setArg(arg++, cl_plane_hypotheses_);
     k.setArg(arg++, cl_costs_);
+    k.setArg(arg++, cl_planes_img_);
+    k.setArg(arg++, cl_costs_img_);
     k.setArg(arg++, cl_cameras_);
     k.setArg(arg++, width);
     k.setArg(arg++, height);
     k.setArg(arg++, color_flag);
   };
 
-  cl::NDRange global(static_cast<size_t>((width + 15) / 16 * 16),
+  // Dense checkerboard: launch half-width grid so all SIMD lanes are active.
+  int half_width = (width + 1) / 2;
+  cl::NDRange global(static_cast<size_t>((half_width + 15) / 16 * 16),
                      static_cast<size_t>((height + 15) / 16 * 16));
   cl::NDRange local(16, 16);
 
   // Filter red pixels (reading from black neighbours).
+  SyncBuffersToImages(width, height);
   set_filter_args(k_checkerboard_filter_red_, 0);
   queue.enqueueNDRangeKernel(k_checkerboard_filter_red_, cl::NullRange, global,
                              local);
-  queue.finish();
+  // queue.finish();
 
   // Filter black pixels (reading from red neighbours).
+  SyncBuffersToImages(width, height);
   set_filter_args(k_checkerboard_filter_black_, 1);
   queue.enqueueNDRangeKernel(k_checkerboard_filter_black_, cl::NullRange,
                              global, local);
-  queue.finish();
+  // queue.finish();
 }
 
 // =====================================================================
@@ -654,7 +817,7 @@ void DepthmapEstimator::UpsampleDepthNormal(const DepthmapResult& coarse,
                      static_cast<size_t>((dst_h + 15) / 16 * 16));
   cl::NDRange local(16, 16);
   queue.enqueueNDRangeKernel(k_upsample_, cl::NullRange, global, local);
-  queue.finish();
+  // queue.finish();
 }
 
 // =====================================================================
@@ -721,13 +884,17 @@ void DepthmapEstimator::ComputeSfMPlanarPrior(int w, int h) {
     projections.push_back(p);
   }
 
-  std::cerr << "[PatchMatch]   SfM planar prior: " << projections.size() << "/"
-            << sfm_points_.size() << " points project into " << w << "x" << h
-            << " image\n";
+  {
+    std::ostringstream oss;
+    oss << "[PatchMatch]   SfM planar prior: " << projections.size() << "/"
+        << sfm_points_.size() << " points project into " << w << "x" << h
+        << " image";
+    foundation::LogDebug("dense", oss.str());
+  }
 
   if (projections.size() < 4) {
-    std::cerr
-        << "[PatchMatch]   Too few projected points, skipping SfM prior\n";
+    foundation::LogDebug(
+        "dense", "[PatchMatch]   Too few projected points, skipping SfM prior");
     // Upload empty masks so PriorReinit is a no-op.
     int npix = w * h;
     std::vector<cl_uint> masks_buf(npix, 0u);
@@ -924,8 +1091,12 @@ void DepthmapEstimator::ComputeSfMPlanarPrior(int w, int h) {
     }
   }
 
-  std::cerr << "[PatchMatch]   SfM prior: " << triangles.size()
-            << " triangles, " << filled << "/" << npix << " pixels masked\n";
+  {
+    std::ostringstream oss;
+    oss << "[PatchMatch]   SfM prior: " << triangles.size() << " triangles, "
+        << filled << "/" << npix << " pixels masked";
+    foundation::LogDebug("dense", oss.str());
+  }
 
   // ---- 6. Upload prior planes and masks to GPU ----
   auto& queue = opencl::CLContext::Instance().Device(device_idx_).queue();
@@ -1019,6 +1190,18 @@ void DepthmapEstimator::ReadBackResults(DepthmapResult* result, int width,
     }
   }
 
+  // ---- Speckle removal: BFS flood-fill, remove small segments ----
+  if (params_.speckle_min_size > 0) {
+    RemoveSmallSegments(result->depth, result->normal, width, height,
+                        params_.speckle_min_size, 0.01f);
+  }
+
+  // ---- Gap interpolation: fill small holes row-wise + column-wise ----
+  if (params_.gap_max_size > 0) {
+    GapInterpolation(result->depth, result->normal, width, height,
+                     params_.gap_max_size, 0.025f);
+  }
+
   // ---- Surface confidence: logistic on photometric cost ----
   // P(surface) = sigmoid(-(cost - c0) / lambda)
   // Cost already captures match quality; prior is used for PatchMatch guidance,
@@ -1040,12 +1223,208 @@ void DepthmapEstimator::ReadBackResults(DepthmapResult* result, int width,
   }
 }
 
+// =====================================================================
+// Speckle removal: BFS flood-fill to find connected components of
+// similar depth, then zero out components smaller than min_segment_size.
+// depth_diff_threshold is the relative depth difference threshold.
+// =====================================================================
+void DepthmapEstimator::RemoveSmallSegments(ImageF& depth, PixelData3f& normal,
+                                            int width, int height,
+                                            int min_segment_size,
+                                            float depth_diff_threshold) {
+  const int npix = width * height;
+  std::vector<bool> visited(npix, false);
+  std::vector<int> segment;
+  segment.reserve(1024);
+
+  // 4-connectivity offsets: right, left, down, up
+  const int dx[4] = {1, -1, 0, 0};
+  const int dy[4] = {0, 0, 1, -1};
+
+  int total_removed = 0;
+
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      int idx = y * width + x;
+      if (visited[idx] || depth(y, x) <= 0.0f) {
+        visited[idx] = true;
+        continue;
+      }
+
+      // BFS flood fill
+      segment.clear();
+      segment.push_back(idx);
+      visited[idx] = true;
+      int head = 0;
+
+      while (head < static_cast<int>(segment.size())) {
+        int cur = segment[head++];
+        int cy = cur / width;
+        int cx = cur % width;
+        float d_cur = depth(cy, cx);
+
+        for (int dir = 0; dir < 4; ++dir) {
+          int nx = cx + dx[dir];
+          int ny = cy + dy[dir];
+          if (nx < 0 || nx >= width || ny < 0 || ny >= height) {
+            continue;
+          }
+          int nidx = ny * width + nx;
+          if (visited[nidx]) {
+            continue;
+          }
+          float d_nbr = depth(ny, nx);
+          if (d_nbr <= 0.0f) {
+            visited[nidx] = true;
+            continue;
+          }
+          // Relative depth similarity check
+          float max_d = std::max(d_cur, d_nbr);
+          if (std::abs(d_cur - d_nbr) / max_d < depth_diff_threshold) {
+            visited[nidx] = true;
+            segment.push_back(nidx);
+          }
+        }
+      }
+
+      // Remove small segments
+      if (static_cast<int>(segment.size()) < min_segment_size) {
+        for (int pidx : segment) {
+          int py = pidx / width;
+          int px = pidx % width;
+          depth(py, px) = 0.0f;
+          normal.col(pidx).setZero();
+        }
+        total_removed += static_cast<int>(segment.size());
+      }
+    }
+  }
+
+  if (total_removed > 0) {
+    {
+      std::ostringstream oss;
+      oss << "[PatchMatch] Speckle removal: " << total_removed
+          << " pixels removed (min segment " << min_segment_size << ")";
+      foundation::LogDebug("dense", oss.str());
+    }
+  }
+}
+
+// =====================================================================
+// Gap interpolation: scan row-wise then column-wise, linearly
+// interpolate depth and normal for small gaps bounded by similar depths.
+// depth_diff_threshold is the relative depth difference threshold for
+// the gap boundary pixels.
+// =====================================================================
+void DepthmapEstimator::GapInterpolation(ImageF& depth, PixelData3f& normal,
+                                         int width, int height,
+                                         int max_gap_size,
+                                         float depth_diff_threshold) {
+  int total_filled = 0;
+
+  // 1. Row-wise (horizontal gaps)
+  for (int y = 0; y < height; ++y) {
+    int gap_start = -1;
+    for (int x = 0; x < width; ++x) {
+      float d = depth(y, x);
+      if (d <= 0.0f) {
+        if (gap_start < 0) {
+          gap_start = x;
+        }
+        continue;
+      }
+      // We hit a valid pixel after a gap
+      if (gap_start >= 0) {
+        int gap_len = x - gap_start;
+        int left_x = gap_start - 1;
+        if (left_x >= 0 && gap_len <= max_gap_size) {
+          float d_left = depth(y, left_x);
+          float d_right = d;
+          float max_d = std::max(d_left, d_right);
+          if (std::abs(d_left - d_right) / max_d < depth_diff_threshold) {
+            // Linearly interpolate depth and normal
+            Vec3f n_left = normal.col(y * width + left_x);
+            Vec3f n_right = normal.col(y * width + x);
+            for (int gx = gap_start; gx < x; ++gx) {
+              float t = static_cast<float>(gx - left_x) /
+                        static_cast<float>(x - left_x);
+              depth(y, gx) = d_left + t * (d_right - d_left);
+              Vec3f n_interp = (1.0f - t) * n_left + t * n_right;
+              float nlen = n_interp.norm();
+              if (nlen > 1e-6f) {
+                n_interp /= nlen;
+              }
+              normal.col(y * width + gx) = n_interp;
+              ++total_filled;
+            }
+          }
+        }
+      }
+      gap_start = -1;
+    }
+  }
+
+  // 2. Column-wise (vertical gaps)
+  for (int x = 0; x < width; ++x) {
+    int gap_start = -1;
+    for (int y = 0; y < height; ++y) {
+      float d = depth(y, x);
+      if (d <= 0.0f) {
+        if (gap_start < 0) {
+          gap_start = y;
+        }
+        continue;
+      }
+      if (gap_start >= 0) {
+        int gap_len = y - gap_start;
+        int top_y = gap_start - 1;
+        if (top_y >= 0 && gap_len <= max_gap_size) {
+          float d_top = depth(top_y, x);
+          float d_bottom = d;
+          float max_d = std::max(d_top, d_bottom);
+          if (std::abs(d_top - d_bottom) / max_d < depth_diff_threshold) {
+            Vec3f n_top = normal.col(top_y * width + x);
+            Vec3f n_bottom = normal.col(y * width + x);
+            for (int gy = gap_start; gy < y; ++gy) {
+              float t = static_cast<float>(gy - top_y) /
+                        static_cast<float>(y - top_y);
+              // Only fill if still empty (don't overwrite row-wise fills)
+              if (depth(gy, x) <= 0.0f) {
+                depth(gy, x) = d_top + t * (d_bottom - d_top);
+                Vec3f n_interp = (1.0f - t) * n_top + t * n_bottom;
+                float nlen = n_interp.norm();
+                if (nlen > 1e-6f) {
+                  n_interp /= nlen;
+                }
+                normal.col(gy * width + x) = n_interp;
+                ++total_filled;
+              }
+            }
+          }
+        }
+      }
+      gap_start = -1;
+    }
+  }
+
+  if (total_filled > 0) {
+    {
+      std::ostringstream oss;
+      oss << "[PatchMatch] Gap interpolation: " << total_filled
+          << " pixels filled (max gap " << max_gap_size << ")";
+      foundation::LogDebug("dense", oss.str());
+    }
+  }
+}
+
 void DepthmapEstimator::ReleaseGpuBuffers() {
   // Release GPU buffers (host-pinned memory on many OpenCL implementations).
   for (int i = 0; i < static_cast<int>(cl_images_.size()); i++) {
     cl_images_[i] = cl::Image2D();
   }
   cl_images_.clear();
+  cl_ref_img_ = cl::Image2D();
+  cl_src_images_array_ = cl::Image2DArray();
   cl_cameras_ = cl::Buffer();
   cl_plane_hypotheses_ = cl::Buffer();
   cl_costs_ = cl::Buffer();
@@ -1055,6 +1434,7 @@ void DepthmapEstimator::ReleaseGpuBuffers() {
   cl_plane_masks_ = cl::Buffer();
   cl_prev_depths_ = cl::Buffer();
   cl_prev_depth_mask_ = 0u;
+  cl_angle_weights_ = cl::Buffer();
 }
 
 void DepthmapEstimator::ReleaseBuffers() {

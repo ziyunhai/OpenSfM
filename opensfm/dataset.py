@@ -669,6 +669,18 @@ class DataSet(DataSetBase):
         geo.log_vertical_datum(result)
         return result
 
+    def output_coordinate_system(self) -> str:
+        """CRS used for georeferenced products (LAS/LAZ, DSM/ortho, report).
+
+        Centralizes the choice: the GCP coordinate system when it is projected,
+        otherwise the UTM zone of the reconstruction reference (see
+        ``geo.decide_output_crs``).  Returned as an EPSG/proj/WKT string usable by
+        both pyproj and OSR.
+        """
+        return geo.decide_output_crs(
+            self.load_gcp_coordinate_system(), self.load_reference()
+        )
+
     def save_ground_control_points(
         self,
         points: List[pymap.GroundControlPoint],
@@ -949,6 +961,22 @@ class UndistortedDataSet:
             smask = self.load_undistorted_segmentation_mask(image)
         return masking.combine_masks(mask, smask)
 
+    def equalization_file(self) -> str:
+        return os.path.join(self.data_path, "equalization.json")
+
+    def equalization_exists(self) -> bool:
+        return self.io_handler.isfile(self.equalization_file())
+
+    def load_equalization(self) -> Dict[str, Any]:
+        """Per-image radiometric corrections produced by ``dense_equalize``:
+        ``{shot_id: {gain, vignette, pp, rmax, vignette_order}}``."""
+        with self.io_handler.open_rt(self.equalization_file()) as fin:
+            return io.json_load(fin)
+
+    def save_equalization(self, equalization: Dict[str, Any]) -> None:
+        with self.io_handler.open_wt(self.equalization_file()) as fout:
+            io.json_dump(equalization, fout)
+
     def clusters_file(self) -> str:
         return os.path.join(self.data_path, "clusters.json")
 
@@ -989,6 +1017,106 @@ class UndistortedDataSet:
                 })
             io.json_dump({"clusters_points": clusters_points_list}, fout)
 
+    def _neighbors_best_file(self) -> str:
+        return os.path.join(self.data_path, "neighbors_best.json")
+
+    def _neighbors_all_file(self) -> str:
+        return os.path.join(self.data_path, "neighbors_all.json")
+
+    def _depth_ranges_file(self) -> str:
+        return os.path.join(self.data_path, "depth_ranges.json")
+
+    def neighbors_exist(self) -> bool:
+        return self.io_handler.isfile(
+            self._neighbors_best_file()
+        ) and self.io_handler.isfile(self._neighbors_all_file())
+
+    def save_neighbors_best(self, neighbors: Dict[str, List[str]]) -> None:
+        with self.io_handler.open_wt(self._neighbors_best_file()) as fout:
+            io.json_dump(neighbors, fout)
+
+    def load_neighbors_best(self) -> Dict[str, List[str]]:
+        with self.io_handler.open_rt(self._neighbors_best_file()) as fin:
+            return io.json_load(fin)
+
+    def save_neighbors_all(self, neighbors: Dict[str, List[str]]) -> None:
+        with self.io_handler.open_wt(self._neighbors_all_file()) as fout:
+            io.json_dump(neighbors, fout)
+
+    def load_neighbors_all(self) -> Dict[str, List[str]]:
+        with self.io_handler.open_rt(self._neighbors_all_file()) as fin:
+            return io.json_load(fin)
+
+    def depth_ranges_exist(self) -> bool:
+        return self.io_handler.isfile(self._depth_ranges_file())
+
+    def save_depth_ranges(
+        self, depth_ranges: Dict[str, Tuple[float, float]]
+    ) -> None:
+        payload = {
+            sid: [float(dr[0]), float(dr[1])]
+            for sid, dr in depth_ranges.items()
+        }
+        with self.io_handler.open_wt(self._depth_ranges_file()) as fout:
+            io.json_dump(payload, fout)
+
+    def load_depth_ranges(self) -> Dict[str, Tuple[float, float]]:
+        with self.io_handler.open_rt(self._depth_ranges_file()) as fin:
+            payload = io.json_load(fin)
+        return {sid: (float(v[0]), float(v[1])) for sid, v in payload.items()}
+
+    def _cluster_bboxes_file(self) -> str:
+        return os.path.join(self.data_path, "cluster_bboxes.json")
+
+    def cluster_bboxes_exist(self) -> bool:
+        return self.io_handler.isfile(self._cluster_bboxes_file())
+
+    def save_cluster_bboxes(
+        self, bboxes: List[Tuple[NDArray, NDArray]]
+    ) -> None:
+        payload = [
+            {"min": np.asarray(mn).tolist(), "max": np.asarray(mx).tolist()}
+            for mn, mx in bboxes
+        ]
+        with self.io_handler.open_wt(self._cluster_bboxes_file()) as fout:
+            io.json_dump({"cluster_bboxes": payload}, fout)
+
+    def load_cluster_bboxes(self) -> List[Tuple[NDArray, NDArray]]:
+        with self.io_handler.open_rt(self._cluster_bboxes_file()) as fin:
+            payload = io.json_load(fin)["cluster_bboxes"]
+        return [
+            (
+                np.array(b["min"], dtype=np.float64),
+                np.array(b["max"], dtype=np.float64),
+            )
+            for b in payload
+        ]
+
+    def crop_hull_file(self) -> str:
+        return os.path.join(self.data_path, "dense_crop_hull.json")
+
+    def crop_hull_exists(self) -> bool:
+        return self.io_handler.isfile(self.crop_hull_file())
+
+    def save_crop_hull(self, vertices: NDArray, percentile: float) -> None:
+        """Persist the dense crop hull (CCW topocentric XY polygon).
+
+        Saved by ``dense_clustering`` and consumed by ``dense_merging`` to clip
+        the point cloud and mask the DSM/ortho to the surveyed footprint.
+        """
+        payload = {
+            "frame": "topocentric",
+            "percentile": float(percentile),
+            "vertices": np.asarray(vertices, dtype=float).tolist(),
+        }
+        with self.io_handler.open_wt(self.crop_hull_file()) as fout:
+            io.json_dump(payload, fout)
+
+    def load_crop_hull(self) -> NDArray:
+        with self.io_handler.open_rt(self.crop_hull_file()) as fin:
+            payload = io.json_load(fin)
+        return np.array(payload["vertices"], dtype=np.float64)
+
     def _depthmap_path(self) -> str:
         return os.path.join(self.data_path, "depthmaps")
 
@@ -1017,6 +1145,29 @@ class UndistortedDataSet:
         with self.io_handler.open_wb(self.point_cloud_file(filename)) as fp:
             io.point_cloud_to_ply(points, normals, colors, labels, fp)
 
+    def mesh_file(self, filename: str = "mesh.ply") -> str:
+        return os.path.join(self._depthmap_path(), filename)
+
+    def load_mesh(
+        self, filename: str = "mesh.ply"
+    ) -> Tuple[NDArray, NDArray, NDArray, NDArray]:
+        """Load a dense triangle mesh PLY → (vertices, normals, colors, faces)."""
+        with self.io_handler.open_rb(self.mesh_file(filename)) as fp:
+            return io.load_mesh_from_ply(fp)
+
+    def save_mesh(
+        self,
+        vertices: NDArray,
+        normals: NDArray,
+        colors: NDArray,
+        faces: NDArray,
+        filename: str = "mesh.ply",
+    ) -> None:
+        """Save a dense triangle mesh as a binary PLY (xyz+normal+rgb + faces)."""
+        self.io_handler.mkdir_p(self._depthmap_path())
+        with self.io_handler.open_wb(self.mesh_file(filename)) as fp:
+            io.mesh_to_ply(vertices, normals, colors, faces, fp)
+
     def dsm_file(self) -> str:
         return os.path.join(self._depthmap_path(), "dsm.tif")
 
@@ -1026,73 +1177,223 @@ class UndistortedDataSet:
         origin_x: float,
         origin_y: float,
         gsd: float,
-        reference: Optional["geo.TopocentricConverter"] = None,
+        srs_wkt: Optional[str] = None,
+        path: Optional[str] = None,
     ) -> None:
-        """Save a DSM grid as a GeoTIFF.
+        """Save a DSM grid as a GeoTIFF (see ``geo.save_dsm_geotiff``).
 
-        Args:
-            grid: (H, W) float32 array. NaN = no data.
-            origin_x: X coordinate of the left edge of the grid.
-            origin_y: Y coordinate of the bottom edge of the grid.
-            gsd: ground sample distance in world units per pixel.
-            reference: topocentric reference for CRS (UTM). None = no CRS.
+        ``srs_wkt`` tags the raster's CRS; None leaves it untagged (topocentric).
+        ``path`` defaults to the final ``dsm.tif`` (override for per-cluster
+        debug tiles).
         """
-        from osgeo import gdal, osr
-
         self.io_handler.mkdir_p(self._depthmap_path())
-        path = self.dsm_file()
-        h, w = grid.shape
-
-        driver = gdal.GetDriverByName("GTiff")
-        ds = driver.Create(path, w, h, 1, gdal.GDT_Float32)
-
-        # GeoTransform: (top-left X, pixel width, 0, top-left Y, 0, -pixel height)
-        # origin_y is bottom edge, so top-left Y = origin_y + H * gsd
-        top_left_y = origin_y + h * gsd
-        ds.SetGeoTransform((origin_x, gsd, 0.0, top_left_y, 0.0, -gsd))
-
-        # Set CRS if reference available.
-        if reference is not None:
-            srs = osr.SpatialReference()
-            utm_zone = int((reference.lon + 180.0) / 6.0) + 1
-            north = reference.lat >= 0.0
-            srs.SetUTM(utm_zone, north)
-            srs.SetWellKnownGeogCS("WGS84")
-            ds.SetProjection(srs.ExportToWkt())
-
-        band = ds.GetRasterBand(1)
-        nodata = -9999.0
-        band.SetNoDataValue(nodata)
-
-        # Replace NaN with nodata value.
-        out = np.where(np.isnan(grid), nodata, grid).astype(np.float32)
-        # Flip vertically: GeoTIFF row 0 = top, our grid row 0 = bottom.
-        band.WriteArray(np.flipud(out))
-        band.FlushCache()
-        ds = None  # close file
+        geo.save_dsm_geotiff(
+            path or self.dsm_file(), grid, origin_x, origin_y, gsd, srs_wkt
+        )
 
     def load_dsm(self) -> Tuple[NDArray, Tuple[float, ...], str]:
-        """Load DSM from GeoTIFF.
+        """Load DSM from GeoTIFF (see ``geo.load_dsm_geotiff``)."""
+        return geo.load_dsm_geotiff(self.dsm_file())
 
-        Returns:
-            (grid, geotransform, crs_wkt): grid has NaN for no-data cells.
+    def ortho_file(self) -> str:
+        return os.path.join(self._depthmap_path(), "ortho.tif")
+
+    def save_ortho(
+        self,
+        image: NDArray,
+        origin_x: float,
+        origin_y: float,
+        gsd: float,
+        srs_wkt: Optional[str] = None,
+        nodata_mask: Optional[NDArray] = None,
+        path: Optional[str] = None,
+    ) -> None:
+        """Save an ortho image as a GeoTIFF (see ``geo.save_ortho_geotiff``).
+
+        ``srs_wkt`` tags the raster's CRS; None leaves it untagged (topocentric).
+        ``path`` defaults to the final ``ortho.tif`` (override for per-cluster
+        tiles).
         """
-        from osgeo import gdal
+        self.io_handler.mkdir_p(self._depthmap_path())
+        geo.save_ortho_geotiff(
+            path or self.ortho_file(), image, origin_x, origin_y, gsd,
+            srs_wkt, nodata_mask=nodata_mask,
+        )
 
-        ds = gdal.Open(self.dsm_file(), gdal.GA_ReadOnly)
-        if ds is None:
-            raise FileNotFoundError(f"DSM not found: {self.dsm_file()}")
-        band = ds.GetRasterBand(1)
-        nodata = band.GetNoDataValue()
-        arr = band.ReadAsArray().astype(np.float32)
-        # Flip back: GeoTIFF row 0 = top → our convention row 0 = bottom.
-        arr = np.flipud(arr)
-        if nodata is not None:
-            arr[arr == nodata] = np.nan
-        gt = ds.GetGeoTransform()
-        wkt = ds.GetProjection() or ""
-        ds = None
-        return arr, gt, wkt
+    def save_dsm_ortho_streamed(
+        self,
+        gh: int,
+        gw: int,
+        origin_x: float,
+        origin_y: float,
+        gsd: float,
+        fill_band: "Any",
+        band_rows: int,
+        reference: Optional["geo.TopocentricConverter"] = None,
+        output_crs: Optional[str] = None,
+    ) -> int:
+        """Write dsm.tif + ortho.tif band-by-band, never holding the full grid.
+
+        When ``output_crs`` is given (with ``reference``), the rasters are
+        reprojected to that CRS, north-up (see
+        ``geo.save_dsm_ortho_streamed_georeferenced``).  Otherwise the grid stays
+        in topocentric coordinates with no CRS tag.  Returns the valid-cell count.
+        """
+        self.io_handler.mkdir_p(self._depthmap_path())
+        if output_crs is not None and reference is not None:
+            return geo.save_dsm_ortho_streamed_georeferenced(
+                self.dsm_file(), self.ortho_file(), gh, gw, origin_x, origin_y,
+                gsd, fill_band, band_rows, reference, output_crs,
+                tmp_dsm_path=self.dsm_file() + ".topo.tif",
+                tmp_ortho_path=self.ortho_file() + ".topo.tif",
+            )
+        return geo.save_dsm_ortho_streamed_geotiff(
+            self.dsm_file(), self.ortho_file(), gh, gw, origin_x, origin_y,
+            gsd, fill_band, band_rows, srs_wkt=None,
+        )
+
+    # ── Per-cluster DSM/ortho tiles (composited into the final raster) ──
+    def dsm_ortho_batch_file(self, batch_num: int) -> str:
+        return os.path.join(
+            self._depthmap_path(), f"dsm_ortho_batch_{batch_num:04d}.npz"
+        )
+
+    def dsm_cluster_file(self, batch_num: int) -> str:
+        """Path of a per-cluster debug DSM GeoTIFF (dsm_save_cluster_tiles)."""
+        return os.path.join(
+            self._depthmap_path(), f"dsm_cluster_{batch_num:04d}.tif"
+        )
+
+    def ortho_cluster_file(self, batch_num: int) -> str:
+        """Path of a per-cluster debug ortho GeoTIFF (dsm_save_cluster_tiles)."""
+        return os.path.join(
+            self._depthmap_path(), f"ortho_cluster_{batch_num:04d}.tif"
+        )
+
+    def dsm_ortho_batch_exists(self, batch_num: int) -> bool:
+        return self.io_handler.isfile(self.dsm_ortho_batch_file(batch_num))
+
+    def list_batch_indices(self, prefix: str, suffix: str) -> List[int]:
+        """Discover fusion batch indices by listing the depthmap folder.
+
+        Returns the sorted indices ``i`` for every file named exactly
+        ``{prefix}{i:04d}{suffix}`` (e.g. ``fused_batch_0003.ply``).  Names with
+        anything between the number and suffix (``fused_batch_0003_debug.ply``)
+        are ignored.  The fusion stage emits one batch per KD-tree chunk, so the
+        merge derives the chunk count from disk rather than a persisted marker.
+        """
+        path = self._depthmap_path()
+        if not self.io_handler.isdir(path):
+            return []
+        indices: List[int] = []
+        for name in self.io_handler.ls(path):
+            base = os.path.basename(name)
+            if base.startswith(prefix) and base.endswith(suffix):
+                middle = base[len(prefix): len(base) - len(suffix)]
+                if middle.isdigit():
+                    indices.append(int(middle))
+        return sorted(indices)
+
+    def save_dsm_ortho_batch(
+        self,
+        batch_num: int,
+        dsm_grid: NDArray,
+        ortho_grid: NDArray,
+        origin_x: float,
+        origin_y: float,
+        gsd: float,
+        base_offset: Tuple[int, int] = (0, 0),
+        global_shape: Optional[Tuple[int, int]] = None,
+        confidence: Optional[NDArray] = None,
+    ) -> None:
+        """Save one cluster's finished DSM+ortho as a compact tile.
+
+        The passed grids may already be a territory-sized WINDOW into the shared
+        global grid (re-fitted per cluster to bound RAM).  We crop them further
+        to the tight bounding box of valid (non-NaN) DSM cells and store the
+        row/col offset *within the global grid* — ``base_offset`` is the window's
+        own offset, added to the local crop.  The tiles are composited back by
+        max-z in ``dense.merge.merge_dsm_ortho_batches``.  Writes nothing for an
+        empty footprint.
+
+        Args:
+            batch_num: cluster index (matches the ``fused_batch`` numbering).
+            dsm_grid: (H, W) float32, NaN = no surface (window or full extent).
+            ortho_grid: (H, W, 3) uint8 (same window as ``dsm_grid``).
+            origin_x/origin_y/gsd: GLOBAL grid georeference (identical across
+                clusters); stored so the merge can write the final GeoTIFF.
+            base_offset: (row, col) offset of the passed window within the global
+                grid.  ``(0, 0)`` when the grid already spans the full extent.
+            global_shape: (H, W) of the global grid; defaults to the passed
+                grid's shape (full-extent case).
+            confidence: optional (H, W) bool/uint8, True where the DSM cell is a
+                REAL reconstruction (vs a hole-fill).  Stored (cropped identically
+                to the DSM) so the merge can favour real heights over interpolated
+                ones in tile overlaps.  Omitted → the merge treats the tile as all
+                real (legacy behaviour).
+        """
+        self.io_handler.mkdir_p(self._depthmap_path())
+        valid = ~np.isnan(dsm_grid)
+        if not valid.any():
+            return
+        rows = np.where(valid.any(axis=1))[0]
+        cols = np.where(valid.any(axis=0))[0]
+        r0, r1 = int(rows[0]), int(rows[-1]) + 1
+        c0, c1 = int(cols[0]), int(cols[-1]) + 1
+        dsm_win = np.ascontiguousarray(
+            dsm_grid[r0:r1, c0:c1], dtype=np.float32)
+        ortho_win = np.ascontiguousarray(
+            ortho_grid[r0:r1, c0:c1], dtype=np.uint8
+        )
+        base_r, base_c = base_offset
+        gshape = (
+            global_shape if global_shape is not None
+            else (int(dsm_grid.shape[0]), int(dsm_grid.shape[1]))
+        )
+        arrays = dict(
+            dsm=dsm_win,
+            ortho=ortho_win,
+            offset=np.array([base_r + r0, base_c + c0], dtype=np.int64),
+            global_shape=np.array(gshape, dtype=np.int64),
+            geo=np.array([origin_x, origin_y, gsd], dtype=np.float64),
+        )
+        if confidence is not None:
+            arrays["conf"] = np.ascontiguousarray(
+                confidence[r0:r1, c0:c1], dtype=np.uint8
+            )
+        buf = BytesIO()
+        np.savez(buf, **arrays)
+        with self.io_handler.open_wb(self.dsm_ortho_batch_file(batch_num)) as f:
+            f.write(lz4_frame.compress(buf.getvalue()))
+
+    def load_dsm_ortho_batch(
+        self, batch_num: int
+    ) -> Tuple[NDArray, NDArray, int, int, Tuple[int, int],
+               Tuple[float, float, float], Optional[NDArray]]:
+        """Load a DSM/ortho tile.
+
+        Returns ``(dsm_win, ortho_win, row0, col0, (global_h, global_w),
+        (origin_x, origin_y, gsd), conf)`` where ``conf`` is the (H, W) uint8
+        real-reconstruction mask (1 = real, 0 = hole-fill), or ``None`` for a
+        legacy tile saved without it.
+        """
+        with self.io_handler.open_rb(
+            self.dsm_ortho_batch_file(batch_num)
+        ) as f:
+            raw = lz4_frame.decompress(f.read())
+        o = np.load(BytesIO(raw))
+        dsm = o["dsm"]
+        ortho = o["ortho"]
+        r0, c0 = int(o["offset"][0]), int(o["offset"][1])
+        gh, gw = int(o["global_shape"][0]), int(o["global_shape"][1])
+        ox, oy, gsd = (float(o["geo"][0]), float(o["geo"][1]),
+                       float(o["geo"][2]))
+        conf = o["conf"] if "conf" in o.files else None
+        o.close()
+        dsm = np.where(
+            np.isfinite(dsm) & (dsm != geo.DSM_NODATA), dsm, np.nan
+        ).astype(np.float32)
+        return dsm, ortho, r0, c0, (gh, gw), (ox, oy, gsd), conf
 
     def raw_depthmap_exists(self, image: str) -> bool:
         return self.io_handler.isfile(self.depthmap_file(image, "raw.npz"))
@@ -1123,8 +1424,10 @@ class UndistortedDataSet:
     ) -> None:
         filepath = self.depthmap_file(image, "raw.npz")
         buf = BytesIO()
-        arrays = dict(depth=depth, plane=plane, score=score,
-                      nghbr=nghbr, nghbrs=nghbrs)
+        # ``score`` (PatchMatch cost), ``nghbr`` and ``nghbrs`` are accepted
+        # for call-site compatibility but not persisted: nothing ever reads
+        # them back (cleaning consumes only depth, plane/normal, confidence).
+        arrays = dict(depth=depth, plane=plane)
         if confidence is not None:
             arrays["confidence"] = confidence
         np.savez(buf, **arrays)
@@ -1139,9 +1442,11 @@ class UndistortedDataSet:
         o = np.load(BytesIO(raw))
         depth = o["depth"]
         plane = o["plane"]
-        score = o["score"]
-        nghbr = o["nghbr"]
-        nghbrs = o["nghbrs"]
+        # score/nghbr/nghbrs are legacy fields no longer written; tolerate
+        # both old files (present) and new ones (absent).
+        score = o["score"] if "score" in o else None
+        nghbr = o["nghbr"] if "nghbr" in o else None
+        nghbrs = o["nghbrs"] if "nghbrs" in o else None
         confidence = o["confidence"] if "confidence" in o else None
         o.close()
         return depth, plane, score, nghbr, nghbrs, confidence

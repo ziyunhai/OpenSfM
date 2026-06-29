@@ -565,8 +565,11 @@ class Report:
              if geo_string else self.locale.t("none")],
         ]
 
-        horiz_crs, vert_crs = geo.nicify_crs(self.stats.get(
-            "gcp_errors", {}).get("coordinate_system", ""))
+        # CRS of the georeferenced products (centralized decision: GCP CRS if
+        # projected, else UTM).  Fall back to the GCP CRS for older stats files.
+        output_crs = self.stats.get("output_coordinate_system") or self.stats.get(
+            "gcp_errors", {}).get("coordinate_system", "")
+        horiz_crs, vert_crs = geo.nicify_crs(output_crs)
 
         gcp_crs = f"{horiz_crs} | {vert_crs}"
         if gcp_crs:
@@ -634,13 +637,43 @@ class Report:
 
         self.pdf.set_xy(MARGIN, self.pdf.get_y() + TABLE_GAP)
 
+    def _grouped_steps_times(self) -> Dict[str, float]:
+        """Collapse the fine-grained per-stage timings into the few buckets shown
+        in the report table, so it stays readable as stages are added.
+
+        ``stats.json`` keeps the full breakdown; only the displayed table is
+        grouped: Tracks Merging + Reconstruction become a single Reconstruction
+        column and the four dense stages a single Dense column. A group is
+        dropped entirely when none of its source stages ran (e.g. no dense run).
+        """
+        steps_times = self.stats["processing_statistics"]["steps_times"]
+
+        groups = [
+            ("Features", ["Feature Extraction"]),
+            ("Matching", ["Features Matching"]),
+            ("Reconstruction", ["Tracks Merging", "Reconstruction"]),
+            ("Dense", ["Dense Clustering", "Dense Equalize", "Dense Depthmaps",
+                       "Dense Fusion", "Dense Merging"]),
+            ("Statistics", ["Statistics"]),
+            ("Total Time", ["Total Time"]),
+        ]
+
+        grouped: Dict[str, float] = {}
+        for display_name, source_keys in groups:
+            present = [steps_times[k] for k in source_keys if k in steps_times]
+            if not present:
+                continue
+            valid = [v for v in present if v >= 0]
+            grouped[display_name] = sum(valid) if valid else -1
+        return grouped
+
     def make_processing_time_details(self) -> None:
         self._make_section(self.locale.t("processing_time_details"))
 
-        columns_names = list(
-            self.stats["processing_statistics"]["steps_times"].keys())
+        steps_times = self._grouped_steps_times()
+        columns_names = list(steps_times.keys())
         formatted_floats = []
-        for v in self.stats["processing_statistics"]["steps_times"].values():
+        for v in steps_times.values():
             formatted_floats.append(self.locale.format_time(v))
         rows = [formatted_floats]
         self._make_table(columns_names, rows)
@@ -1148,6 +1181,34 @@ class Report:
 
         self.pdf.set_xy(MARGIN, self.pdf.get_y() + TABLE_GAP)
 
+    def make_dsm_details(self) -> None:
+        dsm_thumbs = [
+            f for f in self.io_handler.ls(self.output_path)
+            if f.startswith("dsm_thumb") and f.endswith(".jpg")
+        ]
+        if not dsm_thumbs:
+            return
+
+        self._make_section(self.locale.t("digital_surface_model"))
+        self._make_centered_image(
+            os.path.join(self.output_path, dsm_thumbs[0]), 120
+        )
+        self.pdf.set_xy(MARGIN, self.pdf.get_y() + TABLE_GAP)
+
+    def make_ortho_details(self) -> None:
+        ortho_thumbs = [
+            f for f in self.io_handler.ls(self.output_path)
+            if f.startswith("ortho_thumb") and f.endswith(".jpg")
+        ]
+        if not ortho_thumbs:
+            return
+
+        self._make_section(self.locale.t("orthophoto"))
+        self._make_centered_image(
+            os.path.join(self.output_path, ortho_thumbs[0]), 120
+        )
+        self.pdf.set_xy(MARGIN, self.pdf.get_y() + TABLE_GAP)
+
     def add_page_break(self) -> None:
         self.pdf.add_page("P")
 
@@ -1165,6 +1226,14 @@ class Report:
         self.make_camera_models_details()
         self.make_rig_cameras_details()
         self.add_page_break()
+
+        report_images = self.io_handler.ls(self.output_path)
+        if any(
+            f.startswith(("dsm_thumb", "ortho_thumb")) for f in report_images
+        ):
+            self.make_dsm_details()
+            self.make_ortho_details()
+            self.add_page_break()
 
         self.make_overlap_summary()
         self.make_gps_details()

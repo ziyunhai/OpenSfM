@@ -10,19 +10,50 @@
 // Major differences from the original CUDA code:
 //   - Uses OpenCL 1.2 instead of CUDA.
 //   - Uses a Philox-style PRNG instead of curand.
-//   - Texture sampling is done via read_imagef on CL image objects.
+//   - Texture sampling uses read_imagef (CL_HALF_FLOAT storage,
+//   hardware-converted).
 
 #ifdef OPENSFM_HAVE_OPENCL
 
 namespace dense {
 
-inline constexpr int kMaxSources = 16;
+inline constexpr int kMaxSources = 8;
 
 inline const char* kPatchMatchKernelSource =
-R"CL(
+    R"CL(
 
 // Maximum number of source images the kernels support.
-#define MAX_SOURCES 16
+#define MAX_SOURCES 8
+
+// Patch half-size, baked in at build time (-DPM_HALF_PATCH=patch_size/2) so
+// the reference-patch cache below can be sized exactly.  Falls back to the
+// default 5x5 window (half_patch=2) when the define is not supplied.
+#ifndef PM_HALF_PATCH
+#define PM_HALF_PATCH 2
+#endif
+#define PM_PATCH_SAMPLES ((2 * PM_HALF_PATCH + 1) * (2 * PM_HALF_PATCH + 1))
+
+// Reference-side NCC patch.  The reference reads, bilateral weights and
+// reference moments depend ONLY on the reference image and (x, y) — they are
+// identical for every plane hypothesis tested at a pixel.  compute_ref_patch
+// fills this once per work-item and every compute_cost_vector call reuses it,
+// eliminating the redundant reference texture reads and exp() weights
+// (~14/15 of them on the acmmp_patchmatch hot path).
+typedef struct {
+  float ref_center;            // reference value at the patch centre
+  float sum_w;                 // Σ w     (bilateral weights)
+  float sum_wr;                // Σ w·r
+  float sum_wrr;               // Σ w·r·r
+  float w[PM_PATCH_SAMPLES];   // per-sample weight, row-major (iy then ix)
+  float wr[PM_PATCH_SAMPLES];  // per-sample w·r, same order
+} RefPatch;
+
+
+// Nearest-neighbor sampler for reading planes/costs from image2d_t.
+// Used to leverage the texture cache for scattered neighbor reads.
+__constant sampler_t samp_planes = CLK_NORMALIZED_COORDS_FALSE
+                                 | CLK_ADDRESS_CLAMP_TO_EDGE
+                                 | CLK_FILTER_NEAREST;
 
 // =====================================================================
 // Camera struct – matches host-side layout.
@@ -156,7 +187,8 @@ PlaneHypothesis plane_from_depth_normal(float x, float y, float depth,
 // =====================================================================
 float compute_ncc_at_stride(
     read_only image2d_t ref_img,
-    read_only image2d_t src_img,
+    read_only image2d_array_t src_images,
+    int src_layer,
     float ref_center,
     float src_center,
     float src_cx, float src_cy,
@@ -173,16 +205,13 @@ float compute_ncc_at_stride(
                          CLK_FILTER_LINEAR;
 
   // Center-shifted accumulation to avoid catastrophic cancellation.
-  // Instead of computing var = E[X²] - E[X]² (which loses precision when
-  // E[X]² ≈ E[X²], i.e. in dark or uniform regions), we shift all pixel
-  // values by the center pixel: r = ref_val - ref_center, s = src_val - src_center.
-  // Then var_ref = E[r²] - E[r]² is well-conditioned because E[r] ≈ 0.
   float sum_w = 0.0f;
-  float sum_r = 0.0f;    // Σ w·(ref - ref_center)
-  float sum_s = 0.0f;    // Σ w·(src - src_center)
-  float sum_rr = 0.0f;   // Σ w·(ref - ref_center)²
-  float sum_ss = 0.0f;   // Σ w·(src - src_center)²
-  float sum_rs = 0.0f;   // Σ w·(ref - ref_center)·(src - src_center)
+  float sum_r = 0.0f;
+  float sum_s = 0.0f;
+  float sum_rr = 0.0f;
+  float sum_ss = 0.0f;
+  float sum_rs = 0.0f;
+
 
   for (int iy = -half_patch; iy <= half_patch; iy++) {
     for (int ix = -half_patch; ix <= half_patch; ix++) {
@@ -194,18 +223,15 @@ float compute_ncc_at_stride(
       float ry = (float)cy + fdy;
       float ref_val = read_imagef(ref_img, samp, (float2)(rx + 0.5f, ry + 0.5f)).x;
 
-      // Warp to source using the Jacobian (already per-pixel, scale by stride)
+      // Warp to source using the Jacobian
       float sx = src_cx + dfdx_x * fdx + dfdy_x * fdy;
       float sy = src_cy + dfdx_y * fdx + dfdy_y * fdy;
-      float src_val = read_imagef(src_img, samp, (float2)(sx + 0.5f, sy + 0.5f)).x;
+      float src_val = read_imagef(src_images, samp, (float4)(sx + 0.5f, sy + 0.5f, (float)src_layer, 0.0f)).x;
 
       // Bilateral weight: spatial × color.
-      // Intensities and sigma_color are both in normalized [0,1] units.
-      // Use physical pixel distance (fdx, fdy), not loop index (ix, iy),
-      // so that the spatial weight decays correctly at stride > 1.
-      float dist2 = fdx * fdx + fdy * fdy;
       float r = ref_val - ref_center;
-      float w = exp(dist2 * spatial_factor + r * r * color_factor);
+      float w = exp(fdx * fdx * spatial_factor + fdy * fdy * spatial_factor
+                  + r * r * color_factor);
       float s = src_val - src_center;
 
       sum_r  += w * r;
@@ -222,302 +248,17 @@ float compute_ncc_at_stride(
   float inv_w = 1.0f / sum_w;
   float mean_r = sum_r * inv_w;
   float mean_s = sum_s * inv_w;
-  // var = E[(x-c)²] - E[x-c]².  Since c = center pixel, E[x-c] ≈ 0,
-  // so E[x-c]² ≈ 0 and the subtraction is benign.
   float var_ref = sum_rr * inv_w - mean_r * mean_r;
   float var_src = sum_ss * inv_w - mean_s * mean_s;
 
-  // Reference PatchMatch uses kMinVar = 1e-5 with [0,255] pixel values.
-  // Our pixels are [0,1], so equivalent threshold is 1e-5 / 255² ≈ 1.5e-10.
-  // With center-shifted accumulation this is numerically stable.
-  if (var_ref < 1.5e-10f || var_src < 1.5e-10f) return -1.0f;
+  if (var_ref < 1.5e-6f || var_src < 1.5e-6f) return -1.0f;
 
   float covar = sum_rs * inv_w - mean_r * mean_s;
   return covar / sqrt(var_ref * var_src);
 }
 
-float compute_ncc(
-    read_only image2d_t ref_img,
-    read_only image2d_t src_img,
-    __global const Camera *ref_cam,
-    __global const Camera *src_cam,
-    int cx, int cy,
-    PlaneHypothesis plane,
-    int half_patch,
-    float sigma_spatial,
-    float sigma_color
-) {
-  const sampler_t samp = CLK_NORMALIZED_COORDS_FALSE |
-                         CLK_ADDRESS_CLAMP_TO_EDGE |
-                         CLK_FILTER_LINEAR;
-
-  float ref_center = read_imagef(ref_img, samp, (float2)(cx + 0.5f, cy + 0.5f)).x;
-
-  float depth = depth_from_plane((float)cx, (float)cy, plane, ref_cam);
-  if (depth <= 0.0f) return -1.0f;
-
-  // Back-project center to world
-  float3 center_world = backproject((float)cx, (float)cy, depth, ref_cam);
-
-  // Project to source
-  float3 src_proj = project(center_world, src_cam);
-  if (src_proj.z < 1e-6f) return -1.0f;
-  float src_cx = src_proj.x / src_proj.z;
-  float src_cy = src_proj.y / src_proj.z;
-
-  // Jacobian via finite differences for patch warping
-  float depth_dx = depth_from_plane((float)(cx+1), (float)cy, plane, ref_cam);
-  float depth_dy = depth_from_plane((float)cx, (float)(cy+1), plane, ref_cam);
-  if (depth_dx <= 0.0f || depth_dy <= 0.0f) return -1.0f;
-
-  float3 world_dx = backproject((float)(cx+1), (float)cy, depth_dx, ref_cam);
-  float3 world_dy = backproject((float)cx, (float)(cy+1), depth_dy, ref_cam);
-
-  float3 proj_dx = project(world_dx, src_cam);
-  float3 proj_dy = project(world_dy, src_cam);
-  if (proj_dx.z < 1e-6f || proj_dy.z < 1e-6f) return -1.0f;
-
-  float dfdx_x = proj_dx.x / proj_dx.z - src_cx;
-  float dfdx_y = proj_dx.y / proj_dx.z - src_cy;
-  float dfdy_x = proj_dy.x / proj_dy.z - src_cx;
-  float dfdy_y = proj_dy.y / proj_dy.z - src_cy;
-
-  float spatial_factor = -1.0f / (2.0f * sigma_spatial * sigma_spatial);
-  float color_factor = -1.0f / (2.0f * sigma_color * sigma_color);
-
-  float src_center = read_imagef(src_img, samp, (float2)(src_cx + 0.5f, src_cy + 0.5f)).x;
-
-  // Multi-scale: try progressively larger effective radii via strided
-  // sampling.  Same number of samples at each scale, so cost is O(1)
-  // per additional scale attempted.  Only escalate when variance is too
-  // low (textureless patch).
-  //
-  // stride=1.0 → original patch size
-  // stride=1.5 → 1.5x radius, same grid points
-  // stride=2.0 → 2x radius, etc.
-  // stride=2.5 → 2.5x radius
-  // stride=3.0 → 3x radius (last resort)
-  float strides[5] = {1.0f, 1.5f, 2.0f, 2.5f, 3.0f};
-
-  // Track the best NCC across all scales.  Previously this returned the
-  // LAST stride's NCC, which could be worse than an earlier stride —
-  // e.g. stride 1.0 gives 0.06 on a dark patch but stride 3.0 gives
-  // -0.03 due to noise.  Returning the best prevents false negatives.
-  float best_ncc = -1.0f;
-  bool base_textureless = false;
-  for (int s = 0; s < 5; s++) {
-    float ncc = compute_ncc_at_stride(
-        ref_img, src_img, ref_center, src_center,
-        src_cx, src_cy, cx, cy, half_patch, strides[s],
-        dfdx_x, dfdx_y, dfdy_x, dfdy_y,
-        spatial_factor, color_factor);
-    // If the base stride (1.0) has no texture, larger strides may pick
-    // up signal from a different depth surface across a discontinuity.
-    // Cap their NCC so the cost function falls back to Census instead.
-    if (s == 0 && ncc < -0.5f) base_textureless = true;
-    if (base_textureless && ncc > 0.0f) ncc = 0.0f;
-    if (ncc > best_ncc) best_ncc = ncc;
-    if (best_ncc > 0.1f) return best_ncc;  // good enough, done
-  }
-
-  return best_ncc;  // best across all scales
-}
-
-// =====================================================================
-// Census-transform matching cost between reference and source patches.
-//
-// The Census transform compares each pixel in a window to the center pixel,
-// producing a binary descriptor.  The Hamming distance between the reference
-// and (warped) source Census descriptors gives a non-parametric matching
-// cost that is robust to:
-//   - Low-texture / uniform surfaces (asphalt, walls, sky)
-//   - Global illumination changes
-//   - Radiometric differences between views
-//
-// Unlike NCC, Census ALWAYS produces a valid cost because it does not
-// depend on patch variance — even a perfectly uniform patch produces a
-// well-defined (all-zero) descriptor.
-//
-// We use a 5x5 Census window (25 comparisons → 25 bits in a uint).
-// The result is normalised to [0, 1] where 0 = perfect match.
-// =====================================================================
-float compute_census_cost(
-    read_only image2d_t ref_img,
-    read_only image2d_t src_img,
-    __global const Camera *ref_cam,
-    __global const Camera *src_cam,
-    int cx, int cy,
-    PlaneHypothesis plane
-) {
-  const sampler_t samp = CLK_NORMALIZED_COORDS_FALSE |
-                         CLK_ADDRESS_CLAMP_TO_EDGE |
-                         CLK_FILTER_LINEAR;
-
-  float depth = depth_from_plane((float)cx, (float)cy, plane, ref_cam);
-  if (depth <= 0.0f) return 1.0f;
-
-  // Back-project center to world and project to source
-  float3 center_world = backproject((float)cx, (float)cy, depth, ref_cam);
-  float3 src_proj = project(center_world, src_cam);
-  if (src_proj.z < 1e-6f) return 1.0f;
-  float src_cx = src_proj.x / src_proj.z;
-  float src_cy = src_proj.y / src_proj.z;
-
-  // Jacobian for patch warping (same as NCC)
-  float depth_dx = depth_from_plane((float)(cx+1), (float)cy, plane, ref_cam);
-  float depth_dy = depth_from_plane((float)cx, (float)(cy+1), plane, ref_cam);
-  if (depth_dx <= 0.0f || depth_dy <= 0.0f) return 1.0f;
-
-  float3 world_dx = backproject((float)(cx+1), (float)cy, depth_dx, ref_cam);
-  float3 world_dy = backproject((float)cx, (float)(cy+1), depth_dy, ref_cam);
-  float3 proj_dx = project(world_dx, src_cam);
-  float3 proj_dy = project(world_dy, src_cam);
-  if (proj_dx.z < 1e-6f || proj_dy.z < 1e-6f) return 1.0f;
-
-  float dfdx_x = proj_dx.x / proj_dx.z - src_cx;
-  float dfdx_y = proj_dx.y / proj_dx.z - src_cy;
-  float dfdy_x = proj_dy.x / proj_dy.z - src_cx;
-  float dfdy_y = proj_dy.y / proj_dy.z - src_cy;
-
-  // Center pixel values
-  float ref_center = read_imagef(ref_img, samp, (float2)(cx + 0.5f, cy + 0.5f)).x;
-  float src_center = read_imagef(src_img, samp, (float2)(src_cx + 0.5f, src_cy + 0.5f)).x;
-
-  // Build 5x5 Census descriptors (25 bits each)
-  uint ref_census = 0u;
-  uint src_census = 0u;
-  int bit = 0;
-
-  for (int dy = -2; dy <= 2; dy++) {
-    for (int dx = -2; dx <= 2; dx++) {
-      if (dx == 0 && dy == 0) continue;  // skip center
-
-      float rx = (float)(cx + dx);
-      float ry = (float)(cy + dy);
-      float ref_val = read_imagef(ref_img, samp, (float2)(rx + 0.5f, ry + 0.5f)).x;
-
-      float sx = src_cx + dfdx_x * dx + dfdy_x * dy;
-      float sy = src_cy + dfdx_y * dx + dfdy_y * dy;
-      float src_val = read_imagef(src_img, samp, (float2)(sx + 0.5f, sy + 0.5f)).x;
-
-      if (ref_val > ref_center) ref_census |= (1u << bit);
-      if (src_val > src_center) src_census |= (1u << bit);
-      bit++;
-    }
-  }
-
-  // Hamming distance
-  uint xor_val = ref_census ^ src_census;
-  int hamming = popcount(xor_val);
-
-  // Minimum contrast: if both descriptors have fewer than 3 set bits,
-  // the patches are essentially uniform.  A Hamming distance of 0
-  // between two all-zero descriptors is meaningless — it holds for
-  // *any* depth.  Return worst-case cost to prevent false matches.
-  if (popcount(ref_census) < 3 && popcount(src_census) < 3) return 1.0f;
-
-  // Normalise to [0, 1]:  24 is max Hamming distance for 5x5-1 = 24 bits
-  return (float)hamming / 24.0f;
-})CL"
-R"CL(
-
-// =====================================================================
-// Combined matching cost: (1-w)*NCC_cost + w*Census_cost
-//
-// When NCC fails (returns -1 due to low variance), we fall back entirely
-// to the Census cost, which always works.  This is critical for
-// textureless surfaces like asphalt, painted walls, etc.
-// =====================================================================
-float compute_combined_cost(
-    read_only image2d_t ref_img,
-    read_only image2d_t src_img,
-    __global const Camera *ref_cam,
-    __global const Camera *src_cam,
-    int cx, int cy,
-    PlaneHypothesis plane,
-    int half_patch,
-    float sigma_spatial,
-    float sigma_color,
-    float census_weight
-) {
-  float ncc = compute_ncc(ref_img, src_img, ref_cam, src_cam,
-                          cx, cy, plane, half_patch,
-                          sigma_spatial, sigma_color);
-
-  if (ncc <= -0.5f) {
-    // NCC completely failed (textureless / degenerate): Census only.
-    // Census always produces a valid cost because it compares relative
-    // pixel orderings, not absolute values — even a uniform patch gives
-    // a well-defined (all-zero) descriptor.
-    if (census_weight > 1e-6f) {
-      float census = compute_census_cost(ref_img, src_img, ref_cam, src_cam,
-                                         cx, cy, plane);
-      return census;
-    }
-    return 2.0f;  // Census disabled and NCC failed
-  }
-
-  float ncc_cost = 1.0f - ncc;  // [0, 2], good match → near 0
-
-  if (census_weight < 1e-6f) return ncc_cost;  // Census disabled
-
-  // Adaptive blending: Census contributes only when NCC quality is poor.
-  // On textured surfaces (ncc >= 0.9), Census is skipped entirely,
-  // preserving NCC's sub-pixel precision and avoiding overhead.
-  // On dark/low-texture surfaces (ncc ~= 0.4), Census is fully engaged
-  // at the user-specified census_weight, providing robust discrimination.
-  //
-  // smoothstep(0.1, 0.6, ncc_cost) gives:
-  //   ncc >= 0.9 (ncc_cost <= 0.1) → t = 0 → pure NCC
-  //   ncc ~= 0.4 (ncc_cost ~= 0.6) → t = 1 → full census_weight blend
-  float t = smoothstep(0.1f, 0.6f, ncc_cost);
-  float blend = census_weight * t;
-
-  if (blend < 1e-4f) return ncc_cost;  // fast path: skip Census entirely
-
-  float census = compute_census_cost(ref_img, src_img, ref_cam, src_cam,
-                                     cx, cy, plane);
-  return (1.0f - blend) * ncc_cost + blend * census;
-}
-
-// =====================================================================
-// Multi-scale NCC using pre-computed warp parameters.
-//
-// Takes the already-computed source projection and Jacobian, avoiding
-// redundant depth_from_plane / backproject / project calls.
-// Reduced from 5 to 3 scales — Census handles textureless regions,
-// so intermediate strides (1.5, 2.5) are redundant.
-// =====================================================================
-float compute_ncc_multiscale(
-    read_only image2d_t ref_img,
-    read_only image2d_t src_img,
-    float ref_center,
-    float src_center,
-    float src_cx, float src_cy,
-    int cx, int cy,
-    int half_patch,
-    float dfdx_x, float dfdx_y,
-    float dfdy_x, float dfdy_y,
-    float spatial_factor,
-    float color_factor
-) {
-  float strides[3] = {1.0f, 2.0f, 3.0f};
-  float best_ncc = -1.0f;
-  bool base_textureless = false;
-  for (int s = 0; s < 3; s++) {
-    float ncc = compute_ncc_at_stride(
-        ref_img, src_img, ref_center, src_center,
-        src_cx, src_cy, cx, cy, half_patch, strides[s],
-        dfdx_x, dfdx_y, dfdy_x, dfdy_y,
-        spatial_factor, color_factor);
-    if (s == 0 && ncc < -0.5f) base_textureless = true;
-    if (base_textureless && ncc > 0.0f) ncc = 0.0f;
-    if (ncc > best_ncc) best_ncc = ncc;
-    if (best_ncc > 0.1f) return best_ncc;
-  }
-  return best_ncc;
-})CL"
-R"CL(
+)CL"
+    R"CL(
 
 // =====================================================================
 // Census-transform cost using pre-computed warp parameters.
@@ -528,7 +269,8 @@ R"CL(
 // =====================================================================
 float compute_census_inner(
     read_only image2d_t ref_img,
-    read_only image2d_t src_img,
+    read_only image2d_array_t src_images,
+    int src_layer,
     float ref_center,
     float src_center,
     int cx, int cy,
@@ -554,7 +296,7 @@ float compute_census_inner(
 
       float sx = src_cx + dfdx_x * dx + dfdy_x * dy;
       float sy = src_cy + dfdx_y * dx + dfdy_y * dy;
-      float src_val = read_imagef(src_img, samp, (float2)(sx + 0.5f, sy + 0.5f)).x;
+      float src_val = read_imagef(src_images, samp, (float4)(sx + 0.5f, sy + 0.5f, (float)src_layer, 0.0f)).x;
 
       if (ref_val > ref_center) ref_census |= (1u << bit);
       if (src_val > src_center) src_census |= (1u << bit);
@@ -573,88 +315,68 @@ float compute_census_inner(
 }
 
 // =====================================================================
-// Combined NCC+Census cost for a single source image, using
-// pre-computed reference-side geometry (world points).
+// Precompute the reference-side patch for a pixel: the centre value, the
+// per-sample bilateral weights w / w·r and the moments Σw, Σw·r, Σw·r².
 //
-// This is the core optimisation: the reference camera geometry
-// (depth_from_plane, backproject at center/dx/dy) is computed ONCE
-// in compute_cost_vector and shared across all source images.
-// Each call here only does the source-specific projection (3 project
-// calls) plus NCC/Census — eliminating ~75% of redundant geometry.
+// All of these depend ONLY on the reference image and (x, y), so they are
+// the SAME for every plane hypothesis evaluated at this pixel.  Computing
+// them once here (instead of inside every compute_cost_vector call) removes
+// the redundant reference texture reads and exp() evaluations on the hot
+// path.  The accumulation order is identical to the original fused loop, so
+// the resulting moments are bit-for-bit unchanged.
 // =====================================================================
-float compute_single_cost(
+void compute_ref_patch(
     read_only image2d_t ref_img,
-    read_only image2d_t src_img,
-    __global const Camera *src_cam,
-    float3 center_world,
-    float3 world_dx,
-    float3 world_dy,
-    float ref_center,
-    int cx, int cy,
+    int x, int y,
     int half_patch,
     float spatial_factor,
     float color_factor,
-    float census_weight
+    RefPatch *rp
 ) {
   const sampler_t samp = CLK_NORMALIZED_COORDS_FALSE |
                          CLK_ADDRESS_CLAMP_TO_EDGE |
                          CLK_FILTER_LINEAR;
 
-  // Project to source (only per-source work)
-  float3 src_proj = project(center_world, src_cam);
-  if (src_proj.z < 1e-6f) return 2.0f;
-  float src_cx = src_proj.x / src_proj.z;
-  float src_cy = src_proj.y / src_proj.z;
+  float ref_center = read_imagef(ref_img, samp, (float2)(x + 0.5f, y + 0.5f)).x;
 
-  // Jacobian (source-specific)
-  float3 proj_dx = project(world_dx, src_cam);
-  float3 proj_dy = project(world_dy, src_cam);
-  if (proj_dx.z < 1e-6f || proj_dy.z < 1e-6f) return 2.0f;
-
-  float dfdx_x = proj_dx.x / proj_dx.z - src_cx;
-  float dfdx_y = proj_dx.y / proj_dx.z - src_cy;
-  float dfdy_x = proj_dy.x / proj_dy.z - src_cx;
-  float dfdy_y = proj_dy.y / proj_dy.z - src_cy;
-
-  float src_center = read_imagef(src_img, samp,
-      (float2)(src_cx + 0.5f, src_cy + 0.5f)).x;
-
-  // NCC (multi-scale, using pre-computed warp)
-  float ncc = compute_ncc_multiscale(ref_img, src_img,
-      ref_center, src_center, src_cx, src_cy, cx, cy, half_patch,
-      dfdx_x, dfdx_y, dfdy_x, dfdy_y, spatial_factor, color_factor);
-
-  if (ncc <= -0.5f) {
-    if (census_weight > 1e-6f) {
-      return compute_census_inner(ref_img, src_img, ref_center, src_center,
-          cx, cy, src_cx, src_cy, dfdx_x, dfdx_y, dfdy_x, dfdy_y);
+  float sum_w = 0.0f, sum_wr = 0.0f, sum_wrr = 0.0f;
+  int p = 0;
+  for (int iy = -half_patch; iy <= half_patch; iy++) {
+    float ry = (float)(y + iy);
+    for (int ix = -half_patch; ix <= half_patch; ix++) {
+      float rx = (float)(x + ix);
+      float ref_val = read_imagef(ref_img, samp, (float2)(rx + 0.5f, ry + 0.5f)).x;
+      float r = ref_val - ref_center;
+      float w = exp(spatial_factor * (float)(ix*ix + iy*iy)
+                  + color_factor * r * r);
+      sum_w += w;
+      float wr = w * r;
+      sum_wr += wr;
+      sum_wrr += wr * r;
+      rp->w[p]  = w;
+      rp->wr[p] = wr;
+      p++;
     }
-    return 2.0f;
   }
 
-  float ncc_cost = 1.0f - ncc;
-  if (census_weight < 1e-6f) return ncc_cost;
-
-  float t = smoothstep(0.1f, 0.6f, ncc_cost);
-  float blend = census_weight * t;
-  if (blend < 1e-4f) return ncc_cost;
-
-  float census = compute_census_inner(ref_img, src_img, ref_center, src_center,
-      cx, cy, src_cx, src_cy, dfdx_x, dfdx_y, dfdy_x, dfdy_y);
-  return (1.0f - blend) * ncc_cost + blend * census;
+  rp->ref_center = ref_center;
+  rp->sum_w   = sum_w;
+  rp->sum_wr  = sum_wr;
+  rp->sum_wrr = sum_wrr;
 }
 
 // =====================================================================
 // Compute per-view cost vector: one cost per source image.
 // Returns the number of valid costs written.
 //
-// OPTIMISED: reference-side geometry (depth_from_plane, backproject)
-// is computed ONCE and shared across all source images, eliminating
-// redundant geometry calls per plane hypothesis evaluation.
+// FUSED OPTIMIZATION: The bilateral weight exp(spatial + color)
+// depends ONLY on the reference image.  By fusing all source views
+// into a single pass over the reference patch (at stride=1), we
+// compute the expensive exp() ONCE per sample instead of N times.
+// This eliminates ~7/8 of all exp() calls in the common path.
 //
-// OpenCL 1.2 does not allow dynamic indexing of image2d_t parameters,
-// so all MAX_SOURCES source images are passed individually and
-// dispatched via a switch statement.
+// For sources that need larger strides (textureless regions), the
+// code falls back to per-source compute_ncc_at_stride individually.
 // =====================================================================
 int compute_cost_vector(
     read_only image2d_t ref_img,
@@ -666,25 +388,14 @@ int compute_cost_vector(
     float sigma_spatial,
     float sigma_color,
     float census_weight,
+    const RefPatch *rp,
     float *out_costs,
-    read_only image2d_t src_img0,
-    read_only image2d_t src_img1,
-    read_only image2d_t src_img2,
-    read_only image2d_t src_img3,
-    read_only image2d_t src_img4,
-    read_only image2d_t src_img5,
-    read_only image2d_t src_img6,
-    read_only image2d_t src_img7,
-    read_only image2d_t src_img8,
-    read_only image2d_t src_img9,
-    read_only image2d_t src_img10,
-    read_only image2d_t src_img11,
-    read_only image2d_t src_img12,
-    read_only image2d_t src_img13,
-    read_only image2d_t src_img14,
-    read_only image2d_t src_img15
+    read_only image2d_array_t src_images
 ) {
   int n_src = min(num_images - 1, MAX_SOURCES);
+  const sampler_t samp = CLK_NORMALIZED_COORDS_FALSE |
+                         CLK_ADDRESS_CLAMP_TO_EDGE |
+                         CLK_FILTER_LINEAR;
 
   // ---- Reference geometry: computed ONCE for all source images ----
   float depth = depth_from_plane((float)x, (float)y, plane, &cameras[0]);
@@ -704,45 +415,147 @@ int compute_cost_vector(
   float3 world_dx = backproject((float)(x+1), (float)y, depth_dx, &cameras[0]);
   float3 world_dy = backproject((float)x, (float)(y+1), depth_dy, &cameras[0]);
 
-  const sampler_t samp = CLK_NORMALIZED_COORDS_FALSE |
-                         CLK_ADDRESS_CLAMP_TO_EDGE |
-                         CLK_FILTER_LINEAR;
-  float ref_center = read_imagef(ref_img, samp, (float2)(x + 0.5f, y + 0.5f)).x;
+  // Reference centre + bilateral weights were precomputed once for this
+  // pixel (identical for every hypothesis) — reuse the cached patch.
+  float ref_center = rp->ref_center;
 
   float spatial_factor = -1.0f / (2.0f * sigma_spatial * sigma_spatial);
   float color_factor = -1.0f / (2.0f * sigma_color * sigma_color);
 
-  // ---- Per-source cost: dispatch via switch (OpenCL can't index image2d_t) ----
-  // Macro to avoid repeating the compute_single_cost call for each case.
-  #define COST_CASE(I, IMG) \
-    case I: out_costs[I] = compute_single_cost(ref_img, IMG, &cameras[I+1], \
-        center_world, world_dx, world_dy, ref_center, \
-        x, y, half_patch, spatial_factor, color_factor, census_weight); break;
+  // ---- Pre-project all sources: store Jacobians and center values ----
+  float src_cxs[MAX_SOURCES], src_cys[MAX_SOURCES];
+  float jdx_x[MAX_SOURCES], jdx_y[MAX_SOURCES];
+  float jdy_x[MAX_SOURCES], jdy_y[MAX_SOURCES];
+  float src_centers[MAX_SOURCES];
+  int src_valid[MAX_SOURCES];
 
   for (int i = 0; i < n_src; i++) {
-    switch (i) {
-      COST_CASE( 0, src_img0)
-      COST_CASE( 1, src_img1)
-      COST_CASE( 2, src_img2)
-      COST_CASE( 3, src_img3)
-      COST_CASE( 4, src_img4)
-      COST_CASE( 5, src_img5)
-      COST_CASE( 6, src_img6)
-      COST_CASE( 7, src_img7)
-      COST_CASE( 8, src_img8)
-      COST_CASE( 9, src_img9)
-      COST_CASE(10, src_img10)
-      COST_CASE(11, src_img11)
-      COST_CASE(12, src_img12)
-      COST_CASE(13, src_img13)
-      COST_CASE(14, src_img14)
-      COST_CASE(15, src_img15)
+    float3 src_proj = project(center_world, &cameras[i+1]);
+    if (src_proj.z < 1e-6f) { src_valid[i] = 0; out_costs[i] = 2.0f; continue; }
+    src_cxs[i] = src_proj.x / src_proj.z;
+    src_cys[i] = src_proj.y / src_proj.z;
+
+    float3 proj_dx = project(world_dx, &cameras[i+1]);
+    float3 proj_dy = project(world_dy, &cameras[i+1]);
+    if (proj_dx.z < 1e-6f || proj_dy.z < 1e-6f) {
+      src_valid[i] = 0; out_costs[i] = 2.0f; continue;
+    }
+
+    jdx_x[i] = proj_dx.x / proj_dx.z - src_cxs[i];
+    jdx_y[i] = proj_dx.y / proj_dx.z - src_cys[i];
+    jdy_x[i] = proj_dy.x / proj_dy.z - src_cxs[i];
+    jdy_y[i] = proj_dy.y / proj_dy.z - src_cys[i];
+
+    // Reject degenerate warps via Jacobian determinant (patch area ratio).
+    // det ≈ 0: patch collapses to a line (badly-oriented normal) → samples
+    //          near-identical pixels → artificially high NCC.
+    // det >> 1: patch explodes → correlates unrelated content.
+    float det = jdx_x[i] * jdy_y[i] - jdx_y[i] * jdy_x[i];
+    if (det < 0.02f || det > 50.0f) {
+      src_valid[i] = 0; out_costs[i] = 2.0f; continue;
+    }
+
+    src_centers[i] = read_imagef(src_images, samp,
+        (float4)(src_cxs[i] + 0.5f, src_cys[i] + 0.5f, (float)i, 0.0f)).x;
+    src_valid[i] = 1;
+  }
+
+  // ---- FUSED NCC at stride=1: reference weights come from the cache ----
+  // Per-source accumulators:
+  float sum_ws[MAX_SOURCES], sum_wss[MAX_SOURCES], sum_wrs[MAX_SOURCES];
+  for (int i = 0; i < MAX_SOURCES; i++) {
+    sum_ws[i] = 0.0f; sum_wss[i] = 0.0f; sum_wrs[i] = 0.0f;
+  }
+
+  int p = 0;  // running index into the cached reference patch (iy then ix)
+  for (int iy = -half_patch; iy <= half_patch; iy++) {
+    // Hoist row-constant source base coordinates out of inner loop.
+    float base_sx[MAX_SOURCES], base_sy[MAX_SOURCES];
+    for (int s = 0; s < n_src; s++) {
+      if (!src_valid[s]) continue;
+      base_sx[s] = src_cxs[s] + jdy_x[s] * (float)iy;
+      base_sy[s] = src_cys[s] + jdy_y[s] * (float)iy;
+    }
+
+    for (int ix = -half_patch; ix <= half_patch; ix++) {
+      // --- Reference weight + w·r: precomputed once for all hypotheses ---
+      float w  = rp->w[p];
+      float wr = rp->wr[p];
+      p++;
+
+      // --- All valid sources: only source-specific work here ---
+      for (int s = 0; s < n_src; s++) {
+        if (!src_valid[s]) continue;
+        float sx = base_sx[s] + jdx_x[s] * (float)ix;
+        float sy = base_sy[s] + jdx_y[s] * (float)ix;
+        float src_val = read_imagef(src_images, samp,
+            (float4)(sx + 0.5f, sy + 0.5f, (float)s, 0.0f)).x;
+        float sv = src_val - src_centers[s];
+        sum_ws[s] += w * sv;
+        sum_wss[s] += w * sv * sv;
+        sum_wrs[s] += wr * sv;
+      }
     }
   }
-  #undef COST_CASE
+
+  // ---- Compute NCC from accumulated stats; fallback for poor matches ----
+  if (rp->sum_w < 1e-6f) {
+    for (int i = 0; i < n_src; i++) out_costs[i] = 2.0f;
+    return n_src;
+  }
+
+  float inv_w = 1.0f / rp->sum_w;
+  float mean_r = rp->sum_wr * inv_w;
+  float var_ref = rp->sum_wrr * inv_w - mean_r * mean_r;
+
+  for (int s = 0; s < n_src; s++) {
+    if (!src_valid[s]) continue;
+
+    float ncc_s1 = -1.0f;  // stride=1 NCC result
+
+    if (var_ref >= 1.5e-6f) {
+      float mean_s = sum_ws[s] * inv_w;
+      float var_src = sum_wss[s] * inv_w - mean_s * mean_s;
+      if (var_src >= 1.5e-6f) {
+        float covar = sum_wrs[s] * inv_w - mean_r * mean_s;
+        ncc_s1 = covar / sqrt(var_ref * var_src);
+      }
+    }
+
+    // Fast path: good match at stride=1 (majority of cases)
+    if (ncc_s1 > 0.1f) {
+      out_costs[s] = 1.0f - ncc_s1;
+      continue;
+    }
+
+    // Slow path: try larger strides individually (rare: textureless)
+    float best_ncc = ncc_s1;
+    float strides_fallback[2] = {2.0f, 3.0f};
+    for (int st = 0; st < 2; st++) {
+      float ncc = compute_ncc_at_stride(ref_img, src_images, s,
+          ref_center, src_centers[s], src_cxs[s], src_cys[s],
+          x, y, half_patch, strides_fallback[st],
+          jdx_x[s], jdx_y[s], jdy_x[s], jdy_y[s],
+          spatial_factor, color_factor);
+      if (ncc > best_ncc) best_ncc = ncc;
+      if (best_ncc > 0.1f) break;
+    }
+
+    if (best_ncc <= -0.5f) {
+      out_costs[s] = (census_weight > 1e-6f)
+          ? compute_census_inner(ref_img, src_images, s,
+                ref_center, src_centers[s], x, y,
+                src_cxs[s], src_cys[s],
+                jdx_x[s], jdx_y[s], jdy_x[s], jdy_y[s])
+          : 2.0f;
+    } else {
+      out_costs[s] = 1.0f - best_ncc;
+    }
+  }
+
   return n_src;
 })CL"
-R"CL(
+    R"CL(
 
 // =====================================================================
 // Compute initial multi-view cost and selected views bitmask.
@@ -760,23 +573,9 @@ float compute_initial_cost_and_views(
     float sigma_color,
     int top_k,
     float census_weight,
+    const RefPatch *rp,
     uint *out_selected,
-    read_only image2d_t src_img0,
-    read_only image2d_t src_img1,
-    read_only image2d_t src_img2,
-    read_only image2d_t src_img3,
-    read_only image2d_t src_img4,
-    read_only image2d_t src_img5,
-    read_only image2d_t src_img6,
-    read_only image2d_t src_img7,
-    read_only image2d_t src_img8,
-    read_only image2d_t src_img9,
-    read_only image2d_t src_img10,
-    read_only image2d_t src_img11,
-    read_only image2d_t src_img12,
-    read_only image2d_t src_img13,
-    read_only image2d_t src_img14,
-    read_only image2d_t src_img15
+    read_only image2d_array_t src_images
 ) {
   float cost_vector[MAX_SOURCES];
   float cost_copy[MAX_SOURCES];
@@ -788,11 +587,7 @@ float compute_initial_cost_and_views(
 
   compute_cost_vector(ref_img, cameras, num_images, x, y, plane,
                       half_patch, sigma_spatial, sigma_color, census_weight,
-                      cost_vector,
-                      src_img0, src_img1, src_img2, src_img3,
-                      src_img4, src_img5, src_img6, src_img7,
-                      src_img8, src_img9, src_img10, src_img11,
-                      src_img12, src_img13, src_img14, src_img15);
+                      rp, cost_vector, src_images);
 
   int num_valid = 0;
   for (int i = 0; i < n_src; i++) {
@@ -852,7 +647,7 @@ void pdf_to_cdf(float *probs, int n) {
 // Returns a cost in [0, 1] where 0 = perfectly smooth.
 // =====================================================================
 float compute_smoothness_cost(
-    __global const PlaneHypothesis *planes,
+    read_only image2d_t planes_img,
     __global const Camera *cam,
     PlaneHypothesis cur_plane,
     int x, int y, int width, int height
@@ -880,8 +675,7 @@ float compute_smoothness_cost(
     int ny = y + dy[k];
     if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
 
-    int nidx = ny * width + nx;
-    PlaneHypothesis nb = planes[nidx];
+    PlaneHypothesis nb = read_imagef(planes_img, samp_planes, (int2)(nx, ny));
     float nb_depth = depth_from_plane((float)nx, (float)ny, nb, cam);
     if (nb_depth <= 0.0f) continue;
 
@@ -910,6 +704,71 @@ float compute_smoothness_cost(
 
   if (total_weight < 1e-6f) return 0.0f;
   return total_cost / total_weight;
+}
+
+// =====================================================================
+// Compute surface normal from the depth gradient of 4-connected neighbors.
+//
+// from how depth changes spatially across neighboring pixels.  This
+// acts as an implicit geometric regularizer — biasing normals toward
+// being consistent with the local depth surface — without any explicit
+// smoothness term.
+//
+// The normal is computed as:
+//   dx = depth[x+1] - depth[x-1]   (central difference)
+//   dy = depth[y+1] - depth[y-1]
+//   n  = normalize(fx*dx, fy*dy, (cx-x)*dx + (cy-y)*dy - depth)
+//
+// Returns (0,0,0) if the normal cannot be computed (border pixels
+// or neighbors with invalid depths).
+// =====================================================================
+float3 compute_surface_normal(
+    read_only image2d_t planes_img,
+    __global const Camera *cam,
+    int x, int y, int width, int height,
+    float center_depth
+) {
+  if (center_depth <= 0.0f) return (float3)(0.0f, 0.0f, 0.0f);
+  if (x < 1 || x >= width - 1 || y < 1 || y >= height - 1)
+    return (float3)(0.0f, 0.0f, 0.0f);
+
+  float fx = cam->K[0];
+  float fy = cam->K[4];
+  float cx = cam->K[2];
+  float cy = cam->K[5];
+
+  // Read 4-connected neighbor depths via texture cache.
+  // These are opposite-color pixels in the checkerboard, so they
+  // were written in the previous half-iteration — safe to read.
+  PlaneHypothesis pl_l = read_imagef(planes_img, samp_planes, (int2)(x - 1, y));
+  PlaneHypothesis pl_r = read_imagef(planes_img, samp_planes, (int2)(x + 1, y));
+  PlaneHypothesis pl_u = read_imagef(planes_img, samp_planes, (int2)(x, y - 1));
+  PlaneHypothesis pl_d = read_imagef(planes_img, samp_planes, (int2)(x, y + 1));
+
+  float d_l = depth_from_plane((float)(x - 1), (float)y, pl_l, cam);
+  float d_r = depth_from_plane((float)(x + 1), (float)y, pl_r, cam);
+  float d_u = depth_from_plane((float)x, (float)(y - 1), pl_u, cam);
+  float d_d = depth_from_plane((float)x, (float)(y + 1), pl_d, cam);
+
+  if (d_l <= 0.0f || d_r <= 0.0f || d_u <= 0.0f || d_d <= 0.0f)
+    return (float3)(0.0f, 0.0f, 0.0f);
+
+  float dx = d_r - d_l;
+  float dy = d_d - d_u;
+
+  float3 n;
+  n.x = fx * dx;
+  n.y = fy * dy;
+  n.z = (cx - (float)x) * dx + (cy - (float)y) * dy - center_depth;
+
+  float len = length(n);
+  if (len < 1e-8f) return (float3)(0.0f, 0.0f, 0.0f);
+  n = n / len;
+
+  // Ensure normal faces camera (z < 0 in camera space)
+  if (n.z > 0.0f) n = -n;
+
+  return n;
 }
 
 // =====================================================================
@@ -951,59 +810,54 @@ float compute_geom_consistency_cost(
     int src_idx,
     int pd_width, int pd_height
 ) {
-  const float max_cost = 5.0f;
+  const float bad_cost = 1.0f;
+
+  // Normalize geometric error by image scale.
+  float max_dim = (float)max(pd_width, pd_height);
+  if (max_dim < 1.0f) return bad_cost;
+  float good_thresh = 3.0f / max_dim;
+  float full_thresh = 6.0f / max_dim;
 
   // 1. Depth from plane at reference pixel
   float depth = depth_from_plane((float)px, (float)py, plane, ref_cam);
-  if (depth <= 0.0f) return max_cost;
+  if (depth <= 0.0f) return bad_cost;
 
   // 2. Backproject to world
   float3 world_pt = backproject((float)px, (float)py, depth, ref_cam);
 
   // 3. Project to source camera
   float3 src_proj = project(world_pt, src_cam);
-  if (src_proj.z < 1e-6f) return max_cost;
+  if (src_proj.z < 1e-6f) return bad_cost;
   float src_x = src_proj.x / src_proj.z;
   float src_y = src_proj.y / src_proj.z;
 
   // Bounds check
   if (src_x < 0.0f || src_x >= (float)pd_width ||
       src_y < 0.0f || src_y >= (float)pd_height)
-    return max_cost;
+    return bad_cost;
 
   // 4. Look up previous depth at source pixel
   float src_depth = sample_prev_depth(prev_depths, src_idx,
                                       src_x, src_y, pd_width, pd_height);
-  if (src_depth <= 0.0f) return max_cost;
+  if (src_depth <= 0.0f) return bad_cost;
 
   // 5. Backproject source pixel with previous depth to world
   float3 src_world = backproject(src_x, src_y, src_depth, src_cam);
 
   // 6. Re-project to reference camera
   float3 ref_proj = project(src_world, ref_cam);
-  if (ref_proj.z < 1e-6f) return max_cost;
+  if (ref_proj.z < 1e-6f) return bad_cost;
   float back_x = ref_proj.x / ref_proj.z;
   float back_y = ref_proj.y / ref_proj.z;
 
-  // 7. 2D reprojection error
+  // 7. 2D reprojection error mapped to [0, 1]:
+  //    0 for [0, 3] px, linear ramp to 1 at 6 px.
   float dx = (float)px - back_x;
   float dy = (float)py - back_y;
-  return min(max_cost, sqrt(dx * dx + dy * dy));
-}
-
-// =====================================================================
-// Compute view-weighted aggregate cost from a per-view cost vector.
-// =====================================================================
-float compute_weighted_cost(const float *cost_vec, const float *view_weights,
-                            float weight_norm, int n_src) {
-  if (weight_norm < 1e-6f) return 2.0f;
-  float total = 0.0f;
-  for (int i = 0; i < n_src; i++) {
-    if (view_weights[i] > 0.0f) {
-      total += view_weights[i] * cost_vec[i];
-    }
-  }
-  return total / weight_norm;
+  float reproj_err = sqrt(dx * dx + dy * dy) / max_dim;
+  if (reproj_err <= good_thresh) return 0.0f;
+  if (reproj_err >= full_thresh) return 1.0f;
+  return (reproj_err - good_thresh) / (full_thresh - good_thresh);
 }
 
 // =====================================================================
@@ -1043,8 +897,78 @@ float compute_weighted_cost_geom(
     }
   }
   return total / weight_norm;
-})CL"
-R"CL(
+}
+
+// =====================================================================
+// Monte Carlo importance-sampled cost (COLMAP-inspired).
+//
+// Instead of a deterministic weighted sum, builds a CDF from
+// view_weights and draws num_samples random views.  This ensures no
+// view is ever permanently excluded — even low-weight views have a
+// chance of being sampled, breaking conspiracy feedback loops.
+// =====================================================================
+#define MC_NUM_SAMPLES 32
+
+float compute_mc_cost(
+    const float *cost_vec,
+    const float *view_weights,
+    float weight_norm,
+    int n_src,
+    __global const Camera *cameras,
+    PlaneHypothesis plane,
+    int x, int y,
+    __global const float *prev_depths,
+    uint prev_depth_mask,
+    int pd_width, int pd_height,
+    float geom_weight,
+    uint2 *rng_state,
+    uint rng_key
+) {
+  if (weight_norm < 1e-6f) return 2.0f;
+
+  // Build CDF from view_weights.
+  float cdf[MAX_SOURCES];
+  float cum = 0.0f;
+  for (int i = 0; i < n_src; i++) {
+    cum += view_weights[i];
+    cdf[i] = cum;
+  }
+  // cum == weight_norm at this point.
+  float inv_norm = 1.0f / cum;
+
+  // Draw MC_NUM_SAMPLES random views and accumulate cost.
+  float total = 0.0f;
+  int valid_samples = 0;
+  for (int s = 0; s < MC_NUM_SAMPLES; s++) {
+    float u = rand_float(rng_state, rng_key + (uint)s * 7919u);
+    float threshold = u * cum;
+
+    // Find view from CDF (linear scan — MAX_SOURCES is small).
+    int sampled_view = n_src - 1;
+    for (int i = 0; i < n_src; i++) {
+      if (cdf[i] > threshold) {
+        sampled_view = i;
+        break;
+      }
+    }
+
+    // Compute cost for sampled view.
+    float photo = cost_vec[sampled_view];
+    float geom = 0.0f;
+    if (geom_weight > 0.0f && (prev_depth_mask & (1u << sampled_view))) {
+      geom = compute_geom_consistency_cost(
+          &cameras[0], &cameras[sampled_view + 1],
+          plane, x, y,
+          prev_depths, sampled_view, pd_width, pd_height);
+    }
+    total += photo + geom_weight * geom;
+    valid_samples++;
+  }
+
+  return (valid_samples > 0) ? (total / (float)valid_samples) : 2.0f;
+}
+)CL"
+    R"CL(
 
 // =====================================================================
 // Kernel: Random initialisation of plane hypotheses.
@@ -1059,22 +983,7 @@ __kernel void acmmp_random_init(
     __global uint *selected_views,
     __global const Camera *cameras,
     read_only image2d_t ref_img,
-    read_only image2d_t src_img0,
-    read_only image2d_t src_img1,
-    read_only image2d_t src_img2,
-    read_only image2d_t src_img3,
-    read_only image2d_t src_img4,
-    read_only image2d_t src_img5,
-    read_only image2d_t src_img6,
-    read_only image2d_t src_img7,
-    read_only image2d_t src_img8,
-    read_only image2d_t src_img9,
-    read_only image2d_t src_img10,
-    read_only image2d_t src_img11,
-    read_only image2d_t src_img12,
-    read_only image2d_t src_img13,
-    read_only image2d_t src_img14,
-    read_only image2d_t src_img15,
+    read_only image2d_array_t src_images,
     int width, int height,
     float depth_min, float depth_max,
     int num_images,
@@ -1113,16 +1022,19 @@ __kernel void acmmp_random_init(
   planes[idx] = plane;
   rand_states[idx] = state;
 
+  // Precompute the reference patch once for this pixel (shared by every
+  // hypothesis the cost function evaluates).
+  float spatial_factor = -1.0f / (2.0f * sigma_spatial * sigma_spatial);
+  float color_factor = -1.0f / (2.0f * sigma_color * sigma_color);
+  RefPatch rp;
+  compute_ref_patch(ref_img, x, y, half_patch, spatial_factor, color_factor, &rp);
+
   // Compute initial cost and selected views
   uint sel = 0u;
   costs[idx] = compute_initial_cost_and_views(
       ref_img, cameras, num_images,
       x, y, plane, half_patch, sigma_spatial, sigma_color, top_k,
-      census_weight, &sel,
-      src_img0, src_img1, src_img2, src_img3,
-      src_img4, src_img5, src_img6, src_img7,
-      src_img8, src_img9, src_img10, src_img11,
-      src_img12, src_img13, src_img14, src_img15);
+      census_weight, &rp, &sel, src_images);
   selected_views[idx] = sel;
 }
 
@@ -1144,26 +1056,13 @@ __kernel void acmmp_random_init(
 __kernel void acmmp_prior_reinit(
     __global PlaneHypothesis *planes,
     __global float *costs,
+    read_only image2d_t planes_img,
+    read_only image2d_t costs_img,
     __global uint2 *rand_states,
     __global uint *selected_views,
     __global const Camera *cameras,
     read_only image2d_t ref_img,
-    read_only image2d_t src_img0,
-    read_only image2d_t src_img1,
-    read_only image2d_t src_img2,
-    read_only image2d_t src_img3,
-    read_only image2d_t src_img4,
-    read_only image2d_t src_img5,
-    read_only image2d_t src_img6,
-    read_only image2d_t src_img7,
-    read_only image2d_t src_img8,
-    read_only image2d_t src_img9,
-    read_only image2d_t src_img10,
-    read_only image2d_t src_img11,
-    read_only image2d_t src_img12,
-    read_only image2d_t src_img13,
-    read_only image2d_t src_img14,
-    read_only image2d_t src_img15,
+    read_only image2d_array_t src_images,
     int width, int height,
     float depth_min, float depth_max,
     int num_images,
@@ -1225,6 +1124,13 @@ __kernel void acmmp_prior_reinit(
     }
   }
 
+  // Precompute the reference patch once for this pixel (shared by both the
+  // bootstrap path and the weighted-cost path below).
+  float spatial_factor = -1.0f / (2.0f * sigma_spatial * sigma_spatial);
+  float color_factor = -1.0f / (2.0f * sigma_color * sigma_color);
+  RefPatch rp;
+  compute_ref_patch(ref_img, x, y, half_patch, spatial_factor, color_factor, &rp);
+
   // If no views are selected yet (e.g. first iteration), fall back to
   // compute_initial_cost_and_views to bootstrap.
   if (weight_norm < 1e-6f) {
@@ -1232,14 +1138,10 @@ __kernel void acmmp_prior_reinit(
     float cost = compute_initial_cost_and_views(
         ref_img, cameras, num_images,
         x, y, plane, half_patch, sigma_spatial, sigma_color, top_k,
-        census_weight, &sel,
-        src_img0, src_img1, src_img2, src_img3,
-        src_img4, src_img5, src_img6, src_img7,
-        src_img8, src_img9, src_img10, src_img11,
-        src_img12, src_img13, src_img14, src_img15);
+        census_weight, &rp, &sel, src_images);
 
     if (smooth_weight > 1e-6f) {
-      cost += smooth_weight * compute_smoothness_cost(planes, &cameras[0],
+      cost += smooth_weight * compute_smoothness_cost(planes_img, &cameras[0],
           plane, x, y, width, height);
     }
 
@@ -1257,18 +1159,15 @@ __kernel void acmmp_prior_reinit(
   for (int i = 0; i < MAX_SOURCES; i++) cost_vec[i] = 2.0f;
   compute_cost_vector(ref_img, cameras, num_images, x, y, plane,
       half_patch, sigma_spatial, sigma_color, census_weight,
-      cost_vec,
-      src_img0, src_img1, src_img2, src_img3,
-      src_img4, src_img5, src_img6, src_img7,
-      src_img8, src_img9, src_img10, src_img11,
-      src_img12, src_img13, src_img14, src_img15);
+      &rp, cost_vec,
+      src_images);
 
   float cost = compute_weighted_cost_geom(cost_vec, view_weights, weight_norm,
       n_src, cameras, plane, x, y,
       prev_depths, prev_depth_mask, width, height, geom_weight);
 
   if (smooth_weight > 1e-6f) {
-    cost += smooth_weight * compute_smoothness_cost(planes, &cameras[0],
+    cost += smooth_weight * compute_smoothness_cost(planes_img, &cameras[0],
         plane, x, y, width, height);
   }
 
@@ -1298,26 +1197,13 @@ __kernel void acmmp_prior_reinit(
 __kernel void acmmp_patchmatch(
     __global PlaneHypothesis *planes,
     __global float *costs,
+    read_only image2d_t planes_img,
+    read_only image2d_t costs_img,
     __global uint2 *rand_states,
     __global uint *selected_views,
     __global const Camera *cameras,
     read_only image2d_t ref_img,
-    read_only image2d_t src_img0,
-    read_only image2d_t src_img1,
-    read_only image2d_t src_img2,
-    read_only image2d_t src_img3,
-    read_only image2d_t src_img4,
-    read_only image2d_t src_img5,
-    read_only image2d_t src_img6,
-    read_only image2d_t src_img7,
-    read_only image2d_t src_img8,
-    read_only image2d_t src_img9,
-    read_only image2d_t src_img10,
-    read_only image2d_t src_img11,
-    read_only image2d_t src_img12,
-    read_only image2d_t src_img13,
-    read_only image2d_t src_img14,
-    read_only image2d_t src_img15,
+    read_only image2d_array_t src_images,
     int width, int height,
     float depth_min, float depth_max,
     int num_images,
@@ -1333,18 +1219,34 @@ __kernel void acmmp_patchmatch(
     uint prev_depth_mask,
     float geom_weight,
     __global const PlaneHypothesis *prior_planes,
-    __global const uint *plane_masks
+    __global const uint *plane_masks,
+    int anchor_views,
+    __global const float *angle_weights
 ) {
-  int x = get_global_id(0);
-  int y = get_global_id(1);
-  if (x >= width || y >= height) return;
-  if (((x + y) & 1) != color_flag) return;
+  // Dense checkerboard indexing: grid is (half_width x height), reconstruct
+  // true pixel coordinates so all SIMD lanes are active on Apple Silicon.
+  int gid_x = get_global_id(0);
+  int gid_y = get_global_id(1);
+  int half_width = (width + 1) / 2;
+  if (gid_x >= half_width || gid_y >= height) return;
+  int x = gid_x * 2 + ((gid_y + color_flag) % 2);
+  int y = gid_y;
+  if (x >= width) return;
 
   int idx = y * width + x;
   uint2 state = rand_states[idx];
   uint key = (uint)(idx + iteration * 7919 + 42);
   int n_src = min(num_images - 1, MAX_SOURCES);
   int npix = width * height;
+
+  // Precompute the reference patch ONCE for this pixel.  Every
+  // compute_cost_vector call below (8 spatial candidates + current pixel +
+  // up to 6 refinement hypotheses) reuses it, so the reference texture
+  // reads and exp() weights are no longer recomputed per hypothesis.
+  float spatial_factor = -1.0f / (2.0f * sigma_spatial * sigma_spatial);
+  float color_factor = -1.0f / (2.0f * sigma_color * sigma_color);
+  RefPatch rp;
+  compute_ref_patch(ref_img, x, y, half_patch, spatial_factor, color_factor, &rp);
 
   // =================================================================
   // Step 1: Identify 8 candidate neighbor positions (adaptive search)
@@ -1359,281 +1261,330 @@ __kernel void acmmp_patchmatch(
 
   // --- Far up (start at y-3, search every 2 rows up to 23 rows) ---
   if (y > 2) {
-    int base = (y - 3) * width + x;
-    float best_c = costs[base]; int best_p = base;
+    int best_py = y - 3;
+    float best_c = read_imagef(costs_img, samp_planes, (int2)(x, best_py)).x;
     for (int i = 1; i < 11; i++) {
       int yy = y - 3 - 2 * i;
       if (yy < 0) break;
-      int pp = yy * width + x;
-      if (costs[pp] < best_c) { best_c = costs[pp]; best_p = pp; }
+      float c = read_imagef(costs_img, samp_planes, (int2)(x, yy)).x;
+      if (c < best_c) { best_c = c; best_py = yy; }
     }
-    positions[1] = best_p; flags[1] = true;
+    positions[1] = best_py * width + x; flags[1] = true;
+    PlaneHypothesis best_plane = read_imagef(planes_img, samp_planes, (int2)(x, best_py));
     compute_cost_vector(ref_img, cameras, num_images, x, y,
-        planes[best_p], half_patch, sigma_spatial, sigma_color, census_weight,
-        &cost_array[1 * MAX_SOURCES],
-        src_img0, src_img1, src_img2, src_img3,
-        src_img4, src_img5, src_img6, src_img7,
-        src_img8, src_img9, src_img10, src_img11,
-        src_img12, src_img13, src_img14, src_img15);
+        best_plane, half_patch, sigma_spatial, sigma_color, census_weight,
+        &rp, &cost_array[1 * MAX_SOURCES],
+        src_images);
   }
 
   // --- Far down ---
   if (y < height - 3) {
-    int base = (y + 3) * width + x;
-    float best_c = costs[base]; int best_p = base;
+    int best_py = y + 3;
+    float best_c = read_imagef(costs_img, samp_planes, (int2)(x, best_py)).x;
     for (int i = 1; i < 11; i++) {
       int yy = y + 3 + 2 * i;
       if (yy >= height) break;
-      int pp = yy * width + x;
-      if (costs[pp] < best_c) { best_c = costs[pp]; best_p = pp; }
+      float c = read_imagef(costs_img, samp_planes, (int2)(x, yy)).x;
+      if (c < best_c) { best_c = c; best_py = yy; }
     }
-    positions[3] = best_p; flags[3] = true;
+    positions[3] = best_py * width + x; flags[3] = true;
+    PlaneHypothesis best_plane = read_imagef(planes_img, samp_planes, (int2)(x, best_py));
     compute_cost_vector(ref_img, cameras, num_images, x, y,
-        planes[best_p], half_patch, sigma_spatial, sigma_color, census_weight,
-        &cost_array[3 * MAX_SOURCES],
-        src_img0, src_img1, src_img2, src_img3,
-        src_img4, src_img5, src_img6, src_img7,
-        src_img8, src_img9, src_img10, src_img11,
-        src_img12, src_img13, src_img14, src_img15);
+        best_plane, half_patch, sigma_spatial, sigma_color, census_weight,
+        &rp, &cost_array[3 * MAX_SOURCES],
+        src_images);
   }
 
   // --- Far left ---
   if (x > 2) {
-    int base = y * width + (x - 3);
-    float best_c = costs[base]; int best_p = base;
+    int best_px = x - 3;
+    float best_c = read_imagef(costs_img, samp_planes, (int2)(best_px, y)).x;
     for (int i = 1; i < 11; i++) {
       int xx = x - 3 - 2 * i;
       if (xx < 0) break;
-      int pp = y * width + xx;
-      if (costs[pp] < best_c) { best_c = costs[pp]; best_p = pp; }
+      float c = read_imagef(costs_img, samp_planes, (int2)(xx, y)).x;
+      if (c < best_c) { best_c = c; best_px = xx; }
     }
-    positions[5] = best_p; flags[5] = true;
+    positions[5] = y * width + best_px; flags[5] = true;
+    PlaneHypothesis best_plane = read_imagef(planes_img, samp_planes, (int2)(best_px, y));
     compute_cost_vector(ref_img, cameras, num_images, x, y,
-        planes[best_p], half_patch, sigma_spatial, sigma_color, census_weight,
-        &cost_array[5 * MAX_SOURCES],
-        src_img0, src_img1, src_img2, src_img3,
-        src_img4, src_img5, src_img6, src_img7,
-        src_img8, src_img9, src_img10, src_img11,
-        src_img12, src_img13, src_img14, src_img15);
+        best_plane, half_patch, sigma_spatial, sigma_color, census_weight,
+        &rp, &cost_array[5 * MAX_SOURCES],
+        src_images);
   }
 
   // --- Far right ---
   if (x < width - 3) {
-    int base = y * width + (x + 3);
-    float best_c = costs[base]; int best_p = base;
+    int best_px = x + 3;
+    float best_c = read_imagef(costs_img, samp_planes, (int2)(best_px, y)).x;
     for (int i = 1; i < 11; i++) {
       int xx = x + 3 + 2 * i;
       if (xx >= width) break;
-      int pp = y * width + xx;
-      if (costs[pp] < best_c) { best_c = costs[pp]; best_p = pp; }
+      float c = read_imagef(costs_img, samp_planes, (int2)(xx, y)).x;
+      if (c < best_c) { best_c = c; best_px = xx; }
     }
-    positions[7] = best_p; flags[7] = true;
+    positions[7] = y * width + best_px; flags[7] = true;
+    PlaneHypothesis best_plane = read_imagef(planes_img, samp_planes, (int2)(best_px, y));
     compute_cost_vector(ref_img, cameras, num_images, x, y,
-        planes[best_p], half_patch, sigma_spatial, sigma_color, census_weight,
-        &cost_array[7 * MAX_SOURCES],
-        src_img0, src_img1, src_img2, src_img3,
-        src_img4, src_img5, src_img6, src_img7,
-        src_img8, src_img9, src_img10, src_img11,
-        src_img12, src_img13, src_img14, src_img15);
+        best_plane, half_patch, sigma_spatial, sigma_color, census_weight,
+        &rp, &cost_array[7 * MAX_SOURCES],
+        src_images);
   }
 
   // --- Near up (with diagonal V-shape search) ---
   if (y > 0) {
-    int base = (y - 1) * width + x;
-    float best_c = costs[base]; int best_p = base;
+    int best_px = x, best_py = y - 1;
+    float best_c = read_imagef(costs_img, samp_planes, (int2)(best_px, best_py)).x;
     for (int i = 0; i < 3; i++) {
       if (y > 1 + i && x > i) {
-        int pp = (y - 2 - i) * width + (x - i - 1);
-        if (pp >= 0 && pp < npix && costs[pp] < best_c)
-          { best_c = costs[pp]; best_p = pp; }
+        int px = x - i - 1, py = y - 2 - i;
+        float c = read_imagef(costs_img, samp_planes, (int2)(px, py)).x;
+        if (c < best_c) { best_c = c; best_px = px; best_py = py; }
       }
       if (y > 1 + i && x < width - 1 - i) {
-        int pp = (y - 2 - i) * width + (x + i + 1);
-        if (pp >= 0 && pp < npix && costs[pp] < best_c)
-          { best_c = costs[pp]; best_p = pp; }
+        int px = x + i + 1, py = y - 2 - i;
+        float c = read_imagef(costs_img, samp_planes, (int2)(px, py)).x;
+        if (c < best_c) { best_c = c; best_px = px; best_py = py; }
       }
     }
-    positions[0] = best_p; flags[0] = true;
+    positions[0] = best_py * width + best_px; flags[0] = true;
+    PlaneHypothesis best_plane = read_imagef(planes_img, samp_planes, (int2)(best_px, best_py));
     compute_cost_vector(ref_img, cameras, num_images, x, y,
-        planes[best_p], half_patch, sigma_spatial, sigma_color, census_weight,
-        &cost_array[0 * MAX_SOURCES],
-        src_img0, src_img1, src_img2, src_img3,
-        src_img4, src_img5, src_img6, src_img7,
-        src_img8, src_img9, src_img10, src_img11,
-        src_img12, src_img13, src_img14, src_img15);
+        best_plane, half_patch, sigma_spatial, sigma_color, census_weight,
+        &rp, &cost_array[0 * MAX_SOURCES],
+        src_images);
   }
 )CL"
-R"CL(
+    R"CL(
 
   // --- Near down ---
   if (y < height - 1) {
-    int base = (y + 1) * width + x;
-    float best_c = costs[base]; int best_p = base;
+    int best_px = x, best_py = y + 1;
+    float best_c = read_imagef(costs_img, samp_planes, (int2)(best_px, best_py)).x;
     for (int i = 0; i < 3; i++) {
       if (y < height - 2 - i && x > i) {
-        int pp = (y + 2 + i) * width + (x - i - 1);
-        if (pp >= 0 && pp < npix && costs[pp] < best_c)
-          { best_c = costs[pp]; best_p = pp; }
+        int px = x - i - 1, py = y + 2 + i;
+        float c = read_imagef(costs_img, samp_planes, (int2)(px, py)).x;
+        if (c < best_c) { best_c = c; best_px = px; best_py = py; }
       }
       if (y < height - 2 - i && x < width - 1 - i) {
-        int pp = (y + 2 + i) * width + (x + i + 1);
-        if (pp >= 0 && pp < npix && costs[pp] < best_c)
-          { best_c = costs[pp]; best_p = pp; }
+        int px = x + i + 1, py = y + 2 + i;
+        float c = read_imagef(costs_img, samp_planes, (int2)(px, py)).x;
+        if (c < best_c) { best_c = c; best_px = px; best_py = py; }
       }
     }
-    positions[2] = best_p; flags[2] = true;
+    positions[2] = best_py * width + best_px; flags[2] = true;
+    PlaneHypothesis best_plane = read_imagef(planes_img, samp_planes, (int2)(best_px, best_py));
     compute_cost_vector(ref_img, cameras, num_images, x, y,
-        planes[best_p], half_patch, sigma_spatial, sigma_color, census_weight,
-        &cost_array[2 * MAX_SOURCES],
-        src_img0, src_img1, src_img2, src_img3,
-        src_img4, src_img5, src_img6, src_img7,
-        src_img8, src_img9, src_img10, src_img11,
-        src_img12, src_img13, src_img14, src_img15);
+        best_plane, half_patch, sigma_spatial, sigma_color, census_weight,
+        &rp, &cost_array[2 * MAX_SOURCES],
+        src_images);
   }
 
   // --- Near left ---
   if (x > 0) {
-    int base = y * width + (x - 1);
-    float best_c = costs[base]; int best_p = base;
+    int best_px = x - 1, best_py = y;
+    float best_c = read_imagef(costs_img, samp_planes, (int2)(best_px, best_py)).x;
     for (int i = 0; i < 3; i++) {
       if (x > 1 + i && y > i) {
-        int pp = (y - i - 1) * width + (x - 2 - i);
-        if (pp >= 0 && pp < npix && costs[pp] < best_c)
-          { best_c = costs[pp]; best_p = pp; }
+        int px = x - 2 - i, py = y - i - 1;
+        float c = read_imagef(costs_img, samp_planes, (int2)(px, py)).x;
+        if (c < best_c) { best_c = c; best_px = px; best_py = py; }
       }
       if (x > 1 + i && y < height - 1 - i) {
-        int pp = (y + i + 1) * width + (x - 2 - i);
-        if (pp >= 0 && pp < npix && costs[pp] < best_c)
-          { best_c = costs[pp]; best_p = pp; }
+        int px = x - 2 - i, py = y + i + 1;
+        float c = read_imagef(costs_img, samp_planes, (int2)(px, py)).x;
+        if (c < best_c) { best_c = c; best_px = px; best_py = py; }
       }
     }
-    positions[4] = best_p; flags[4] = true;
+    positions[4] = best_py * width + best_px; flags[4] = true;
+    PlaneHypothesis best_plane = read_imagef(planes_img, samp_planes, (int2)(best_px, best_py));
     compute_cost_vector(ref_img, cameras, num_images, x, y,
-        planes[best_p], half_patch, sigma_spatial, sigma_color, census_weight,
-        &cost_array[4 * MAX_SOURCES],
-        src_img0, src_img1, src_img2, src_img3,
-        src_img4, src_img5, src_img6, src_img7,
-        src_img8, src_img9, src_img10, src_img11,
-        src_img12, src_img13, src_img14, src_img15);
+        best_plane, half_patch, sigma_spatial, sigma_color, census_weight,
+        &rp, &cost_array[4 * MAX_SOURCES],
+        src_images);
   }
 
   // --- Near right ---
   if (x < width - 1) {
-    int base = y * width + (x + 1);
-    float best_c = costs[base]; int best_p = base;
+    int best_px = x + 1, best_py = y;
+    float best_c = read_imagef(costs_img, samp_planes, (int2)(best_px, best_py)).x;
     for (int i = 0; i < 3; i++) {
       if (x < width - 2 - i && y > i) {
-        int pp = (y - i - 1) * width + (x + 2 + i);
-        if (pp >= 0 && pp < npix && costs[pp] < best_c)
-          { best_c = costs[pp]; best_p = pp; }
+        int px = x + 2 + i, py = y - i - 1;
+        float c = read_imagef(costs_img, samp_planes, (int2)(px, py)).x;
+        if (c < best_c) { best_c = c; best_px = px; best_py = py; }
       }
       if (x < width - 2 - i && y < height - 1 - i) {
-        int pp = (y + i + 1) * width + (x + 2 + i);
-        if (pp >= 0 && pp < npix && costs[pp] < best_c)
-          { best_c = costs[pp]; best_p = pp; }
+        int px = x + 2 + i, py = y + i + 1;
+        float c = read_imagef(costs_img, samp_planes, (int2)(px, py)).x;
+        if (c < best_c) { best_c = c; best_px = px; best_py = py; }
       }
     }
-    positions[6] = best_p; flags[6] = true;
+    positions[6] = best_py * width + best_px; flags[6] = true;
+    PlaneHypothesis best_plane = read_imagef(planes_img, samp_planes, (int2)(best_px, best_py));
     compute_cost_vector(ref_img, cameras, num_images, x, y,
-        planes[best_p], half_patch, sigma_spatial, sigma_color, census_weight,
-        &cost_array[6 * MAX_SOURCES],
-        src_img0, src_img1, src_img2, src_img3,
-        src_img4, src_img5, src_img6, src_img7,
-        src_img8, src_img9, src_img10, src_img11,
-        src_img12, src_img13, src_img14, src_img15);
+        best_plane, half_patch, sigma_spatial, sigma_color, census_weight,
+        &rp, &cost_array[6 * MAX_SOURCES],
+        src_images);
   }
 
   // =================================================================
-  // Step 2: Multi-hypothesis Joint View Selection
+  // Step 2: Diversity-Enforced View Selection
+  // =================================================================
+  //
+  // Redesign rationale: The original ACMMP CDF sampling narrows the
+  // view set across iterations via magic-number Gaussian kernels.  This
+  // causes a conspiracy where a few low-baseline views all agree on a
+  // leaked foreground depth, and other views that DISAGREE are starved
+  // of weight.  The redesign:
+  //   - Count how many candidates each view validates (cost < threshold)
+  //   - Give weight = validation_count (flat, no Gaussian bias)
+  //   - Anchor previous-iteration views with a minimum floor weight
+  //   - Use a FIXED cost threshold (no iteration decay)
+  //
+  // This ensures views which consistently validate across spatial
+  // neighbors get weight, but views that disagree are NOT suppressed.
   // =================================================================
 
-  // 2a. Build view selection priors from 4 direct neighbors
-  float view_selection_priors[MAX_SOURCES];
-  for (int i = 0; i < MAX_SOURCES; i++) view_selection_priors[i] = 0.0f;
-  int neighbor_pos[4] = {idx - width, idx + width, idx - 1, idx + 1};
-  for (int i = 0; i < 4; i++) {
-    int np = neighbor_pos[i];
-    // Map neighbor to the near candidate flag index: up=0, down=2, left=4, right=6
-    bool neighbor_valid = flags[2 * i];
-    if (neighbor_valid && np >= 0 && np < npix) {
-      uint sv = selected_views[np];
-      for (int j = 0; j < n_src; j++) {
-        if (sv & (1u << j))
-          view_selection_priors[j] = 0.9f;
-        else
-          view_selection_priors[j] = 0.1f;
-      }
-    }
-  }
+  // Fixed threshold: a view validates a candidate if cost < 0.6
+  // (i.e. NCC > 0.2).  No iteration-dependent decay.
+  const float validation_threshold = 0.8f;
 
-  // 2b. Compute sampling probabilities from cost_array
-  float cost_threshold = 0.8f * exp((float)(iteration * iteration) / (-90.0f));
-  float sampling_probs[MAX_SOURCES];
-  for (int i = 0; i < MAX_SOURCES; i++) sampling_probs[i] = 0.0f;
-  for (int i = 0; i < n_src; i++) {
-    float count = 0.0f;
-    int count_false = 0;
-    float tmpw = 0.0f;
-    for (int j = 0; j < 8; j++) {
-      float cv = cost_array[j * MAX_SOURCES + i];
-      if (flags[j] && cv < cost_threshold) {
-        tmpw += exp(cv * cv / (-0.18f));
-        count += 1.0f;
-      }
-      if (flags[j] && cv > 1.2f) {
-        count_false++;
-      }
-    }
-    if (count > 2.0f && count_false < 3)
-      sampling_probs[i] = tmpw / count;
-    else if (count_false < 3)
-      sampling_probs[i] = exp(cost_threshold * cost_threshold / (-0.32f));
-    sampling_probs[i] *= view_selection_priors[i];
-  }
-
-  // 2c. Convert to CDF and draw 15 weighted samples
-  pdf_to_cdf(sampling_probs, n_src);
-
+  // 2a. Count per-view validations across the 8 spatial candidates
   float view_weights[MAX_SOURCES];
   for (int i = 0; i < MAX_SOURCES; i++) view_weights[i] = 0.0f;
-  for (int sample = 0; sample < 15; sample++) {
-    float r = rand_float(&state, key + sample * 997u) - 1e-7f;
-    for (int j = 0; j < n_src; j++) {
-      if (sampling_probs[j] > r) {
-        view_weights[j] += 1.0f;
-        break;
+
+  for (int i = 0; i < n_src; i++) {
+    float valid_count = 0.0f;
+    for (int j = 0; j < 8; j++) {
+      float cost = cost_array[j * MAX_SOURCES + i];
+      if (flags[j] && cost < validation_threshold) {
+        valid_count += (1.0f - cost);
+      }
+    }
+    // Weight = number of candidates this view validates.
+    if (valid_count > 0.0f) {
+      view_weights[i] = valid_count;
+    }
+  }
+
+  // 2b. Anchoring: forcibly include views from the previous iteration.
+  uint prev_sel = selected_views[idx];
+  if (anchor_views > 0) {
+    int anchored = 0;
+    for (int i = 0; i < n_src && anchored < anchor_views; i++) {
+      if ((prev_sel & (1u << i)) && view_weights[i] < 1e-6f) {
+        view_weights[i] = 1.0f;
+        anchored++;
       }
     }
   }
 
+  // 2c. Multi-factor geometric priors (COLMAP-inspired).
+  // Multiply each view's weight by:
+  //   - Triangulation angle factor: angle_weights[i] = sin(baseline_angle)
+  //     → promotes wide-baseline views, penalizes near-zero baselines.
+  //   - Incident angle factor: exp(-(1-|cos_θ|)² / (2*σ²))
+  //     → penalizes views that see the surface at grazing angles.
+  //     Uses the current pixel's normal estimate so it adapts with depth.
+  {
+    // Get current normal from the existing plane hypothesis.
+    PlaneHypothesis cur_plane = read_imagef(planes_img, samp_planes, (int2)(x, y));
+    float3 cur_n = (float3)(cur_plane.x, cur_plane.y, cur_plane.z);
+    float n_len = length(cur_n);
+    bool have_normal = (n_len > 0.1f);
+    if (have_normal) cur_n /= n_len;
+
+    // Reference camera center: C0 = -R0^T * t0
+    float3 C0;
+    C0.x = -(cameras[0].R[0]*cameras[0].t[0] + cameras[0].R[3]*cameras[0].t[1] + cameras[0].R[6]*cameras[0].t[2]);
+    C0.y = -(cameras[0].R[1]*cameras[0].t[0] + cameras[0].R[4]*cameras[0].t[1] + cameras[0].R[7]*cameras[0].t[2]);
+    C0.z = -(cameras[0].R[2]*cameras[0].t[0] + cameras[0].R[5]*cameras[0].t[1] + cameras[0].R[8]*cameras[0].t[2]);
+
+    // 3D point at current pixel using current depth.
+    float cur_depth = depth_from_plane((float)x, (float)y, cur_plane, &cameras[0]);
+    float3 point_3d = backproject((float)x, (float)y, cur_depth, &cameras[0]);
+
+    const float inc_sigma = 0.6f;  // incident angle sigma (COLMAP default)
+    const float inv_2sigma2 = -0.5f / (inc_sigma * inc_sigma);
+
+    for (int i = 0; i < n_src; i++) {
+      if (view_weights[i] < 1e-6f) continue;
+
+      // (a) Triangulation angle factor: directly use precomputed sin(angle).
+      float tri_factor = angle_weights[i];  // in [0.01, 1.0]
+      view_weights[i] *= tri_factor;
+
+      // (b) Incident angle factor: how frontal does source see the surface?
+      if (have_normal && cur_depth > 0.0f) {
+        // Source camera center: Ci = -Ri^T * ti
+        float3 Ci;
+        Ci.x = -(cameras[i+1].R[0]*cameras[i+1].t[0] + cameras[i+1].R[3]*cameras[i+1].t[1] + cameras[i+1].R[6]*cameras[i+1].t[2]);
+        Ci.y = -(cameras[i+1].R[1]*cameras[i+1].t[0] + cameras[i+1].R[4]*cameras[i+1].t[1] + cameras[i+1].R[7]*cameras[i+1].t[2]);
+        Ci.z = -(cameras[i+1].R[2]*cameras[i+1].t[0] + cameras[i+1].R[5]*cameras[i+1].t[1] + cameras[i+1].R[8]*cameras[i+1].t[2]);
+
+        // Ray from 3D point to source camera.
+        float3 ray_to_src = normalize(Ci - point_3d);
+        float cos_inc = fabs(dot(cur_n, ray_to_src));
+        // Penalize grazing views: factor → 0 as cos_inc → 0.
+        float x_inc = 1.0f - cos_inc;
+        float inc_factor = exp(x_inc * x_inc * inv_2sigma2);
+        view_weights[i] *= inc_factor;
+      }
+    }
+  }
+
+  // 2d. Compute weight_norm and new_selected bitmask.
   uint new_selected = 0u;
   float weight_norm = 0.0f;
   for (int i = 0; i < n_src; i++) {
 )CL"
-R"CL(
+    R"CL(
     if (view_weights[i] > 0.0f) {
       new_selected |= (1u << i);
       weight_norm += view_weights[i];
     }
   }
 
+  // 2e. Fallback: if no views passed validation, use uniform weights
+  // for all views that had valid projection (cost < 2.0).
+  if (weight_norm < 1e-6f) {
+    for (int i = 0; i < n_src; i++) {
+      for (int j = 0; j < 8; j++) {
+        if (flags[j] && cost_array[j * MAX_SOURCES + i] < 2.0f) {
+          view_weights[i] = 1.0f;
+          new_selected |= (1u << i);
+          weight_norm += 1.0f;
+          break;
+        }
+      }
+    }
+  }
+
+
   // =================================================================
   // Step 3: Compute view-weighted final costs for each candidate
   // =================================================================
+
+  bool propagation_allowed = true;
+
   float final_costs[8];
   for (int i = 0; i < 8; i++) {
     if (flags[i]) {
-      float photo = compute_weighted_cost_geom(&cost_array[i * MAX_SOURCES],
+      PlaneHypothesis cand_plane = read_imagef(planes_img, samp_planes,
+          (int2)(positions[i] % width, positions[i] / width));
+      float photo = compute_mc_cost(&cost_array[i * MAX_SOURCES],
           view_weights, weight_norm, n_src,
-          cameras, planes[positions[i]], x, y,
-          prev_depths, prev_depth_mask, width, height, geom_weight);
+          cameras, cand_plane, x, y,
+          prev_depths, prev_depth_mask, width, height, geom_weight,
+          &state, key + 600u + (uint)i * 31u);
       if (smooth_weight > 1e-6f) {
-        float smooth = compute_smoothness_cost(planes, &cameras[0],
-            planes[positions[i]], x, y, width, height);
-        final_costs[i] = photo + smooth_weight * smooth;
-      } else {
-        final_costs[i] = photo;
+        float smooth = compute_smoothness_cost(planes_img, &cameras[0],
+            cand_plane, x, y, width, height);
+        photo += smooth_weight * smooth;
       }
+      final_costs[i] = photo;
     } else {
       final_costs[i] = 2.0f;
     }
@@ -1650,26 +1601,23 @@ R"CL(
   }
 
   // Compute current pixel's cost with new view weights
+  PlaneHypothesis plane_now = read_imagef(planes_img, samp_planes, (int2)(x, y));
   float cost_vec_now[MAX_SOURCES];
   for (int i = 0; i < MAX_SOURCES; i++) cost_vec_now[i] = 2.0f;
   compute_cost_vector(ref_img, cameras, num_images, x, y,
-      planes[idx], half_patch, sigma_spatial, sigma_color, census_weight,
-      cost_vec_now,
-      src_img0, src_img1, src_img2, src_img3,
-      src_img4, src_img5, src_img6, src_img7,
-      src_img8, src_img9, src_img10, src_img11,
-      src_img12, src_img13, src_img14, src_img15);
-  float cost_now = compute_weighted_cost_geom(cost_vec_now, view_weights,
+      plane_now, half_patch, sigma_spatial, sigma_color, census_weight,
+      &rp, cost_vec_now, src_images);
+  float cost_now = compute_mc_cost(cost_vec_now, view_weights,
       weight_norm, n_src,
-      cameras, planes[idx], x, y,
-      prev_depths, prev_depth_mask, width, height, geom_weight);
+      cameras, plane_now, x, y,
+      prev_depths, prev_depth_mask, width, height, geom_weight,
+      &state, key + 700u);
   if (smooth_weight > 1e-6f) {
-    cost_now += smooth_weight * compute_smoothness_cost(planes, &cameras[0],
-        planes[idx], x, y, width, height);
+    cost_now += smooth_weight * compute_smoothness_cost(planes_img, &cameras[0],
+        plane_now, x, y, width, height);
   }
   costs[idx] = cost_now;
 
-  PlaneHypothesis plane_now = planes[idx];
   float depth_now = depth_from_plane((float)x, (float)y, plane_now, &cameras[0]);
 
   // =================================================================
@@ -1693,12 +1641,14 @@ R"CL(
   // Step 3b: Accept best candidate (pure photometric cost)
   // =================================================================
   {
-    if (flags[best_cand] && best_cand_cost < cost_now) {
+    if (propagation_allowed && flags[best_cand] && best_cand_cost < cost_now) {
+      PlaneHypothesis best_cand_plane = read_imagef(planes_img, samp_planes,
+          (int2)(positions[best_cand] % width, positions[best_cand] / width));
       float db = depth_from_plane((float)x, (float)y,
-                                  planes[positions[best_cand]], &cameras[0]);
+                                  best_cand_plane, &cameras[0]);
       if (db >= depth_min && db <= depth_max) {
         depth_now = db;
-        plane_now = planes[positions[best_cand]];
+        plane_now = best_cand_plane;
         cost_now = best_cand_cost;
         selected_views[idx] = new_selected;
       }
@@ -1708,16 +1658,18 @@ R"CL(
   // =================================================================
   // Step 4: Multi-hypothesis refinement (5 diverse candidates)
   //
-  // From Xu et al.: test 5 combinations of depth and normal:
   //   0: (random_depth,     current_normal)
   //   1: (current_depth,    random_normal)
   //   2: (random_depth,     random_normal)
   //   3: (current_depth,    perturbed_normal)
   //   4: (perturbed_depth,  current_normal)
+  //   5: (current_depth,    surface_normal)
   //
   // =================================================================
   {
-    float perturbation = 0.02f;
+    // Perturbation scales
+    float depth_perturbation = 0.005f;
+    float normal_perturbation = 0.01f * M_PI_F;
     float3 cur_normal = normalize((float3)(plane_now.x, plane_now.y, plane_now.z));
 
     float depth_rand, depth_perturbed;
@@ -1750,14 +1702,14 @@ R"CL(
 
     // Perturbed depth and normal (small perturbation of current)
     {
-      float d_min_p = (1.0f - perturbation) * depth_now;
-      float d_max_p = (1.0f + perturbation) * depth_now;
+      float d_min_p = (1.0f - depth_perturbation) * depth_now;
+      float d_max_p = (1.0f + depth_perturbation) * depth_now;
       depth_perturbed = d_min_p + rand_float(&state, key + 510u) * (d_max_p - d_min_p);
       depth_perturbed = clamp(depth_perturbed, depth_min, depth_max);
     }
     {
-      float pa1 = (rand_float(&state, key + 520u) - 0.5f) * perturbation * M_PI_F;
-      float pa2 = (rand_float(&state, key + 521u) - 0.5f) * perturbation * M_PI_F;
+      float pa1 = (rand_float(&state, key + 520u) - 0.5f) * normal_perturbation;
+      float pa2 = (rand_float(&state, key + 521u) - 0.5f) * normal_perturbation;
       normal_perturbed.x = cur_normal.x + pa1;
       normal_perturbed.y = cur_normal.y + pa2;
       normal_perturbed.z = cur_normal.z;
@@ -1765,17 +1717,31 @@ R"CL(
       if (normal_perturbed.z > 0.0f) normal_perturbed.z = -normal_perturbed.z;
     }
 
-    // 5 candidate hypotheses
-    float  ref_depths[5]  = {depth_rand, depth_now, depth_rand,
-                             depth_now, depth_perturbed};
-    float3 ref_normals[5];
+    // This acts as a geometric regularizer: biases normals toward being
+    // consistent with the local depth surface, without explicit smoothness.
+    float3 surface_normal = compute_surface_normal(planes_img, &cameras[0],
+        x, y, width, height, depth_now);
+    bool have_surface_normal = (length(surface_normal) > 0.5f);
+
+    // 6 candidate hypotheses (5 original + surface normal from neighbors)
+    //   0: (random_depth,     current_normal)
+    //   1: (current_depth,    random_normal)
+    //   2: (random_depth,     random_normal)
+    //   3: (current_depth,    perturbed_normal)
+    //   4: (perturbed_depth,  current_normal)
+    //   5: (current_depth,    surface_normal)
+    float  ref_depths[6]  = {depth_rand, depth_now, depth_rand,
+                             depth_now, depth_perturbed, depth_now};
+    float3 ref_normals[6];
     ref_normals[0] = cur_normal;
     ref_normals[1] = normal_rand;
     ref_normals[2] = normal_rand;
     ref_normals[3] = normal_perturbed;
     ref_normals[4] = cur_normal;
+    ref_normals[5] = surface_normal;
 
-    for (int h = 0; h < 5; h++) {
+    int n_cands = have_surface_normal ? 6 : 5;
+    for (int h = 0; h < n_cands; h++) {
       PlaneHypothesis cand = plane_from_depth_normal(
           (float)x, (float)y, ref_depths[h], ref_normals[h], &cameras[0]);
 
@@ -1783,17 +1749,14 @@ R"CL(
       for (int ci = 0; ci < MAX_SOURCES; ci++) cv[ci] = 2.0f;
       compute_cost_vector(ref_img, cameras, num_images, x, y, cand,
           half_patch, sigma_spatial, sigma_color, census_weight,
-          cv,
-          src_img0, src_img1, src_img2, src_img3,
-          src_img4, src_img5, src_img6, src_img7,
-          src_img8, src_img9, src_img10, src_img11,
-          src_img12, src_img13, src_img14, src_img15);
-      float temp_cost = compute_weighted_cost_geom(cv, view_weights,
+          &rp, cv, src_images);
+      float temp_cost = compute_mc_cost(cv, view_weights,
           weight_norm, n_src,
           cameras, cand, x, y,
-          prev_depths, prev_depth_mask, width, height, geom_weight);
+          prev_depths, prev_depth_mask, width, height, geom_weight,
+          &state, key + 800u + (uint)h * 37u);
       if (smooth_weight > 1e-6f) {
-        temp_cost += smooth_weight * compute_smoothness_cost(planes, &cameras[0],
+        temp_cost += smooth_weight * compute_smoothness_cost(planes_img, &cameras[0],
             cand, x, y, width, height);
       }
 
@@ -1808,11 +1771,12 @@ R"CL(
     }
   }
 
+
   planes[idx] = plane_now;
   costs[idx] = cost_now;
   rand_states[idx] = state;
 })CL"
-R"CL(
+    R"CL(
 
 // =====================================================================
 // Kernel: Upsample plane hypotheses from a coarser resolution.
@@ -1919,131 +1883,118 @@ void sort_small_f(float *d, int n) {
 __kernel void acmmp_checkerboard_filter(
     __global PlaneHypothesis *planes,
     __global float *costs,
+    read_only image2d_t planes_img,
+    read_only image2d_t costs_img,
     __global const Camera *cameras,
     int width, int height,
     int color_flag
 ) {
-  int x = get_global_id(0);
-  int y = get_global_id(1);
-  if (x >= width || y >= height) return;
-  if (((x + y) & 1) != color_flag) return;
+  // Dense checkerboard indexing: grid is (half_width x height), reconstruct
+  // true pixel coordinates so all SIMD lanes are active on Apple Silicon.
+  int gid_x = get_global_id(0);
+  int gid_y = get_global_id(1);
+  int half_width = (width + 1) / 2;
+  if (gid_x >= half_width || gid_y >= height) return;
+  int x = gid_x * 2 + ((gid_y + color_flag) % 2);
+  int y = gid_y;
+  if (x >= width) return;
 
   int center = y * width + x;
 
   // Skip pixels with very low cost (already well converged).
-  if (costs[center] < 0.001f) return;
+  if (read_imagef(costs_img, samp_planes, (int2)(x, y)).x < 0.001f) return;
 
   float filter_buf[21];
   int idx = 0;
 
   // Center pixel depth.
   filter_buf[idx++] = depth_from_plane((float)x, (float)y,
-                                       planes[center], &cameras[0]);
+      read_imagef(planes_img, samp_planes, (int2)(x, y)), &cameras[0]);
 
   // --- Vertical axis (stride 1, 3, 5 in y) ---
   if (y > 0) {
-    int nb = center - width;
     filter_buf[idx++] = depth_from_plane((float)x, (float)(y - 1),
-                                         planes[nb], &cameras[0]);
+        read_imagef(planes_img, samp_planes, (int2)(x, y - 1)), &cameras[0]);
   }
   if (y > 2) {
-    int nb = center - 3 * width;
     filter_buf[idx++] = depth_from_plane((float)x, (float)(y - 3),
-                                         planes[nb], &cameras[0]);
+        read_imagef(planes_img, samp_planes, (int2)(x, y - 3)), &cameras[0]);
   }
   if (y > 4) {
-    int nb = center - 5 * width;
     filter_buf[idx++] = depth_from_plane((float)x, (float)(y - 5),
-                                         planes[nb], &cameras[0]);
+        read_imagef(planes_img, samp_planes, (int2)(x, y - 5)), &cameras[0]);
   }
   if (y < height - 1) {
-    int nb = center + width;
     filter_buf[idx++] = depth_from_plane((float)x, (float)(y + 1),
-                                         planes[nb], &cameras[0]);
+        read_imagef(planes_img, samp_planes, (int2)(x, y + 1)), &cameras[0]);
   }
   if (y < height - 3) {
-    int nb = center + 3 * width;
     filter_buf[idx++] = depth_from_plane((float)x, (float)(y + 3),
-                                         planes[nb], &cameras[0]);
+        read_imagef(planes_img, samp_planes, (int2)(x, y + 3)), &cameras[0]);
   }
   if (y < height - 5) {
-    int nb = center + 5 * width;
     filter_buf[idx++] = depth_from_plane((float)x, (float)(y + 5),
-                                         planes[nb], &cameras[0]);
+        read_imagef(planes_img, samp_planes, (int2)(x, y + 5)), &cameras[0]);
   }
 
   // --- Horizontal axis (stride 1, 3, 5 in x) ---
   if (x > 0) {
-    int nb = center - 1;
     filter_buf[idx++] = depth_from_plane((float)(x - 1), (float)y,
-                                         planes[nb], &cameras[0]);
+        read_imagef(planes_img, samp_planes, (int2)(x - 1, y)), &cameras[0]);
   }
   if (x > 2) {
-    int nb = center - 3;
     filter_buf[idx++] = depth_from_plane((float)(x - 3), (float)y,
-                                         planes[nb], &cameras[0]);
+        read_imagef(planes_img, samp_planes, (int2)(x - 3, y)), &cameras[0]);
   }
   if (x > 4) {
-    int nb = center - 5;
     filter_buf[idx++] = depth_from_plane((float)(x - 5), (float)y,
-                                         planes[nb], &cameras[0]);
+        read_imagef(planes_img, samp_planes, (int2)(x - 5, y)), &cameras[0]);
   }
   if (x < width - 1) {
-    int nb = center + 1;
     filter_buf[idx++] = depth_from_plane((float)(x + 1), (float)y,
-                                         planes[nb], &cameras[0]);
+        read_imagef(planes_img, samp_planes, (int2)(x + 1, y)), &cameras[0]);
   }
   if (x < width - 3) {
-    int nb = center + 3;
     filter_buf[idx++] = depth_from_plane((float)(x + 3), (float)y,
-                                         planes[nb], &cameras[0]);
+        read_imagef(planes_img, samp_planes, (int2)(x + 3, y)), &cameras[0]);
   }
   if (x < width - 5) {
-    int nb = center + 5;
     filter_buf[idx++] = depth_from_plane((float)(x + 5), (float)y,
-                                         planes[nb], &cameras[0]);
+        read_imagef(planes_img, samp_planes, (int2)(x + 5, y)), &cameras[0]);
   }
 
   // --- Diagonal-ish neighbours (checkerboard L-shaped offsets) ---
   if (y > 0 && x < width - 2) {
-    int nb = center - width + 2;
     filter_buf[idx++] = depth_from_plane((float)(x + 2), (float)(y - 1),
-                                         planes[nb], &cameras[0]);
+        read_imagef(planes_img, samp_planes, (int2)(x + 2, y - 1)), &cameras[0]);
   }
   if (y < height - 1 && x < width - 2) {
-    int nb = center + width + 2;
     filter_buf[idx++] = depth_from_plane((float)(x + 2), (float)(y + 1),
-                                         planes[nb], &cameras[0]);
+        read_imagef(planes_img, samp_planes, (int2)(x + 2, y + 1)), &cameras[0]);
   }
   if (y > 0 && x > 1) {
-    int nb = center - width - 2;
     filter_buf[idx++] = depth_from_plane((float)(x - 2), (float)(y - 1),
-                                         planes[nb], &cameras[0]);
+        read_imagef(planes_img, samp_planes, (int2)(x - 2, y - 1)), &cameras[0]);
   }
   if (y < height - 1 && x > 1) {
-    int nb = center + width - 2;
     filter_buf[idx++] = depth_from_plane((float)(x - 2), (float)(y + 1),
-                                         planes[nb], &cameras[0]);
+        read_imagef(planes_img, samp_planes, (int2)(x - 2, y + 1)), &cameras[0]);
   }
   if (x > 0 && y > 2) {
-    int nb = center - 1 - 2 * width;
     filter_buf[idx++] = depth_from_plane((float)(x - 1), (float)(y - 2),
-                                         planes[nb], &cameras[0]);
+        read_imagef(planes_img, samp_planes, (int2)(x - 1, y - 2)), &cameras[0]);
   }
   if (x < width - 1 && y > 2) {
-    int nb = center + 1 - 2 * width;
     filter_buf[idx++] = depth_from_plane((float)(x + 1), (float)(y - 2),
-                                         planes[nb], &cameras[0]);
+        read_imagef(planes_img, samp_planes, (int2)(x + 1, y - 2)), &cameras[0]);
   }
   if (x > 0 && y < height - 2) {
-    int nb = center - 1 + 2 * width;
     filter_buf[idx++] = depth_from_plane((float)(x - 1), (float)(y + 2),
-                                         planes[nb], &cameras[0]);
+        read_imagef(planes_img, samp_planes, (int2)(x - 1, y + 2)), &cameras[0]);
   }
   if (x < width - 1 && y < height - 2) {
-    int nb = center + 1 + 2 * width;
     filter_buf[idx++] = depth_from_plane((float)(x + 1), (float)(y + 2),
-                                         planes[nb], &cameras[0]);
+        read_imagef(planes_img, samp_planes, (int2)(x + 1, y + 2)), &cameras[0]);
   }
 
   // Bilateral depth gate: reject neighbors whose depth differs by more
@@ -2051,7 +2002,7 @@ __kernel void acmmp_checkerboard_filter(
   // this prevents the median from mixing depths from different surfaces,
   // which would otherwise crystallize wrong-depth blobs.
   {
-    float percent = 0.15f;  // 1.5% depth difference allowed
+    float percent = 0.03f;  // // was 0.15f
     float center_d = filter_buf[0];
     if (center_d > 0.0f) {
       float depth_lo = center_d * (1 - percent);
@@ -2078,9 +2029,10 @@ __kernel void acmmp_checkerboard_filter(
 
   // Reconstruct plane with center's normal but the median depth.
   if (median_depth > 0.0f) {
-    float3 normal = normalize((float3)(planes[center].x,
-                                       planes[center].y,
-                                       planes[center].z));
+    PlaneHypothesis center_plane = read_imagef(planes_img, samp_planes, (int2)(x, y));
+    float3 normal = normalize((float3)(center_plane.x,
+                                       center_plane.y,
+                                       center_plane.z));
     planes[center] = plane_from_depth_normal(
         (float)x, (float)y, median_depth, normal, &cameras[0]);
   }
@@ -2164,12 +2116,15 @@ __kernel void acmmp_clean_depthmap(
     read_only image2d_t src14, read_only image2d_t src15,
     __global const Camera *cameras,
     __global float *clean_depth,
+    __global const float *ref_normal,  // HxWx3 camera-frame normals (or NULL-equivalent)
     int width, int height,
     int num_views,
     float same_depth_threshold,
     int min_consistent_views,
     float carving_threshold,
-    int max_carved_views
+    int max_carved_views,
+    float grazing_cos_threshold,
+    int has_normal
 ) {
   int x = get_global_id(0);
   int y = get_global_id(1);
@@ -2182,6 +2137,29 @@ __kernel void acmmp_clean_depthmap(
     clean_depth[idx] = 0.0f;
     return;
   }
+
+  // ---- Grazing angle detection from per-pixel normal ----
+  int is_grazing = 0;
+  if (has_normal) {
+    float nnx = ref_normal[idx * 3];
+    float nny = ref_normal[idx * 3 + 1];
+    float nnz = ref_normal[idx * 3 + 2];
+    float nlen = sqrt(nnx*nnx + nny*nny + nnz*nnz);
+    if (nlen > 1e-6f) {
+      // Normal is in camera frame; view ray in camera frame is (cam_x, cam_y, cam_z)/|...|
+      Camera ref_cam_s = cameras[0];
+      float fcx = ref_cam_s.K[0], ccx = ref_cam_s.K[2];
+      float fcy = ref_cam_s.K[4], ccy = ref_cam_s.K[5];
+      float ray_x = (x - ccx) / fcx;
+      float ray_y = (y - ccy) / fcy;
+      float ray_z = 1.0f;
+      float rlen = sqrt(ray_x*ray_x + ray_y*ray_y + ray_z*ray_z);
+      float cos_angle = fabs((nnx*ray_x + nny*ray_y + nnz*ray_z) / (nlen * rlen));
+      is_grazing = (cos_angle < grazing_cos_threshold) ? 1 : 0;
+    }
+  }
+
+  int is_suspicious = is_grazing;
 
   Camera ref_cam = cameras[0];
   float fx = ref_cam.K[0], cx = ref_cam.K[2];
@@ -2226,11 +2204,34 @@ __kernel void acmmp_clean_depthmap(
 
     if (!(src_depth > 0.0f)) continue;
 
-    // Space carving: if neighbor's ray passes THROUGH the reference point
-    // (neighbor sees further away), the reference point is in free space
-    // from this view — a strong signal that it is a floater.
+    // ---- Space carving: source sees significantly further ----
     if (src_depth > sz * (1.0f + carving_threshold)) {
-      carved++;
+      float src_fx = src_cam.K[0], src_cx = src_cam.K[2];
+      float src_fy = src_cam.K[4], src_cy = src_cam.K[5];
+
+      float src_cam_x = (su - src_cx) / src_fx * src_depth;
+      float src_cam_y = (sv_coord - src_cy) / src_fy * src_depth;
+      float src_cam_z = src_depth;
+
+      float spc_x = src_cam_x - src_cam.t[0];
+      float spc_y = src_cam_y - src_cam.t[1];
+      float spc_z = src_cam_z - src_cam.t[2];
+
+      float wx2 = src_cam.R[0]*spc_x + src_cam.R[3]*spc_y + src_cam.R[6]*spc_z;
+      float wy2 = src_cam.R[1]*spc_x + src_cam.R[4]*spc_y + src_cam.R[7]*spc_z;
+      float wz2 = src_cam.R[2]*spc_x + src_cam.R[5]*spc_y + src_cam.R[8]*spc_z;
+      float rz = ref_cam.R[6]*wx2 + ref_cam.R[7]*wy2 + ref_cam.R[8]*wz2 + ref_cam.t[2];
+
+      if (rz > 1e-6f) {
+        // Carve vote: the source surface point is behind the reference
+        // depth.  No reproj_ok gate — it blocked votes for both floaters
+        // and real surfaces equally.  Consistency-weighted carve_budget
+        // protects well-corroborated surfaces instead.
+        int behind_ref = (rz > ref_depth * (1.0f + same_depth_threshold));
+        if (behind_ref) {
+          carved++;
+        }
+      }
       continue;
     }
 
@@ -2268,7 +2269,12 @@ __kernel void acmmp_clean_depthmap(
     consistent++;
   }
 
-  int keep = (consistent >= min_consistent_views) && (carved < max_carved_views);
+  // ---- Adaptive decision: suspicious pixels get stricter thresholds ----
+  int eff_min = is_suspicious ? (min_consistent_views + 1) : min_consistent_views;
+  int eff_max_carve = is_suspicious ? max(1, max_carved_views - 1) : max_carved_views;
+
+  int carve_budget = eff_max_carve + max(0, consistent - eff_min);
+  int keep = (consistent >= eff_min) && (carved <= carve_budget);
   clean_depth[idx] = keep ? ref_depth : 0.0f;
 }
 

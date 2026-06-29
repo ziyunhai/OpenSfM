@@ -1,6 +1,7 @@
 # pyre-strict
 import logging
 import os
+from timeit import default_timer as timer
 
 from opensfm import io, stats
 from opensfm.dataset import DataSet
@@ -15,6 +16,7 @@ def run_dataset(data: DataSet, diagram_max_points: int = -1) -> None:
         data: dataset object
 
     """
+    start = timer()
     reconstructions = data.load_reconstruction()
     tracks_manager = data.load_tracks_manager()
 
@@ -45,5 +47,16 @@ def run_dataset(data: DataSet, diagram_max_points: int = -1) -> None:
         reconstructions, output_path, data.io_handler
     )
 
+    stats.save_dsm_thumbnail(data, output_path, data.io_handler)
+    stats.save_ortho_thumbnail(data, output_path, data.io_handler)
+
+    elapsed = timer() - start
+    steps_times = stats_dict["processing_statistics"]["steps_times"]
+    total = steps_times.pop("Total Time", 0.0)
+    steps_times["Statistics"] = elapsed
+    steps_times["Total Time"] = total + elapsed
+
     with data.io_handler.open_wt(os.path.join(output_path, "stats.json")) as fout:
         io.json_dump(stats_dict, fout)
+
+    data.save_report(io.json_dumps({"wall_time": elapsed}), "statistics.json")

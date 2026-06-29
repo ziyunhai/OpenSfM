@@ -2,7 +2,7 @@ set(DENSE_FILES
     cleaner.h
     cluster.h
     depthmap_bind.h
-    dsm_opencl_kernels.h
+    diffusion_opencl_kernels.h
     estimator.h
     fuser.h
     svo.h
@@ -12,7 +12,6 @@ set(DENSE_FILES
     opencl_kernels.h
     opencl_utils.h
     openmvs_exporter.h
-    src/fuser.cc
     src/svo.cc
     src/svo_fuser.cc
 )

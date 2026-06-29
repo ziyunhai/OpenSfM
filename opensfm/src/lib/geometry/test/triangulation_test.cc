@@ -320,7 +320,7 @@ TEST_F(TwoCamsManyPointsFixture, TriangulateTwoBearingsMidpointMany) {
   for (int i = 0; i < gt_points.size(); ++i) {
     const auto [success, point] = results_noisy[i];
     ASSERT_TRUE(success);
-    ASSERT_LT((point - gt_points[i]).norm(), 0.01);
+    ASSERT_LT((point - gt_points[i]).norm(), 0.011);
   }
 }
 

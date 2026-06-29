@@ -110,7 +110,7 @@ def undistort_reconstruction_with_images(
             ratio_use = 0.9
             mem_available *= ratio_use
 
-            processing_size = data.config["depthmap_resolution"]
+            processing_size = data.config["depthmap_max_image_size"]
             output_size = processing_size * processing_size * 4 / 1024 / 1024
 
             undistort_factor = 3  # 1 for original image, 2 for (U,V) remapping

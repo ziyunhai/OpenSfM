@@ -1100,17 +1100,31 @@ def point_cloud_from_ply(
     return points, normals, colors, labels
 
 
-def point_cloud_to_ply(
-    points: NDArray,
-    normals: NDArray,
-    colors: NDArray,
-    labels: NDArray,
-    fp: BinaryIO,
-) -> None:
-    header = (
+def read_ply_vertex_count(fp: BinaryIO) -> int:
+    """Read only the header of a PLY stream and return its vertex count.
+
+    Leaves the stream positioned at the start of the binary body, so this
+    is cheap (reads a few header lines, not the point data).
+    """
+    n = 0
+    while True:
+        raw = fp.readline()
+        if not raw:
+            break
+        line = raw.decode("ascii").rstrip("\r\n")
+        if line.startswith("element vertex "):
+            n = int(line.split()[-1])
+        if line == "end_header":
+            break
+    return n
+
+
+def _ply_header(count_vertices: int) -> str:
+    """Binary little-endian PLY header for the dense point-cloud layout."""
+    return (
         "ply\n"
         "format binary_little_endian 1.0\n"
-        f"element vertex {len(points)}\n"
+        f"element vertex {count_vertices}\n"
         "property float x\n"
         "property float y\n"
         "property float z\n"
@@ -1123,22 +1137,168 @@ def point_cloud_to_ply(
         "property uchar class\n"
         "end_header\n"
     )
-    fp.write(header.encode("ascii"))
 
+
+def pack_point_cloud_rows(
+    points: NDArray,
+    normals: NDArray,
+    colors: NDArray,
+    labels: NDArray,
+) -> bytes:
+    """Pack a point cloud into the 28-byte/row binary PLY body layout.
+
+    Each row is 6 floats (xyz + nxnynz) + 4 uint8 (rgb + class).  Returns
+    the raw body bytes (no header).
+    """
     n = len(points)
     if n == 0:
-        return
+        return b""
     pts = np.asarray(points, dtype="<f4")
     nrm = np.asarray(normals, dtype="<f4")
     col = np.asarray(colors, dtype=np.uint8)
     lbl = np.asarray(labels, dtype=np.uint8).reshape(n, 1)
-    # Pack each row: 6 floats (xyz + nxnynz) + 4 bytes (rgb + class)
     row_buf = np.empty(n, dtype=np.dtype([("f", "<f4", 6), ("c", "u1", 4)]))
     row_buf["f"][:, :3] = pts
     row_buf["f"][:, 3:] = nrm
     row_buf["c"][:, :3] = col
     row_buf["c"][:, 3:] = lbl
-    fp.write(row_buf.tobytes())
+    return row_buf.tobytes()
+
+
+def point_cloud_to_ply(
+    points: NDArray,
+    normals: NDArray,
+    colors: NDArray,
+    labels: NDArray,
+    fp: BinaryIO,
+) -> None:
+    fp.write(_ply_header(len(points)).encode("ascii"))
+    if len(points) == 0:
+        return
+    fp.write(pack_point_cloud_rows(points, normals, colors, labels))
+
+
+# ── Triangle mesh PLY (vertices xyz+normal+rgb, faces = uchar/int list) ──
+# Binary vertex record: 6 float32 (xyz + nxnynz) + 3 uint8 (rgb) = 27 bytes.
+_MESH_VERTEX_DT: np.dtype = np.dtype([("f", "<f4", 6), ("c", "u1", 3)])
+# Binary face record: 1 uint8 (count = 3) + 3 int32 (vertex indices) = 13 bytes.
+_MESH_FACE_DT: np.dtype = np.dtype([("n", "u1"), ("idx", "<i4", 3)])
+
+
+def mesh_ply_header(n_vertices: int, n_faces: int) -> str:
+    """Binary little-endian PLY header for the dense triangle mesh layout."""
+    return (
+        "ply\n"
+        "format binary_little_endian 1.0\n"
+        f"element vertex {n_vertices}\n"
+        "property float x\n"
+        "property float y\n"
+        "property float z\n"
+        "property float nx\n"
+        "property float ny\n"
+        "property float nz\n"
+        "property uchar red\n"
+        "property uchar green\n"
+        "property uchar blue\n"
+        f"element face {n_faces}\n"
+        "property list uchar int vertex_indices\n"
+        "end_header\n"
+    )
+
+
+def pack_mesh_vertex_rows(
+    vertices: NDArray, normals: NDArray, colors: NDArray
+) -> bytes:
+    """Pack mesh vertices into the 27-byte/row binary PLY body (no header)."""
+    n = len(vertices)
+    if n == 0:
+        return b""
+    rows = np.empty(n, dtype=_MESH_VERTEX_DT)
+    rows["f"][:, :3] = np.asarray(vertices, dtype="<f4")
+    rows["f"][:, 3:] = np.asarray(normals, dtype="<f4")
+    rows["c"][:, :3] = np.asarray(colors, dtype=np.uint8)
+    return rows.tobytes()
+
+
+def pack_mesh_face_rows(faces: NDArray, index_offset: int = 0) -> bytes:
+    """Pack triangle faces into the 13-byte/row binary PLY body (no header).
+
+    ``index_offset`` is added to every vertex index — used when concatenating
+    several per-cluster meshes whose vertices are stacked into one buffer.
+    """
+    m = len(faces)
+    if m == 0:
+        return b""
+    rows = np.empty(m, dtype=_MESH_FACE_DT)
+    rows["n"] = 3
+    rows["idx"] = np.asarray(faces, dtype="<i4") + np.int32(index_offset)
+    return rows.tobytes()
+
+
+def read_mesh_ply_counts(fp: BinaryIO) -> Tuple[int, int]:
+    """Read only the header of a mesh PLY and return (n_vertices, n_faces).
+
+    Leaves the stream positioned at the start of the binary body.
+    """
+    n_v = 0
+    n_f = 0
+    while True:
+        raw = fp.readline()
+        if not raw:
+            break
+        line = raw.decode("ascii").rstrip("\r\n")
+        if line.startswith("element vertex "):
+            n_v = int(line.split()[-1])
+        elif line.startswith("element face "):
+            n_f = int(line.split()[-1])
+        if line == "end_header":
+            break
+    return n_v, n_f
+
+
+def load_mesh_from_ply(
+    fp: BinaryIO,
+) -> Tuple[NDArray, NDArray, NDArray, NDArray]:
+    """Load a binary mesh PLY written by ``mesh_to_ply``.
+
+    Returns ``(vertices, normals, colors, faces)`` where faces is an M×3 int32
+    array of vertex indices.  Assumes the exact layout of ``mesh_ply_header``.
+    """
+    n_v, n_f = read_mesh_ply_counts(fp)
+    if n_v == 0:
+        return (
+            np.zeros((0, 3), dtype=np.float32),
+            np.zeros((0, 3), dtype=np.float32),
+            np.zeros((0, 3), dtype=np.uint8),
+            np.zeros((0, 3), dtype=np.int32),
+        )
+    vbuf = fp.read(n_v * _MESH_VERTEX_DT.itemsize)
+    vrows = np.frombuffer(vbuf, dtype=_MESH_VERTEX_DT, count=n_v)
+    vertices = vrows["f"][:, :3].astype(np.float32)
+    normals = vrows["f"][:, 3:].astype(np.float32)
+    colors = vrows["c"][:, :3].astype(np.uint8)
+    if n_f == 0:
+        faces = np.zeros((0, 3), dtype=np.int32)
+    else:
+        fbuf = fp.read(n_f * _MESH_FACE_DT.itemsize)
+        frows = np.frombuffer(fbuf, dtype=_MESH_FACE_DT, count=n_f)
+        faces = frows["idx"].astype(np.int32)
+    return vertices, normals, colors, faces
+
+
+def mesh_to_ply(
+    vertices: NDArray,
+    normals: NDArray,
+    colors: NDArray,
+    faces: NDArray,
+    fp: BinaryIO,
+) -> None:
+    """Write a binary triangle mesh PLY (xyz+normal+rgb vertices, tri faces)."""
+    fp.write(mesh_ply_header(len(vertices), len(faces)).encode("ascii"))
+    if len(vertices) == 0:
+        return
+    fp.write(pack_mesh_vertex_rows(vertices, normals, colors))
+    fp.write(pack_mesh_face_rows(faces))
 
 
 # Filesystem interaction methods

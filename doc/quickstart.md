@@ -33,7 +33,7 @@ When done, exit with Ctrl+d. The model will be available in the `data/` director
 A web-based viewer is included. Start it with:
 
 ```bash
-python viewer/server.py path/to/dataset
+python viewer/server.py -d path/to/dataset
 ```
 
 ## Dense Point Clouds
@@ -42,10 +42,13 @@ For a denser point cloud:
 
 ```bash
 bin/opensfm undistort data/berlin
+bin/opensfm dense_clustering data/berlin
 bin/opensfm compute_depthmaps data/berlin
+bin/opensfm fuse_depthmaps data/berlin
+bin/opensfm dense_merging data/berlin
 ```
 
-This runs dense multiview stereo and produces a denser point cloud at `data/berlin/undistorted/depthmaps/merged.ply`. Visualize it with [MeshLab](http://www.meshlab.net/) or any viewer supporting [PLY](http://paulbourke.net/dataformats/ply/) files.
+This runs dense multi-view stereo and produces a dense point cloud at `data/berlin/undistorted/depthmaps/fused.ply` (along with a `mesh.ply`, a DSM and an orthophoto). Visualize the cloud with [MeshLab](http://www.meshlab.net/) or any viewer supporting [PLY](http://paulbourke.net/dataformats/ply/) files.
 
 ## Reconstructing Your Own Images
 
