@@ -544,6 +544,35 @@ class OpenSfMConfig:
     octree_max_bucket_points: int = 8_000_000
 
     ##################################
+    # Params for Dense Colour Equalization (per-image exposure + white balance + vignetting)
+    ##################################
+    # Apply the saved per-image equalization to the source colour images during the dense colour bake (ortho + point cloud + mesh) when an equalization.json is present.
+    equalize_apply_in_bake: bool = True
+    # Highlight protection: the correction rolls off toward identity as the corrected luminance rises above this knee, so a brightening gain cannot "burn" already-bright regions (concrete, sky) to flat white. Lower protects more highlights; 255 disables (pure multiply, may clip).
+    equalize_highlight_knee: float = 235.0
+    # Number of radial vignetting coefficients (basis rho^2, rho^4, ...).
+    equalize_vignette_order: int = 2
+    # A track must be seen by at least this many reconstructed images to be used (fewer couples no images).
+    equalize_min_track_length: int = 3
+    # Cap on the number of observations fed to the solver (whole tracks are subsampled, deterministically, beyond it) — bounds memory/time on huge scenes.
+    equalize_max_observations: int = 4000000
+    # Drop measurements within this many levels of 0/255 (clipped → unreliable in log).
+    equalize_saturation_margin: float = 2.0
+    # IRLS (Huber) reweighting iterations for robustness to specular/moving outliers.
+    equalize_irls_iterations: int = 5
+    # Huber transition, in robust-sigma units (residuals beyond this are down-weighted).
+    equalize_huber_delta: float = 2.0
+    # Ridge on the vignetting coefficients (prior toward a flat lens; stabilises images with few high-radius observations).
+    equalize_vignette_regularization: float = 0.1
+    # Tiny ridge on the per-image gains (conditioning only).
+    equalize_gain_regularization: float = 0.001
+    # Soft weight enforcing sum(log-gain)=0 — fixes the global scale gauge and keeps the mean brightness unchanged.
+    equalize_gauge_weight: float = 1.0
+    # PCG (conjugate-gradient) solver tolerance and iteration cap per IRLS step.
+    equalize_pcg_tol: float = 0.000001
+    equalize_pcg_max_iterations: int = 2000
+
+    ##################################
     # Params for DSM (Digital Surface Model)and ortho generation
     ##################################
     # Controls DSM + ortho rendering.
@@ -570,6 +599,12 @@ class OpenSfMConfig:
     ortho_bake_irls_iterations: int = 5
     # Per-view horizon occlusion for hole-filled (interpolated) ortho cells: the bake marches the full DSM from each cell toward the camera and drops views blocked by a taller surface (roof)
     ortho_bake_dsm_occlusion: bool = True
+    # Detail injection: recover the texture the multi-view blend low-passes away, without reintroducing seams.
+    ortho_detail_injection: bool = True
+    # Detail injection: Gaussian sigma (ortho pixels) splitting low/high bands.
+    ortho_detail_sigma: float = 2.0
+    # Detail injection: amount of high-pass added back (1.0 = full detail; >1 over-sharpens, <1 is gentler).
+    ortho_detail_strength: float = 1.0
     # Gated 3x3 median despeckle of the baked ortho: a pixel is replaced by the local median only when it differs from it by more than this
     ortho_median_threshold: float = 24.0
     # DSM Post-process hole filling : a hole's connected component is "tiny" when it has <= hole_fill_small_area_max cells

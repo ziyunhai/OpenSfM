@@ -1689,6 +1689,14 @@ float3 linear_to_srgb(float3 c) {
 // occlusion_margin: absolute world-space depth tolerance (e.g. 3*voxel).
 // n_final:     number of sharpest inlier views to blend (1 or 2).
 // irls_iters:  Tukey reweighting iterations for the consensus (e.g. 3).
+//
+// out_sharp (emit_sharp != 0): in addition to the smooth blend, write per cell
+//   the RAW colour of the SINGLE sharpest (highest-resolution) inlier view.  The
+//   host high-passes this and adds it back onto the blend (detail injection):
+//   the blend supplies smooth, seam-free LOW frequencies (colour/exposure) and
+//   this supplies crisp HIGH frequencies (texture).  Because exposure lives in
+//   the low band, the single-source patchiness of out_sharp is removed by the
+//   high-pass and never appears.  Still robust — it is an INLIER (Tukey-gated).
 // =====================================================================
 // Min nadir-ness (cos of view angle from vertical) for a view to colour an
 // interpolated (relaxed) cell.  0.7 ~= within 45deg of nadir.  Higher = stricter
@@ -1722,7 +1730,9 @@ __kernel void svo_bake_colors(
     float                    dsm_gsd,           // metres per cell
     int                      dsm_w,
     int                      dsm_h,
-    float                    dsm_max_z)         // global max DSM height (march early-out)
+    float                    dsm_max_z,         // global max DSM height (march early-out)
+    __global uchar*          out_sharp,         // M × 3 RGB: sharpest single inlier's colour
+    int                      emit_sharp)        // write out_sharp? (detail injection)
 {
     uint gid = get_global_id(0);
     if (gid >= (uint)n_points) return;   // dispatch is padded to 256
@@ -1882,14 +1892,27 @@ __kernel void svo_bake_colors(
         out_colors[gid * 3 + 0] = 0;
         out_colors[gid * 3 + 1] = 0;
         out_colors[gid * 3 + 2] = 0;
+        if (emit_sharp) {
+            out_sharp[gid * 3 + 0] = 0;
+            out_sharp[gid * 3 + 1] = 0;
+            out_sharp[gid * 3 + 2] = 0;
+        }
         return;
     }
 
     // Single observation: nothing to robustify or select — emit it directly.
     if (n_valid == 1) {
-        out_colors[gid * 3 + 0] = (uchar)clamp(obs_r[0] * 255.0f, 0.0f, 255.0f);
-        out_colors[gid * 3 + 1] = (uchar)clamp(obs_g[0] * 255.0f, 0.0f, 255.0f);
-        out_colors[gid * 3 + 2] = (uchar)clamp(obs_b[0] * 255.0f, 0.0f, 255.0f);
+        uchar c0r = (uchar)clamp(obs_r[0] * 255.0f, 0.0f, 255.0f);
+        uchar c0g = (uchar)clamp(obs_g[0] * 255.0f, 0.0f, 255.0f);
+        uchar c0b = (uchar)clamp(obs_b[0] * 255.0f, 0.0f, 255.0f);
+        out_colors[gid * 3 + 0] = c0r;
+        out_colors[gid * 3 + 1] = c0g;
+        out_colors[gid * 3 + 2] = c0b;
+        if (emit_sharp) {  // the lone view is also the sharpest inlier
+            out_sharp[gid * 3 + 0] = c0r;
+            out_sharp[gid * 3 + 1] = c0g;
+            out_sharp[gid * 3 + 2] = c0b;
+        }
         return;
     }
 
@@ -1989,6 +2012,11 @@ __kernel void svo_bake_colors(
 
     float3 out_lin = (float3)(0.0f, 0.0f, 0.0f);
     float wsum = 0.0f;
+    // Sharpest single inlier (highest resolution among consensus inliers): its
+    // RAW colour is the detail-injection source.  Fall back to the consensus
+    // colour if somehow no inlier survives.
+    float  sharp_res = -1.0f;
+    float3 sharp_c   = (float3)(mu_r, mu_g, mu_b);
     for (int i = 0; i < n_valid; i++) {
         float dr = obs_r[i] - mu_r;
         float dg = obs_g[i] - mu_g;
@@ -2000,6 +2028,10 @@ __kernel void svo_bake_colors(
         float w      = obs_w[i] * robust * pow(rn, SHARP);
         out_lin += srgb_to_linear((float3)(obs_r[i], obs_g[i], obs_b[i])) * w;
         wsum    += w;
+        if (obs_res[i] > sharp_res) {
+            sharp_res = obs_res[i];
+            sharp_c   = (float3)(obs_r[i], obs_g[i], obs_b[i]);
+        }
     }
 
     if (wsum > 1e-8f) {
@@ -2013,6 +2045,11 @@ __kernel void svo_bake_colors(
     out_colors[gid * 3 + 0] = (uchar)clamp(out_srgb.x, 0.0f, 255.0f);
     out_colors[gid * 3 + 1] = (uchar)clamp(out_srgb.y, 0.0f, 255.0f);
     out_colors[gid * 3 + 2] = (uchar)clamp(out_srgb.z, 0.0f, 255.0f);
+    if (emit_sharp) {
+        out_sharp[gid * 3 + 0] = (uchar)clamp(sharp_c.x * 255.0f, 0.0f, 255.0f);
+        out_sharp[gid * 3 + 1] = (uchar)clamp(sharp_c.y * 255.0f, 0.0f, 255.0f);
+        out_sharp[gid * 3 + 2] = (uchar)clamp(sharp_c.z * 255.0f, 0.0f, 255.0f);
+    }
 }
 
 // =====================================================================

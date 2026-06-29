@@ -1371,7 +1371,8 @@ void SVOIntegratorCL::BakeColors(const std::vector<Vec3f>& points,
                                  const std::vector<float>* dsm_occ, int dsm_w,
                                  int dsm_h, float dsm_origin_x,
                                  float dsm_origin_y, float dsm_gsd,
-                                 float dsm_max_z) {
+                                 float dsm_max_z,
+                                 std::vector<uint8_t>* out_sharp) {
   if (!refine_prepared_) {
     throw std::runtime_error(
         "SVOIntegratorCL::BakeColors: PrepareRefinement() not called");
@@ -1433,6 +1434,13 @@ void SVOIntegratorCL::BakeColors(const std::vector<Vec3f>& points,
   cl::Buffer cl_out(ctx, CL_MEM_WRITE_ONLY, color_bytes, nullptr, &err);
   opencl::CheckCL(err, "bake output buffer");
 
+  // Optional sharpest-inlier colour buffer (detail injection).  Dummy 1-byte
+  // when disabled so the kernel arg stays bound.
+  const bool emit_sharp = out_sharp != nullptr;
+  cl::Buffer cl_sharp(ctx, CL_MEM_WRITE_ONLY, emit_sharp ? color_bytes : 1,
+                      nullptr, &err);
+  opencl::CheckCL(err, "bake sharp output buffer");
+
   // Use clean depth maps for occlusion check in color baking.
   // Clean depths represent the front-most surface each camera actually
   // observed — guaranteed correct for occlusion without re-raycasting.
@@ -1466,6 +1474,8 @@ void SVOIntegratorCL::BakeColors(const std::vector<Vec3f>& points,
     k_bake_colors_.setArg(arg++, static_cast<cl_int>(dsm_w));
     k_bake_colors_.setArg(arg++, static_cast<cl_int>(dsm_h));
     k_bake_colors_.setArg(arg++, dsm_max_z);
+    k_bake_colors_.setArg(arg++, cl_sharp);
+    k_bake_colors_.setArg(arg++, static_cast<cl_int>(emit_sharp ? 1 : 0));
 
     const size_t global = ((M + 255) / 256) * 256;
     queue.enqueueNDRangeKernel(k_bake_colors_, cl::NullRange,
@@ -1476,6 +1486,12 @@ void SVOIntegratorCL::BakeColors(const std::vector<Vec3f>& points,
   // Read back colors.
   out_colors->resize(M);
   queue.enqueueReadBuffer(cl_out, CL_TRUE, 0, color_bytes, out_colors->data());
+
+  if (emit_sharp) {
+    out_sharp->resize(color_bytes);
+    queue.enqueueReadBuffer(cl_sharp, CL_TRUE, 0, color_bytes,
+                            out_sharp->data());
+  }
 
   // Release all refinement resources.
   cl_color_images_ = cl::Image2DArray();

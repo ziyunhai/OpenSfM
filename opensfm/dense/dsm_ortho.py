@@ -10,6 +10,7 @@ despeckle, and DSM-derived point normals.
 import logging
 from typing import Any, Dict, Optional, Tuple
 
+import cv2
 import numpy as np
 from numpy.typing import NDArray
 from scipy import ndimage
@@ -549,6 +550,49 @@ def _fill_ortho_holes(
         large_fill="inpaint",  # smooth fast-march fill, no Delaunay fan streaks
     )
     return np.clip(filled, 0, 255).astype(ortho_grid.dtype)
+
+
+def _inject_ortho_detail(
+    ortho_grid: NDArray,
+    sharp_grid: NDArray,
+    baked_mask: NDArray,
+    config: Dict[str, Any],
+) -> NDArray:
+    """Add the single-sharpest-view's high-frequency texture back onto the blend.
+
+    The multi-view colour bake gives a SMOOTH, robust, seam-free blend
+    (``ortho_grid``) but low-passes texture; ``sharp_grid`` holds, per cell, the
+    raw colour of the single sharpest inlier view (full detail but, taken alone,
+    patchy where the chosen view changes — a LOW-frequency exposure/colour step).
+    We composite the two by frequency band:
+
+        final = blend + strength * (sharp - lowpass(sharp))
+
+    The high-pass ``sharp - lowpass(sharp)`` carries texture but not exposure, so
+    the sharp view's single-source patchiness (all low-frequency) is removed and
+    never appears — only its detail is injected.  The low-pass is a *masked*
+    Gaussian (normalised by the blurred coverage mask) so no-data borders do not
+    bleed dark halos into the detail.  Only ``baked_mask`` cells are touched.
+    """
+    sigma = float(config["ortho_detail_sigma"])
+    strength = float(config["ortho_detail_strength"])
+    if sigma <= 0.0 or strength <= 0.0 or not baked_mask.any():
+        return ortho_grid
+
+    m = baked_mask.astype(np.float32)
+    s = sharp_grid.astype(np.float32)
+    # Masked Gaussian low-pass: blur(sharp*mask) / blur(mask) keeps the average
+    # anchored to real colour, so cells near the no-data boundary are not pulled
+    # toward black (which would inject a bright false-edge halo).
+    blur_s = cv2.GaussianBlur(s * m[..., None], (0, 0), sigma)
+    blur_m = cv2.GaussianBlur(m, (0, 0), sigma)
+    low = blur_s / np.maximum(blur_m, 1e-6)[..., None]
+    high = s - low  # high-frequency texture (exposure-free)
+
+    out = ortho_grid.astype(np.float32) + strength * high
+    out = np.clip(out, 0.0, 255.0).astype(ortho_grid.dtype)
+    # Only inject where a real sharp source exists; elsewhere keep the blend.
+    return np.where(baked_mask[..., None], out, ortho_grid)
 
 
 def _ortho_gated_median(

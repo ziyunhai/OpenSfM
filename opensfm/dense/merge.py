@@ -48,7 +48,7 @@ def merge_fusion_batches(
     def _batch_file(batch_num: int) -> str:
         return f"fused_batch_{batch_num:04d}.ply"
 
-    delete_batches = data.config.get("depthmap_delete_fusion_batches", True)
+    delete_batches = data.config["depthmap_delete_fusion_batches"]
 
     fused_exists = data.io_handler.isfile(data.point_cloud_file("fused.ply"))
     present = [
@@ -226,7 +226,7 @@ def merge_dsm_ortho_batches(
     _, _, _, _, (gh, gw), (origin_x, origin_y, gsd), _ = \
         data.load_dsm_ortho_batch(present[0])
 
-    feather = data.config.get("dsm_merge_feather", True)
+    feather = data.config["dsm_merge_feather"]
 
     # Metadata pass: each tile's window offset + shape (one decompress each,
     # pixel data discarded), so the band loop below knows which tiles touch
@@ -246,7 +246,7 @@ def merge_dsm_ortho_batches(
     # Band height bounded by the RAM budget: each band holds accumulators of
     # band_rows × gw.  Feather keeps TWO tiers (real + fill), each w + h + RGB
     # ≈ 20 B/cell → ~40 B/cell plus outputs/flips.
-    max_ram = int(data.config.get("dsm_merge_max_ram_mb", 512)) * (1 << 20)
+    max_ram = int(data.config["dsm_merge_max_ram_mb"]) * (1 << 20)
     band_rows = max(1, min(int(gh), max(64, max_ram // max(1, gw * 50))))
 
     def fill_band(rs: int, re_: int) -> Tuple[NDArray, NDArray]:
@@ -340,7 +340,7 @@ def merge_dsm_ortho_batches(
         f"{crs_msg}"
     )
 
-    if data.config.get("depthmap_delete_geotiff_batches", True):
+    if data.config["depthmap_delete_geotiff_batches"]:
         for bn in present:
             data.io_handler.rm_if_exist(data.dsm_ortho_batch_file(bn))
         logger.info(f"Removed {len(present)} merged DSM/ortho tile(s)")
@@ -366,9 +366,9 @@ def export_pointcloud_formats(
     aborting the pipeline.
     """
     formats = []
-    if config.get("dense_pointcloud_export_las", False):
+    if config["dense_pointcloud_export_las"]:
         formats.append("las")
-    if config.get("dense_pointcloud_export_laz", False):
+    if config["dense_pointcloud_export_laz"]:
         formats.append("laz")
     if not formats:
         return
@@ -473,13 +473,9 @@ def export_octree_tiles(
     # Configure the builder.
     builder_config = pypointcloud.OctreeBuilderConfig()
     builder_config.output_dir = output_dir
-    builder_config.max_points_per_tile = config.get(
-        "octree_max_points_per_tile", 50000
-    )
-    builder_config.max_depth = config.get("octree_max_depth", 15)
-    builder_config.lod_sample_count = config.get(
-        "octree_lod_sample_count", 10000
-    )
+    builder_config.max_points_per_tile = config["octree_max_points_per_tile"]
+    builder_config.max_depth = config["octree_max_depth"]
+    builder_config.lod_sample_count = config["octree_lod_sample_count"]
 
     # Out-of-core build: the PLY is memory-mapped and processed in bounded RAM
     # (independent of the point count), so multi-gigabyte clouds never need to
@@ -487,8 +483,8 @@ def export_octree_tiles(
     meta = pypointcloud.build_octree_from_file(
         cloud_path=ply_path,
         config=builder_config,
-        split_depth=config.get("octree_split_depth", 4),
-        max_bucket_points=config.get("octree_max_bucket_points", 8_000_000),
+        split_depth=config["octree_split_depth"],
+        max_bucket_points=config["octree_max_bucket_points"],
         temp_dir=os.path.join(output_dir, "_ooc_tmp"),
     )
 

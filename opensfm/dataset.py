@@ -961,6 +961,22 @@ class UndistortedDataSet:
             smask = self.load_undistorted_segmentation_mask(image)
         return masking.combine_masks(mask, smask)
 
+    def equalization_file(self) -> str:
+        return os.path.join(self.data_path, "equalization.json")
+
+    def equalization_exists(self) -> bool:
+        return self.io_handler.isfile(self.equalization_file())
+
+    def load_equalization(self) -> Dict[str, Any]:
+        """Per-image radiometric corrections produced by ``dense_equalize``:
+        ``{shot_id: {gain, vignette, pp, rmax, vignette_order}}``."""
+        with self.io_handler.open_rt(self.equalization_file()) as fin:
+            return io.json_load(fin)
+
+    def save_equalization(self, equalization: Dict[str, Any]) -> None:
+        with self.io_handler.open_wt(self.equalization_file()) as fout:
+            io.json_dump(equalization, fout)
+
     def clusters_file(self) -> str:
         return os.path.join(self.data_path, "clusters.json")
 

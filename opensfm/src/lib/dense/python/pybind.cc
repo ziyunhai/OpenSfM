@@ -59,7 +59,7 @@ PYBIND11_MODULE(pydense, m) {
            py::arg("irls_iters") = 3, py::arg("relax_occlusion") = py::none(),
            py::arg("dsm_occ") = py::none(), py::arg("dsm_origin_x") = 0.0f,
            py::arg("dsm_origin_y") = 0.0f, py::arg("dsm_gsd") = 0.0f,
-           py::arg("dsm_max_z") = 0.0f);
+           py::arg("dsm_max_z") = 0.0f, py::arg("with_sharp") = false);
 
   py::class_<dense::DepthmapClusterEstimatorWrapper>(m,
                                                      "DepthmapClusterEstimator")

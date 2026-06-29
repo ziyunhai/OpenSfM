@@ -184,6 +184,9 @@ class SVOIntegratorCL {
   // depth-validity mask is skipped (interpolated filled-DSM cells).
   // |dsm_occ| (+ geo-ref): optional DSM heightfield (row-major dsm_h*dsm_w,
   // NaN = nodata) for per-view horizon occlusion of the relaxed (filled) cells.
+  // |out_sharp| (optional): if non-null, also receives M*3 uint8 RGB — the raw
+  // colour of the single sharpest inlier view per point, for host-side detail
+  // injection (high-pass added back onto the blend).
   void BakeColors(const std::vector<Vec3f>& points,
                   const std::vector<Vec3f>& normals,
                   std::vector<Vec3<uint8_t>>* out_colors, int n_final = 2,
@@ -192,7 +195,8 @@ class SVOIntegratorCL {
                   const std::vector<float>* dsm_occ = nullptr, int dsm_w = 0,
                   int dsm_h = 0, float dsm_origin_x = 0.0f,
                   float dsm_origin_y = 0.0f, float dsm_gsd = 0.0f,
-                  float dsm_max_z = 0.0f);
+                  float dsm_max_z = 0.0f,
+                  std::vector<uint8_t>* out_sharp = nullptr);
 
   // Free the refinement working set (color/depth image arrays, camera array,
   // grad/adam scratch) while keeping the hash table (cl_table_/capacity_)

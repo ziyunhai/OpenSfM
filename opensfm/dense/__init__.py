@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, Tuple
 from opensfm import context, pymap, pysfm, types
 from opensfm.dataset import UndistortedDataSet
 
-from . import clustering, depthmaps, fusion, merge
+from . import clustering, depthmaps, equalize, fusion, merge
 from .common import compute_depth_range, depthmap_to_ply, scale_down_image
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -30,11 +30,31 @@ logger: logging.Logger = logging.getLogger(__name__)
 __all__ = [
     "run_clustering",
     "run_depthmaps",
+    "run_equalize",
     "run_fusion",
     "run_merge",
     "depthmap_to_ply",
     "scale_down_image",
 ]
+
+
+def run_equalize(
+    data: UndistortedDataSet,
+    tracks_manager: pymap.TracksManager,
+    reconstruction: types.Reconstruction,
+) -> None:
+    """Estimate per-image radiometric corrections (gain + vignetting) from the
+    SfM track correspondences and persist them for the colour bake."""
+    context.log_memory("dense equalize start")
+    corrections = equalize.estimate_image_corrections(
+        tracks_manager, reconstruction, data.config
+    )
+    data.save_equalization(corrections)
+    logger.info(
+        "Equalization saved for %d image(s) → %s",
+        len(corrections), data.equalization_file(),
+    )
+    context.log_memory("dense equalize done")
 
 
 # ═══════════════════════════════════════════════════════════════════════

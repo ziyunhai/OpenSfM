@@ -1,12 +1,16 @@
 # pyre-strict
 from pathlib import Path
+import pytest
 
 import numpy as np
-from opensfm import dense, io, pygeometry, types
+from opensfm import dense, io, pygeometry, pymap, types, pydense
+from opensfm.config import default_config
+from opensfm.dense.equalize import estimate_image_corrections, apply_equalization
 from opensfm.dataset import UndistortedDataSet
 from opensfm.dense.dsm_ortho import (
     _dsm_footprint,
     _fill_holes_2pass,
+    _inject_ortho_detail,
     _smooth_fill_components,
 )
 from opensfm.dense.fusion import (
@@ -105,7 +109,8 @@ def test_list_batch_indices_discovers_gaps_and_skips_debug(tmp_path: Path) -> No
         (tmp_path / name).write_text("")
     s = _StubDataset(str(tmp_path))
     fused = UndistortedDataSet.list_batch_indices(s, "fused_batch_", ".ply")
-    assert fused == [0, 2]                          # gap preserved, debug skipped
+    # gap preserved, debug skipped
+    assert fused == [0, 2]
     assert UndistortedDataSet.list_batch_indices(
         s, "mesh_batch_", ".ply") == [0]
     assert UndistortedDataSet.list_batch_indices(
@@ -114,7 +119,8 @@ def test_list_batch_indices_discovers_gaps_and_skips_debug(tmp_path: Path) -> No
 
 def test_list_batch_indices_missing_folder_is_empty() -> None:
     s = _StubDataset("/no/such/depthmap/path")
-    assert UndistortedDataSet.list_batch_indices(s, "fused_batch_", ".ply") == []
+    assert UndistortedDataSet.list_batch_indices(
+        s, "fused_batch_", ".ply") == []
 
 
 def test_assign_footprint_holes_assigns_enclosed_gap() -> None:
@@ -304,14 +310,17 @@ def test_select_chunk_views_coverage_before_quality() -> None:
     }
     weighted = ["A", "B", "D", "C"]  # weight desc; C is worst
 
-    views, n_unc = _select_chunk_views(cpk, weighted, view_ukey, origin, span, 2)
+    views, n_unc = _select_chunk_views(
+        cpk, weighted, view_ukey, origin, span, 2)
     assert "C" in views and n_unc == 0  # sole observer of 4,5 kept
 
-    views, n_unc = _select_chunk_views(cpk, weighted, view_ukey, origin, span, 4)
+    views, n_unc = _select_chunk_views(
+        cpk, weighted, view_ukey, origin, span, 4)
     assert set(views) == {"A", "B", "C", "D"} and n_unc == 0
     assert views[0] == "A" and views[1] == "C"  # coverage picks come first
 
-    views, n_unc = _select_chunk_views(cpk, weighted, view_ukey, origin, span, 1)
+    views, n_unc = _select_chunk_views(
+        cpk, weighted, view_ukey, origin, span, 1)
     assert views == ["A"] and n_unc == 2  # budget-limited, reported
 
 
@@ -385,10 +394,289 @@ def test_dilate_core_xy_zero_margin_is_core_only() -> None:
 def test_kdtree_chunk_labels_separates_far_blobs() -> None:
     # Two compact blobs far apart; with a budget that fits each, the split keeps
     # each blob whole and in its own chunk (spatially coherent, not scattered).
-    a = np.array([(x, y, 0) for x in range(5) for y in range(5)], dtype=np.int32)
+    a = np.array([(x, y, 0) for x in range(5)
+                 for y in range(5)], dtype=np.int32)
     b = a + np.array([1000, 0, 0], dtype=np.int32)
     cells = np.vstack([a, b])
     labels = _kdtree_chunk_labels(cells, max_cells=25)
     assert len(set(labels[:25].tolist())) == 1   # blob A is one chunk
     assert len(set(labels[25:].tolist())) == 1   # blob B is one chunk
     assert labels[0] != labels[25]               # different chunks
+
+
+# ── Radiometric equalization (dense.equalize) ─────────────────────────────
+
+
+def _synthetic_equalize_scene(
+    n_shots: int, n_tracks: int, gains: "np.ndarray", vign: "np.ndarray",
+    width: int = 400, height: int = 300, seed: int = 0,
+) -> "tuple[types.Reconstruction, pymap.TracksManager, np.ndarray]":
+    """Build a reconstruction + tracks where each (shot, track) colour is exactly
+    ``albedo * gain_shot * vignette_shot(rho)`` for known per-shot gains/vignette
+    and known per-track albedos.  Returns (reconstruction, tracks, rmax)."""
+    rng = np.random.default_rng(seed)
+    rec = types.Reconstruction()
+    cam = pygeometry.Camera.create_perspective(0.8, 0.0, 0.0)
+    cam.id = "cam"
+    cam.width = width
+    cam.height = height
+    rec.add_camera(cam)
+    pose = pygeometry.Pose(np.zeros(3), np.zeros(3))
+    for i in range(n_shots):
+        rec.create_shot(f"shot_{i}", cam.id, pose)
+    rmax = 0.5 * np.sqrt(width ** 2 + height ** 2) / max(width, height)
+
+    albedos = rng.uniform(40.0, 200.0, size=(n_tracks, 3))
+    tm = pymap.TracksManager()
+    for t in range(n_tracks):
+        k = min(int(rng.integers(3, 6)), n_shots)
+        shots = rng.choice(n_shots, size=k, replace=False)
+        for i in shots:
+            rho = float(rng.uniform(0.0, 1.0))
+            theta = float(rng.uniform(0.0, 2.0 * np.pi))
+            pt = rho * rmax * np.array([np.cos(theta), np.sin(theta)])
+            v = np.exp(vign[i, :, 0] * rho ** 2 + vign[i, :, 1] * rho ** 4)
+            col = np.clip(albedos[t] * gains[i] * v, 1.0, 254.0)
+            ci = np.round(col).astype(int)
+            obs = pymap.Observation(
+                float(pt[0]), float(pt[1]), 0.01,
+                int(ci[0]), int(ci[1]), int(ci[2]), t)
+            tm.add_observation(f"shot_{i}", str(t), obs)
+    return rec, tm, rmax
+
+
+def test_equalize_recovers_per_image_gains() -> None:
+    # Known per-shot per-channel gains + vignetting baked into track colours must
+    # be recovered (up to the global scale gauge, so compare gain RATIOS between
+    # images, which are gauge-invariant).
+    n_shots = 6
+    rng = np.random.default_rng(1)
+    gains = rng.uniform(0.7, 1.4, size=(n_shots, 3))
+    vign = np.zeros((n_shots, 3, 2))  # no vignetting in this test
+    rec, tm, _ = _synthetic_equalize_scene(n_shots, 400, gains, vign)
+
+    corr = estimate_image_corrections(tm, rec, default_config())
+
+    g = np.array([corr[f"shot_{i}"]["gain"] for i in range(n_shots)])
+    # Gauge-invariant check: every pairwise gain ratio matches the truth.
+    for c in range(3):
+        for i in range(n_shots):
+            for j in range(i + 1, n_shots):
+                got = g[i, c] / g[j, c]
+                want = gains[i, c] / gains[j, c]
+                assert abs(got - want) < 0.05 * want, (
+                    f"gain ratio ch{c} {i}/{j}: {got:.3f} vs {want:.3f}")
+    # Gauge: geometric mean of recovered gains is ~1 per channel.
+    assert np.allclose(np.exp(np.log(g).mean(axis=0)), 1.0, atol=0.02)
+
+
+def test_equalize_recovers_vignetting() -> None:
+    # A radial darkening (negative log-coeffs) baked per image must be recovered
+    # in the vignette coefficients (these carry no gauge ambiguity).
+    n_shots = 4
+    gains = np.ones((n_shots, 3))
+    rng = np.random.default_rng(2)
+    vign = np.zeros((n_shots, 3, 2))
+    vign[:, :, 0] = rng.uniform(-0.35, -0.1, size=(n_shots, 3))  # rho^2 term
+    rec, tm, _ = _synthetic_equalize_scene(n_shots, 1000, gains, vign)
+
+    # Small ridge so the test checks unbiased recovery, not the regulariser.
+    cfg = default_config()
+    cfg["equalize_vignette_regularization"] = 0.02
+
+    corr = estimate_image_corrections(tm, rec, cfg)
+
+    for i in range(n_shots):
+        got = np.array(corr[f"shot_{i}"]["vignette"])  # (3, order)
+        assert np.allclose(got[:, 0], vign[i, :, 0], atol=0.05), (
+            f"shot {i} vignette rho^2: {got[:, 0]} vs {vign[i, :, 0]}")
+    # And edge darkening really is recovered (V(1) < 1).
+    g0 = np.array(corr["shot_0"]["vignette"])
+    assert float(np.exp(g0[:, 0].sum())) < 1.0
+
+
+def test_equalize_identity_when_no_mismatch() -> None:
+    # If every image already agrees (unit gain, no vignette), the correction is
+    # ~identity (gains ~1, vignette ~0).
+    n_shots = 5
+    gains = np.ones((n_shots, 3))
+    vign = np.zeros((n_shots, 3, 2))
+    rec, tm, _ = _synthetic_equalize_scene(n_shots, 300, gains, vign)
+
+    corr = estimate_image_corrections(tm, rec, default_config())
+
+    for i in range(n_shots):
+        assert np.allclose(corr[f"shot_{i}"]["gain"], 1.0, atol=0.03)
+        assert np.allclose(corr[f"shot_{i}"]["vignette"], 0.0, atol=0.03)
+
+
+def test_apply_equalization_flattens_known_falloff() -> None:
+    # Forward-apply a known gain + radial vignetting to a flat-albedo image, then
+    # apply_equalization with the matching correction must recover the flat
+    # albedo (gain divided out, vignette flattened across the frame).
+
+    w, h = 120, 90
+    albedo = 130.0
+    corr = {
+        "gain": [1.25, 1.0, 0.8],
+        "vignette": [[-0.30, 0.0], [-0.20, 0.0], [-0.12, 0.0]],
+        "pp": [0.0, 0.0],
+        "rmax": 0.5 * np.sqrt(w * w + h * h) / max(w, h),
+    }
+    # Build the "measured" image = albedo * gain * V(rho) (what the camera saw).
+    size = float(max(w, h))
+    xs = (np.arange(w) + 0.5 - 0.5 * w) / size
+    ys = (np.arange(h) + 0.5 - 0.5 * h) / size
+    rho2 = (xs[None, :] ** 2 + ys[:, None] ** 2) / corr["rmax"] ** 2
+    measured = np.zeros((h, w, 3), np.float32)
+    for c in range(3):
+        v = np.exp(corr["vignette"][c][0] * rho2)
+        measured[..., c] = albedo * corr["gain"][c] * v
+    measured_u8 = np.clip(measured, 0, 255).astype(np.uint8)
+
+    out = apply_equalization(measured_u8, corr)
+
+    assert out.dtype == np.uint8
+    # Flat and centred on the albedo (small spatial spread, no residual falloff).
+    for c in range(3):
+        assert abs(float(out[..., c].mean()) - albedo) < 3.0
+        assert float(out[..., c].std()) < 3.0
+    # Vignetting really was undone: corner is no longer darker than centre.
+    centre = out[h // 2, w // 2].astype(int)
+    corner = out[1, 1].astype(int)
+    assert abs(int(centre[0]) - int(corner[0])) <= 3
+
+
+def test_apply_equalization_preserves_highlights() -> None:
+    # A brightening gain (gain < 1) lifts midtones AND already-bright pixels; the
+    # highlight roll-off must keep the bright region ~as-is (no flat 255 burn)
+    # while the midtone still gets the full correction.
+    corr = {
+        "gain": [0.7, 0.7, 0.7],      # factor ~1.43 (brightening)
+        "vignette": [[0.0], [0.0], [0.0]],
+        "pp": [0.0, 0.0],
+        "rmax": 0.64,
+    }
+    img = np.zeros((10, 20, 3), np.uint8)
+    img[:, :10] = 120                 # midtone (well below knee)
+    img[:, 10:] = 248                 # near-white (would clip if multiplied)
+
+    out = apply_equalization(img, corr, highlight_knee=235.0)
+    mid = float(out[:, :10].mean())
+    bright = float(out[:, 10:].mean())
+    assert abs(mid - 120 / 0.7) < 4.0           # midtone fully corrected (~171)
+    assert bright < 252.0                       # NOT burned to flat white
+    assert abs(bright - 248.0) < 6.0            # ~kept its original value
+
+    # Disabling the roll-off (knee=255) burns the bright region to white.
+    burned = apply_equalization(img, corr, highlight_knee=255.0)
+    assert float(burned[:, 10:].mean()) > 254.0
+
+
+# ── Ortho detail injection (dsm_ortho._inject_ortho_detail) ───────────────
+
+
+def test_inject_ortho_detail_adds_texture_not_exposure_step() -> None:
+    # The sharp source carries BOTH high-frequency texture and a low-frequency
+    # exposure step (left half brighter — what a single-source switch looks
+    # like).  Detail injection must add the texture back onto the flat blend
+    # while the exposure step is high-passed away (does NOT appear) — that is the
+    # whole point: sharper, but no patchiness.
+    h, w = 64, 64
+    cfg = {"ortho_detail_sigma": 2.0, "ortho_detail_strength": 1.0}
+
+    blend = np.full((h, w, 3), 100, np.uint8)
+    yy, xx = np.mgrid[0:h, 0:w]
+    checker = (20 * ((xx + yy) % 2 == 0) - 10).astype(np.int16)  # ±10 hi-freq
+    # lo-freq step
+    step = np.where(xx < w // 2, 40, 0).astype(np.int16)
+    sharp1 = np.clip(100 + checker + step, 0, 255).astype(np.uint8)
+    sharp = np.repeat(sharp1[..., None], 3, axis=2)  # (h, w, 3)
+    baked = np.ones((h, w), bool)
+
+    out = _inject_ortho_detail(blend, sharp, baked, cfg).astype(np.int16)
+
+    # Texture injected: the checkerboard variance shows up in the output.
+    assert out[8:56, 8:56].std() > 5.0
+    # Exposure step removed: interior left vs right means match (no 40 step),
+    # sampling away from the central boundary where the step's own edge lives.
+    left = out[8:56, 8:24].mean()
+    right = out[8:56, 40:56].mean()
+    assert abs(
+        left - right) < 4.0, f"exposure step leaked: {left:.1f} vs {right:.1f}"
+    # And the base level still comes from the blend (~100), not sharp's 140.
+    assert abs(left - 100) < 4.0
+
+
+def test_inject_ortho_detail_leaves_unbaked_cells_untouched() -> None:
+    # Cells with no real bake (baked_mask False) must keep the blend exactly —
+    # no detail is invented where there is no sharp source.
+    h, w = 32, 32
+    cfg = {"ortho_detail_sigma": 2.0, "ortho_detail_strength": 1.0}
+    rng = np.random.default_rng(0)
+    blend = rng.integers(0, 255, (h, w, 3), dtype=np.uint8)
+    sharp = rng.integers(0, 255, (h, w, 3), dtype=np.uint8)
+    baked = np.ones((h, w), bool)
+    baked[:8, :] = False  # top strip unbaked
+
+    out = _inject_ortho_detail(blend, sharp, baked, cfg)
+    assert np.array_equal(out[:8, :], blend[:8, :])
+
+
+def test_inject_ortho_detail_disabled_is_identity() -> None:
+    blend = np.full((10, 10, 3), 120, np.uint8)
+    sharp = np.zeros((10, 10, 3), np.uint8)
+    baked = np.ones((10, 10), bool)
+    out = _inject_ortho_detail(
+        blend, sharp, baked,
+        {"ortho_detail_sigma": 0.0, "ortho_detail_strength": 1.0})
+    assert np.array_equal(out, blend)
+
+
+def test_bake_colors_sharp_returns_sharpest_inlier_color() -> None:
+    # GPU end-to-end: three nadir cameras at different heights; the SHARPEST
+    # (lowest camera, A) carries a slightly distinct but in-gate colour.
+    # bake_colors(with_sharp=True) must return A's RAW colour as the sharp source
+    # (not the blended/averaged colour).
+
+    if not pydense.SVOFuser.is_gpu_available():
+        pytest.skip("no GPU/OpenCL device for the SVO bake")
+
+    h = w = 64
+    f, cx, cy = 80.0, w / 2.0, h / 2.0
+    R = np.array([[1.0, 0, 0], [0, -1.0, 0], [0, 0, -1.0]])
+    color_a = (160, 90, 40)   # sharpest view (height 8)
+    color_bc = (150, 95, 45)  # the other two (in-gate, close to A)
+
+    fuser = pydense.SVOFuser()
+    fuser.set_voxel_size(0.05)
+    fuser.set_trunc_factor(4.0)
+    fuser.set_min_weight(0.0)
+    fuser.set_min_count(1)
+    fuser.set_device(0)
+    fuser.set_bbox(np.array([-2, -2, -1], np.float32),
+                   np.array([2, 2, 1], np.float32))
+    for height, col in [(8.0, color_a), (10.0, color_bc), (12.0, color_bc)]:
+        K = np.array([[f, 0, cx], [0, f, cy], [0, 0, 1.0]])
+        t = -R @ np.array([0.0, 0.0, height])
+        depth = np.full((h, w), height, dtype=np.float32)
+        normal = np.zeros((h, w, 3), np.float32)
+        normal[..., 2] = 1.0
+        cimg = np.zeros((h, w, 3), np.uint8)
+        cimg[:] = col
+        mask = np.full((h, w), 255, np.uint8)
+        fuser.add_view(K, R, t, depth, normal, cimg, mask)
+    fuser.count_voxels()
+    fuser.fuse_only()
+
+    pts = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
+    nrm = np.array([[0.0, 0.0, 1.0]], dtype=np.float32)
+    out = fuser.bake_colors(pts, nrm, n_final=3, irls_iters=3, with_sharp=True)
+
+    assert isinstance(out, tuple) and len(out) == 2
+    colors, sharp = out
+    assert sharp.shape == (1, 3)
+    # Sharp = A's RAW colour (sharpest inlier), NOT the blend of A/B/C.
+    assert np.all(np.abs(sharp[0].astype(int) - color_a) <= 2)
+    # The blend, by contrast, is pulled toward the B/C majority (not exactly A).
+    assert not np.array_equal(colors[0], np.array(color_a, np.uint8))

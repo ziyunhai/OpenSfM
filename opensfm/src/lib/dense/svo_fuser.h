@@ -97,6 +97,8 @@ class SVOFuser {
   // depth-validity mask is skipped (interpolated filled-DSM cells).
   // |dsm_occ| (+ geo-ref): optional DSM heightfield (row-major dsm_h*dsm_w,
   // NaN = nodata) for per-view horizon occlusion of the relaxed cells.
+  // |out_sharp| (optional): also receive the sharpest-inlier colour per point
+  // (M*3 uint8) for host-side detail injection.
   void BakeColors(std::vector<Vec3f>& points, std::vector<Vec3f>& normals,
                   std::vector<Vec3<uint8_t>>* colors, int n_final = 2,
                   int irls_iters = 3,
@@ -104,7 +106,8 @@ class SVOFuser {
                   const std::vector<float>* dsm_occ = nullptr, int dsm_w = 0,
                   int dsm_h = 0, float dsm_origin_x = 0.0f,
                   float dsm_origin_y = 0.0f, float dsm_gsd = 0.0f,
-                  float dsm_max_z = 0.0f);
+                  float dsm_max_z = 0.0f,
+                  std::vector<uint8_t>* out_sharp = nullptr);
 
   // Visibility-based pruning of the TSDF hash table.
   // Raycasts the hash table from each integrated view, compares with its

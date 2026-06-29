@@ -346,7 +346,8 @@ void SVOFuser::BakeColors(std::vector<Vec3f>& points,
                           const std::vector<uint8_t>* relax_occ,
                           const std::vector<float>* dsm_occ, int dsm_w,
                           int dsm_h, float dsm_origin_x, float dsm_origin_y,
-                          float dsm_gsd, float dsm_max_z) {
+                          float dsm_gsd, float dsm_max_z,
+                          std::vector<uint8_t>* out_sharp) {
   if (!integrator_) {
     throw std::runtime_error(
         "SVOFuser::BakeColors: Fuse() must be called first");
@@ -404,7 +405,7 @@ void SVOFuser::BakeColors(std::vector<Vec3f>& points,
   integrator_->PrepareRefinement(cameras, srcs, w0, h0, n_views);
   integrator_->BakeColors(points, normals, colors, n_final, irls_iters,
                           relax_occ, dsm_occ, dsm_w, dsm_h, dsm_origin_x,
-                          dsm_origin_y, dsm_gsd, dsm_max_z);
+                          dsm_origin_y, dsm_gsd, dsm_max_z, out_sharp);
 }
 
 void SVOFuser::PruneByVisibility(int iterations, float carve_margin,

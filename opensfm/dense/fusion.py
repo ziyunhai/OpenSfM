@@ -33,9 +33,11 @@ from .dsm_ortho import (
     _dsm_point_normals,
     _fill_dsm_holes,
     _fill_ortho_holes,
+    _inject_ortho_detail,
     _ortho_gated_median,
     _shock_dsm_edges,
 )
+from .equalize import apply_equalization
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -912,6 +914,19 @@ def fuse_chunks(
 
     fusable_set: Set[str] = set(fusable)
 
+    # Per-image radiometric equalization (gain + vignetting), if dense_equalize
+    # was run: applied to each source colour image as it is loaded for the bake,
+    # so every baked colour (ortho blend, sharp-detail source, point cloud, mesh)
+    # is sampled from images on a common radiometric frame — removing the
+    # exposure/vignette steps between source images.
+    equalization: Optional[Dict[str, Any]] = None
+    if config["equalize_apply_in_bake"] and data.equalization_exists():
+        equalization = data.load_equalization()
+        logger.info(
+            "Loaded equalization for %d image(s); applying during colour bake",
+            len(equalization),
+        )
+
     # Global SVO voxel size from the depthmaps' surface sampling — one value
     # shared by every chunk (coarse grid, sub-volumes, DSM).
     voxel_size = _resolve_voxel_size(data, fusable, reconstruction, config)
@@ -979,9 +994,15 @@ def fuse_chunks(
 
             def _load_scaled_color(sid: str) -> Tuple[str, NDArray]:
                 w, h = sizes[sid]
-                return sid, scale_down_image(
+                color = scale_down_image(
                     data.load_undistorted_image(sid), w, h
                 )
+                if equalization is not None and sid in equalization:
+                    color = apply_equalization(
+                        color, equalization[sid],
+                        highlight_knee=float(config["equalize_highlight_knee"]),
+                    )
+                return sid, color
 
             with ThreadPoolExecutor(
                 max_workers=data.config["io_processes"]
@@ -1618,6 +1639,15 @@ def fuse_chunks(
                     dsm_occ_arr = np.ascontiguousarray(
                         dsm_grid, dtype=np.float32)
                     dsm_max_z = float(np.nanmax(dsm_grid))
+                # Detail injection: the bake also returns, per cell, the single
+                # sharpest inlier's raw colour; after all leaves we add its high-
+                # frequency texture back onto the (smooth) blend (no seams, full
+                # detail).  Accumulate it over the chunk window like ortho_grid.
+                detail_on = bool(config["ortho_detail_injection"])
+                sharp_grid: Optional[NDArray] = (
+                    np.zeros((dsm_h, dsm_w, 3), dtype=np.uint8)
+                    if detail_on else None
+                )
                 # Cells that received a REAL (non-black) bake.  A cell is baked by exactly one leaf
                 baked_mask = np.zeros((dsm_h, dsm_w), dtype=bool)
                 n_filled_tot = 0  # diagnostics: filled cells + how many baked
@@ -1675,18 +1705,23 @@ def fuse_chunks(
                             continue
                         baker.count_voxels()
                         baker.fuse_only()
-                    colors = np.asarray(
-                        baker.bake_colors(
-                            pts, nrm, n_final=n_final, irls_iters=irls_iters,
-                            relax_occlusion=relax,
-                            dsm_occ=dsm_occ_arr,
-                            dsm_origin_x=dsm_origin_x,
-                            dsm_origin_y=dsm_origin_y,
-                            dsm_gsd=dsm_gsd,
-                            dsm_max_z=dsm_max_z,
-                        ),
-                        dtype=np.uint8,
+                    bake_out = baker.bake_colors(
+                        pts, nrm, n_final=n_final, irls_iters=irls_iters,
+                        relax_occlusion=relax,
+                        dsm_occ=dsm_occ_arr,
+                        dsm_origin_x=dsm_origin_x,
+                        dsm_origin_y=dsm_origin_y,
+                        dsm_gsd=dsm_gsd,
+                        dsm_max_z=dsm_max_z,
+                        with_sharp=detail_on,
                     )
+                    if detail_on:
+                        colors_raw, sharp_raw = bake_out
+                        sharp_grid[rows_idx, cols_idx, :] = np.asarray(
+                            sharp_raw, dtype=np.uint8)
+                    else:
+                        colors_raw = bake_out
+                    colors = np.asarray(colors_raw, dtype=np.uint8)
                     ortho_grid[rows_idx, cols_idx, :] = colors
                     # A cell is "really baked" iff the kernel found >=1 view
                     # (n_valid==0 emits pure black); record that, not sum>0 on
@@ -1714,6 +1749,19 @@ def fuse_chunks(
                     f"{n_owned_black}"
                 )
 
+                # Detail injection: add the sharpest-view high-frequency texture
+                # back onto the smooth blend (before residual hole-fill / median,
+                # which both assume the bake's colours).
+                if sharp_grid is not None:
+                    ortho_grid = _inject_ortho_detail(
+                        ortho_grid, sharp_grid, baked_mask, config
+                    )
+                    logger.info(
+                        "  Injected sharp-view detail (sigma=%.1f, strength=%.2f)",
+                        float(config["ortho_detail_sigma"]),
+                        float(config["ortho_detail_strength"]),
+                    )
+
                 ortho_grid = _fill_ortho_holes(
                     ortho_grid, dsm_grid, config, baked_mask=baked_mask
                 )
@@ -1728,7 +1776,7 @@ def fuse_chunks(
             leaf_fusers = []
             view_cache.clear()
 
-            if not config.get("dsm_merge_feather", True):
+            if not config["dsm_merge_feather"]:
                 owned_xy = np.unique(owned_cells[:, :2], axis=0)
                 oxy_origin = owned_xy.min(axis=0)
                 oxy_span = owned_xy.max(axis=0) - oxy_origin + 1
@@ -1780,7 +1828,7 @@ def fuse_chunks(
             # Debug: also dump this cluster's own DSM+ortho window as standalone
             # (topocentric, untagged) GeoTIFFs that overlay the final raster, to
             # isolate per-cluster boundary / grazing-bake artefacts.
-            if config.get("dsm_save_cluster_tiles", False):
+            if config["dsm_save_cluster_tiles"]:
                 data.save_dsm(
                     dsm_grid, dsm_origin_x, dsm_origin_y, dsm_gsd,
                     path=data.dsm_cluster_file(unit_idx),
@@ -1842,7 +1890,7 @@ def fuse_chunks(
                 f"({len(mverts_all)} verts, {len(mfaces_all)} faces)"
             )
 
-        if config.get("depthmap_save_debug_ply", False) and len(points) > 0:
+        if config["depthmap_save_debug_ply"] and len(points) > 0:
             # Recolour this chunk's points by a per-chunk colour so the disjoint
             # KD-tree partition is visible in a viewer.
             cr, cg, cb = _CLUSTER_COLORS[unit_idx % len(_CLUSTER_COLORS)]

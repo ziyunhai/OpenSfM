@@ -42,7 +42,7 @@ def discover_gpu_devices(config: Dict[str, Any]) -> List[int]:
         logger.warning("No OpenCL devices found — cannot compute depthmaps")
         return []
 
-    ignore_intel_device = config.get("opencl_ignore_intel_device", True)
+    ignore_intel_device = config["opencl_ignore_intel_device"]
 
     # Build ordered device list: GPUs only
     gpu_devs: List[int] = []
@@ -207,7 +207,7 @@ def _run_cluster_raw(
 
     cluster = pydense.DepthmapClusterEstimator()
     debug_dir = ""
-    if config.get("depthmap_save_debug_ply", False) and config.get("depthmap_segmentation_enabled", False):
+    if config["depthmap_save_debug_ply"]:
         debug_dir = data._depthmap_path()
         os.makedirs(debug_dir, exist_ok=True)
     _setup_cluster_params(cluster, config, debug_dir=debug_dir)

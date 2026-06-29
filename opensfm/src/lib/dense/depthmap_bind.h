@@ -487,12 +487,15 @@ class SVOFuserWrapper {
     return py::make_tuple(dsm_arr, ortho_arr, nrm_arr);
   }
 
-  py::array_t<uint8_t> BakeColorsStandalone(
+  // Returns the baked colours (N×3 uint8).  When |with_sharp| is true, returns
+  // a tuple (colours, sharp N×3 uint8) where `sharp` is the sharpest-inlier
+  // colour per point — the host detail-injection source.
+  py::object BakeColorsStandalone(
       const py::array_t<float, py::array::c_style>& points,
       const py::array_t<float, py::array::c_style>& normals, int n_final,
       int irls_iters, const py::object& relax_occlusion,
       const py::object& dsm_occ, float dsm_origin_x, float dsm_origin_y,
-      float dsm_gsd, float dsm_max_z) {
+      float dsm_gsd, float dsm_max_z, bool with_sharp) {
     if (points.ndim() != 2 || points.shape(1) != 3) {
       throw std::invalid_argument("points must be (N, 3)");
     }
@@ -537,19 +540,28 @@ class SVOFuserWrapper {
     }
 
     std::vector<Vec3<uint8_t>> colors(n, Vec3<uint8_t>(128, 128, 128));
+    std::vector<uint8_t> sharp;
 
     {
       py::gil_scoped_release release;
       sf_.BakeColors(pts, nrm, &colors, n_final, irls_iters,
                      relax.empty() ? nullptr : &relax,
                      dsm.empty() ? nullptr : &dsm, dsm_w, dsm_h, dsm_origin_x,
-                     dsm_origin_y, dsm_gsd, dsm_max_z);
+                     dsm_origin_y, dsm_gsd, dsm_max_z,
+                     with_sharp ? &sharp : nullptr);
     }
 
     py::array_t<uint8_t> colors_arr({n, 3});
     std::memcpy(colors_arr.mutable_data(), colors.data(),
                 n * 3 * sizeof(uint8_t));
-    return colors_arr;
+    if (!with_sharp) {
+      return colors_arr;
+    }
+    sharp.resize(static_cast<size_t>(n) * 3, 0);
+    py::array_t<uint8_t> sharp_arr({n, 3});
+    std::memcpy(sharp_arr.mutable_data(), sharp.data(),
+                static_cast<size_t>(n) * 3);
+    return py::make_tuple(colors_arr, sharp_arr);
   }
 
  private:
