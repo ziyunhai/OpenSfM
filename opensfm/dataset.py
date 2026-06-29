@@ -1092,6 +1092,31 @@ class UndistortedDataSet:
             for b in payload
         ]
 
+    def crop_hull_file(self) -> str:
+        return os.path.join(self.data_path, "dense_crop_hull.json")
+
+    def crop_hull_exists(self) -> bool:
+        return self.io_handler.isfile(self.crop_hull_file())
+
+    def save_crop_hull(self, vertices: NDArray, percentile: float) -> None:
+        """Persist the dense crop hull (CCW topocentric XY polygon).
+
+        Saved by ``dense_clustering`` and consumed by ``dense_merging`` to clip
+        the point cloud and mask the DSM/ortho to the surveyed footprint.
+        """
+        payload = {
+            "frame": "topocentric",
+            "percentile": float(percentile),
+            "vertices": np.asarray(vertices, dtype=float).tolist(),
+        }
+        with self.io_handler.open_wt(self.crop_hull_file()) as fout:
+            io.json_dump(payload, fout)
+
+    def load_crop_hull(self) -> NDArray:
+        with self.io_handler.open_rt(self.crop_hull_file()) as fin:
+            payload = io.json_load(fin)
+        return np.array(payload["vertices"], dtype=np.float64)
+
     def _depthmap_path(self) -> str:
         return os.path.join(self.data_path, "depthmaps")
 

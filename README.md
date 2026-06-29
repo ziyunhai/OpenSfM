@@ -3,7 +3,11 @@
 
 OpenSfM
 =======
-[![Conda](https://github.com/OpenSfM/OpenSfM/actions/workflows/conda.yml/badge.svg)](https://github.com/OpenSfM/OpenSfM/actions/workflows/conda.yml) [![Docker Ubuntu 20.04](https://github.com/OpenSfM/OpenSfM/actions/workflows/docker_ubuntu20.yml/badge.svg)](https://github.com/OpenSfM/OpenSfM/actions/workflows/docker_ubuntu20.yml) [![Docker Ubuntu 24.04](https://github.com/OpenSfM/OpenSfM/actions/workflows/docker_ubuntu24.yml/badge.svg)](https://github.com/OpenSfM/OpenSfM/actions/workflows/docker_ubuntu24.yml) [![Coverage](./badges/coverage.svg)](https://github.com/OpenSfM/OpenSfM/actions/workflows/coverage.yml)
+[![Conda](https://github.com/OpenSfM/OpenSfM/actions/workflows/conda.yml/badge.svg)](https://github.com/OpenSfM/OpenSfM/actions/workflows/conda.yml) [![Docker Ubuntu 20.04](https://github.com/OpenSfM/OpenSfM/actions/workflows/docker_ubuntu20.yml/badge.svg)](https://github.com/OpenSfM/OpenSfM/actions/workflows/docker_ubuntu20.yml) [![Docker Ubuntu 24.04](https://github.com/OpenSfM/OpenSfM/actions/workflows/docker_ubuntu24.yml/badge.svg)](https://github.com/OpenSfM/OpenSfM/actions/workflows/docker_ubuntu24.yml)
+ 
+[![Coverage](./badges/coverage.svg)](https://github.com/OpenSfM/OpenSfM/actions/workflows/coverage.yml)
+
+[![Discord](https://dcbadge.limes.pink/api/server/https://discord.gg/KrtV85kvgR?style=flat&theme=discord-inverted)](https://discord.gg/KrtV85kvgR)
 
 ## 🧟 Intro
 This repository continues the original [OpenSfM](https://github.com/mapillary/opensfm) project, which is no longer in active development. We were maintainers and contributors of the original OpenSfM, and we will do our best to keep it alive and serve the community and our users ([OpenDroneMap](https://www.opendronemap.org/), [WebODM](https://webodm.org/) and many others).
