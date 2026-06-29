@@ -399,6 +399,8 @@ class OpenSfMConfig:
     ##################################
     # Params for depth estimation (PatchMatch OpenCL)
     ##################################
+    # In OpenCL, ignore Intel GPU devices (they are too slow and buggy).  Set to False to use them anyway.
+    opencl_ignore_intel_gpu_device: bool = True
     # Number of neighboring views considered as candidates
     depthmap_num_neighbors: int = 10
     # Number of neighboring views used for each depthmap
@@ -577,6 +579,10 @@ class OpenSfMConfig:
     ##################################
     # Controls DSM + ortho rendering.
     dsm_enabled: bool = True
+    # Crop the dense outputs (point cloud + DSM/ortho) to the convex hull of the SfM points on the ground plane, trimming the sparse fringe beyond the surveyed area. Only takes effect when dsm_enabled (the hull is computed by dense_clustering and consumed by dense_merging).
+    dense_crop_to_sfm_hull: bool = True
+    # Outlier trim before hulling: fraction (percent) cut off each extremity along each principal (PCA) axis of the SfM points, so a few stray points can't inflate the crop hull. 0 = plain convex hull of all points.
+    dense_crop_percentile: float = 1.0
     # Robust-to-grazing depth clamp: in the fusion pre-scan, drop depth samples farther than this multiple of the view's median depth.
     dsm_territory_depth_factor: float = 2.0
     # Debug: also write each chunk's own DSM+ortho as georeferenced GeoTIFFs (dsm_cluster_XXXX.tif / ortho_cluster_XXXX.tif) before they are merged

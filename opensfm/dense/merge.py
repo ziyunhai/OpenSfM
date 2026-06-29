@@ -10,7 +10,7 @@ for the viewer.
 import gc
 import logging
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 from numpy.typing import NDArray
@@ -18,6 +18,8 @@ from scipy.ndimage import distance_transform_edt
 
 from opensfm import geo, io, pypointcloud
 from opensfm.dataset import UndistortedDataSet
+
+from . import crop
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -29,6 +31,7 @@ _PLY_ROW_DT: np.dtype = np.dtype([("f", "<f4", 6), ("c", "u1", 4)])
 def merge_fusion_batches(
     data: UndistortedDataSet,
     batch_nums: List[int],
+    crop_hull: Optional[NDArray] = None,
 ) -> None:
     """Stream all batch PLYs into the final ``fused.ply``.
 
@@ -36,6 +39,10 @@ def merge_fusion_batches(
     before the next is read, so peak memory is one batch — not the whole
     merged cloud (which previously had to be held twice across the
     ``np.concatenate``).  The output is byte-identical to the old path.
+
+    When ``crop_hull`` is given, points whose XY falls outside the SfM crop hull
+    are dropped (see ``_merge_fusion_batches_cropped``); otherwise every point is
+    kept.
 
     When ``depthmap_delete_fusion_batches`` is set (default), the per-batch
     PLYs are deleted once the complete ``fused.ply`` has been written; they
@@ -64,6 +71,11 @@ def merge_fusion_batches(
             for bn in present:
                 data.io_handler.rm_if_exist(
                     data.point_cloud_file(_batch_file(bn)))
+        return
+
+    if crop_hull is not None:
+        _merge_fusion_batches_cropped(
+            data, present, _batch_file, crop_hull, delete_batches)
         return
 
     # Pass 1: header-only read to get each batch's vertex count → total.
@@ -105,6 +117,68 @@ def merge_fusion_batches(
         for filename, _n in batch_files:
             data.io_handler.rm_if_exist(data.point_cloud_file(filename))
         logger.info(f"Removed {len(batch_files)} merged batch PLY(s)")
+
+
+def _merge_fusion_batches_cropped(
+    data: UndistortedDataSet,
+    present: List[int],
+    batch_file: Callable[[int], str],
+    crop_hull: NDArray,
+    delete_batches: bool,
+) -> None:
+    """Stream the batch PLYs into ``fused.ply``, keeping only points whose XY is
+    inside the SfM crop hull.
+
+    The survivor count is unknown until the points are filtered, but a PLY needs
+    its vertex count in the header up front.  Rather than decode every batch
+    twice (once to count, once to write), the filtered records are streamed to a
+    temporary body file in a single decode pass (one batch resident at a time),
+    then copied after the header once the running count is known.
+    """
+    data.io_handler.mkdir_p(data._depthmap_path())
+    tmp_path = data.point_cloud_file("fused.ply.body.tmp")
+
+    total_in = 0
+    written = 0
+    with data.io_handler.open_wb(tmp_path) as body:
+        for bn in present:
+            p, nrm, c, lbl = data.load_point_cloud(batch_file(bn))
+            total_in += len(p)
+            if len(p) == 0:
+                continue
+            inside = crop.hull_contains(crop_hull, p[:, 0], p[:, 1])
+            n_keep = int(inside.sum())
+            if n_keep:
+                body.write(io.pack_point_cloud_rows(
+                    np.ascontiguousarray(p[inside]),
+                    np.ascontiguousarray(nrm[inside]),
+                    np.ascontiguousarray(c[inside]),
+                    np.ascontiguousarray(lbl[inside]),
+                ))
+                written += n_keep
+            del p, nrm, c, lbl, inside
+            gc.collect()
+
+    # Prefix the counted body with the PLY header → final fused.ply.
+    with data.io_handler.open_wb(data.point_cloud_file("fused.ply")) as out:
+        out.write(io._ply_header(written).encode("ascii"))
+        with data.io_handler.open_rb(tmp_path) as body:
+            while True:
+                buf = body.read(1 << 20)
+                if not buf:
+                    break
+                out.write(buf)
+    data.io_handler.rm_if_exist(tmp_path)
+
+    logger.info(
+        f"Merged {len(present)} batches → fused.ply "
+        f"({written}/{total_in} points kept inside the crop hull)"
+    )
+
+    if delete_batches:
+        for bn in present:
+            data.io_handler.rm_if_exist(data.point_cloud_file(batch_file(bn)))
+        logger.info(f"Removed {len(present)} merged batch PLY(s)")
 
 
 def merge_mesh_batches(
@@ -190,6 +264,7 @@ def merge_dsm_ortho_batches(
     batch_nums: List[int],
     reference: Optional[Any],
     output_crs: Optional[str] = None,
+    crop_hull: Optional[NDArray] = None,
 ) -> None:
     """Composite per-cluster DSM/ortho tiles into the final dsm.tif / ortho.tif.
 
@@ -210,6 +285,10 @@ def merge_dsm_ortho_batches(
     height from being averaged toward an overlapping tile that filled the same
     spot from the ground (the DSM staircase).  Otherwise (legacy) tiles are
     composited by hard **max-z**.
+
+    When ``crop_hull`` is given, cells whose topocentric centre falls outside the
+    SfM crop hull are masked to no-data (in the topocentric grid, before any
+    georeferencing reprojection), so the raster matches the cropped point cloud.
 
     Tiles are deleted afterwards when ``depthmap_delete_geotiff_batches`` is set.
     """
@@ -248,6 +327,13 @@ def merge_dsm_ortho_batches(
     # ≈ 20 B/cell → ~40 B/cell plus outputs/flips.
     max_ram = int(data.config["dsm_merge_max_ram_mb"]) * (1 << 20)
     band_rows = max(1, min(int(gh), max(64, max_ram // max(1, gw * 50))))
+
+    # World X of every grid column centre (constant across bands), used by the
+    # optional SfM-hull crop applied at the end of each band.
+    crop_cols_x = (
+        origin_x + (np.arange(gw, dtype=np.float64) + 0.5) * gsd
+        if crop_hull is not None else None
+    )
 
     def fill_band(rs: int, re_: int) -> Tuple[NDArray, NDArray]:
         """Composite all tiles overlapping grid rows [rs, re_) into one band."""
@@ -326,6 +412,17 @@ def merge_dsm_ortho_batches(
             ortho_b[useF] = np.clip(
                 accF_c[useF] / accF_w[useF][:, None] + 0.5, 0.0, 255.0
             ).astype(np.uint8)
+        if crop_hull is not None:
+            # Mask cells whose topocentric centre falls outside the SfM hull.
+            # Row 0 is the bottom row (+Y up); cell centre = origin + (i+0.5)·gsd.
+            # NaN-ing the DSM also clears the ortho (its alpha follows DSM
+            # validity in the GeoTIFF writer), keeping every product consistent.
+            ys = origin_y + (np.arange(rs, re_, dtype=np.float64) + 0.5) * gsd
+            inside = crop.hull_contains(
+                crop_hull, crop_cols_x[None, :], ys[:, None])
+            outside = ~inside
+            dsm_b[outside] = np.nan
+            ortho_b[outside] = 0
         gc.collect()
         return dsm_b, ortho_b
 

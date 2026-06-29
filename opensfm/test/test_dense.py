@@ -6,6 +6,7 @@ import numpy as np
 from opensfm import dense, io, pygeometry, pymap, types, pydense
 from opensfm.config import default_config
 from opensfm.dense.equalize import estimate_image_corrections, apply_equalization
+from opensfm.dense import crop
 from opensfm.dataset import UndistortedDataSet
 from opensfm.dense.dsm_ortho import (
     _dsm_footprint,
@@ -680,3 +681,74 @@ def test_bake_colors_sharp_returns_sharpest_inlier_color() -> None:
     assert np.all(np.abs(sharp[0].astype(int) - color_a) <= 2)
     # The blend, by contrast, is pulled toward the B/C majority (not exactly A).
     assert not np.array_equal(colors[0], np.array(color_a, np.uint8))
+
+
+# ───────────────────────── SfM-hull crop ─────────────────────────
+
+
+def test_hull_contains_square() -> None:
+    # Axis-aligned 2×2 square, counter-clockwise.
+    hull = np.array([[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]])
+    x = np.array([1.0, 3.0, -0.5, 0.5])
+    y = np.array([1.0, 1.0, 1.0, 0.5])
+    inside = crop.hull_contains(hull, x, y)
+    assert inside.tolist() == [True, False, False, True]
+
+
+def test_hull_contains_broadcasts_to_grid() -> None:
+    hull = np.array([[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]])
+    xs = np.array([-1.0, 1.0, 3.0, 5.0])
+    ys = np.array([-1.0, 2.0, 5.0])
+    inside = crop.hull_contains(hull, xs[None, :], ys[:, None])
+    assert inside.shape == (3, 4)
+    # Only (x=1 or 3, y=2) land inside the square.
+    assert inside[1, 1] and inside[1, 2]
+    assert not inside[0, 0] and not inside[2, 3]
+
+
+def test_crop_hull_from_points_trims_outliers() -> None:
+    rng = np.random.default_rng(0)
+    # Dense ground cluster in [-1, 1]² with a little height noise.
+    square = rng.uniform(-1.0, 1.0, size=(4000, 2))
+    z = rng.uniform(0.0, 0.1, size=(4000, 1))
+    inliers = np.hstack([square, z])
+    # A few far stray points (well under the 2% trim fraction).
+    outliers = np.array([[100.0, 0.0, 0.0], [0.0, -80.0, 0.0],
+                         [60.0, 60.0, 0.0]])
+    pts = np.vstack([inliers, outliers])
+
+    hull = crop.crop_hull_from_points(pts, percentile=2.0)
+    assert hull is not None
+    # Outliers are trimmed → outside the hull.
+    assert not crop.hull_contains(
+        hull, outliers[:, 0], outliers[:, 1]).any()
+    # The cluster centre is inside; the hull stays tight (~[-1, 1]).
+    assert crop.hull_contains(hull, np.array([0.0]), np.array([0.0]))[0]
+    assert hull[:, 0].max() < 1.5 and hull[:, 1].max() < 1.5
+
+
+def test_crop_hull_follows_oriented_frame() -> None:
+    # A long, thin strip rotated 30°: the percentile trim must act along the
+    # strip's own axes, not the world axes, so the hull keeps the full length.
+    rng = np.random.default_rng(1)
+    u = rng.uniform(-10.0, 10.0, size=(5000, 1))   # along the strip
+    v = rng.uniform(-0.5, 0.5, size=(5000, 1))     # across the strip
+    a = np.deg2rad(30.0)
+    rot = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
+    xy = np.hstack([u, v]) @ rot.T
+    pts = np.hstack([xy, np.zeros((len(xy), 1))])
+
+    hull = crop.crop_hull_from_points(pts, percentile=2.0)
+    assert hull is not None
+    # Endpoints near the strip extremities survive the trim (long axis kept).
+    end = np.array([9.0, 0.0]) @ rot.T
+    assert crop.hull_contains(
+        hull, np.array([end[0]]), np.array([end[1]]))[0]
+
+
+def test_crop_hull_too_few_points_returns_none() -> None:
+    assert crop.crop_hull_from_points(
+        np.zeros((2, 3)), percentile=2.0) is None
+    # Collinear points are degenerate → no crop.
+    line = np.column_stack([np.arange(10.0), np.zeros(10), np.zeros(10)])
+    assert crop.crop_hull_from_points(line, percentile=2.0) is None

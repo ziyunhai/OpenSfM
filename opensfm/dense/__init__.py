@@ -19,10 +19,12 @@ import logging
 import os
 from typing import Dict, List, Optional, Tuple
 
+from numpy.typing import NDArray
+
 from opensfm import context, pymap, pysfm, types
 from opensfm.dataset import UndistortedDataSet
 
-from . import clustering, depthmaps, equalize, fusion, merge
+from . import clustering, crop, depthmaps, equalize, fusion, merge
 from .common import compute_depth_range, depthmap_to_ply, scale_down_image
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -210,6 +212,19 @@ def run_clustering(
             depth_ranges[shot_id] = (mind, maxd)
         data.save_depth_ranges(depth_ranges)
 
+    # ── Dense crop hull (only when DSM/ortho is enabled) ──
+    if config["dsm_enabled"] and config["dense_crop_to_sfm_hull"]:
+        if data.crop_hull_exists():
+            logger.info("Dense crop hull already computed; skipping")
+        else:
+            hull = crop.compute_sfm_crop_hull(
+                reconstruction, config["dense_crop_percentile"])
+            if hull is not None:
+                data.save_crop_hull(hull, config["dense_crop_percentile"])
+                logger.info(
+                    "Dense crop hull saved (%d vertices) → %s",
+                    len(hull), data.crop_hull_file())
+
     logger.info("Clusters, neighbors and depth ranges ready")
     context.log_memory("dense clustering done")
 
@@ -331,9 +346,22 @@ def run_merge(
     # count), and some chunks may yield no points/tile — so the merge discovers
     # the actual batch indices by listing the depthmap folder per file type.
 
+    # ── Optional crop to the SfM footprint (only with DSM enabled) ──
+    crop_hull: Optional[NDArray] = None
+    if (
+        config["dsm_enabled"]
+        and config["dense_crop_to_sfm_hull"]
+        and data.crop_hull_exists()
+    ):
+        crop_hull = data.load_crop_hull()
+        logger.info(
+            "Cropping dense outputs to the SfM hull (%d vertices)",
+            len(crop_hull))
+
     # ── Merge batch PLYs into final fused.ply ──
     merge.merge_fusion_batches(
-        data, data.list_batch_indices("fused_batch_", ".ply")
+        data, data.list_batch_indices("fused_batch_", ".ply"),
+        crop_hull=crop_hull,
     )
 
     # ── Merge per-chunk Surface Nets meshes into final mesh.ply ──
@@ -349,6 +377,7 @@ def run_merge(
         merge.merge_dsm_ortho_batches(
             data, data.list_batch_indices("dsm_ortho_batch_", ".npz"),
             reconstruction.reference, output_crs=output_crs,
+            crop_hull=crop_hull,
         )
 
     context.log_memory("phase 4 merge done")
