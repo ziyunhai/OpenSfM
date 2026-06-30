@@ -568,11 +568,6 @@ class OpenSfMConfig:
     equalize_vignette_regularization: float = 0.1
     # Tiny ridge on the per-image gains (conditioning only).
     equalize_gain_regularization: float = 0.001
-    # Soft weight enforcing sum(log-gain)=0 — fixes the global scale gauge and keeps the mean brightness unchanged.
-    equalize_gauge_weight: float = 1.0
-    # PCG (conjugate-gradient) solver tolerance and iteration cap per IRLS step.
-    equalize_pcg_tol: float = 0.000001
-    equalize_pcg_max_iterations: int = 2000
 
     ##################################
     # Params for DSM (Digital Surface Model)and ortho generation
