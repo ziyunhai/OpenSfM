@@ -304,8 +304,15 @@ def td_errors(
         # triangulate a point and sample around
         # the projection error radius (4 points)
         # by computing all triangulation permutations
+        max_samples = 1000
+        points = list(rec.points.values())
 
-        for p in list(rec.points.values())[:1000]:
+        if len(points) > max_samples:
+            # Deterministic sampling
+            sampler = random.Random(42)
+            points = sampler.sample(points, max_samples)
+
+        for p in points:
             track_obs = tracks_manager.get_track_observations(p.id)
 
             # Build the per-camera reprojection-error-box corners (up to 3 cams).
