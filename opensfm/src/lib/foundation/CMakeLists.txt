@@ -1,4 +1,5 @@
 set(FOUNDATION_FILES
+    logging.h
     memory.h
     stl_extensions.h
     threading.h
@@ -7,6 +8,7 @@ set(FOUNDATION_FILES
     numeric.h
     optional.h
     union_find.h
+    src/logging.cc
     src/memory.cc
     src/types.cc
     src/newton_raphson.cc

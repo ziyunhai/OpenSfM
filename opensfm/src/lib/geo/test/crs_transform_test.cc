@@ -5,8 +5,6 @@
 
 namespace {
 
-// ── ParseGcpProjectionString ─────────────────────────────────────────────────
-
 TEST(CrsTransform, ParseWgs84ReturnsEmpty) {
   EXPECT_TRUE(geo::ParseGcpProjectionString("WGS84").empty());
 }
@@ -55,8 +53,6 @@ TEST(CrsTransform, ParseTrimsWhitespace) {
   EXPECT_TRUE(geo::ParseGcpProjectionString("  WGS84  ").empty());
 }
 
-// ── CrsTransform identity ────────────────────────────────────────────────────
-
 TEST(CrsTransform, IdentityFromEmptyString) {
   geo::CrsTransform ct("");
   EXPECT_TRUE(ct.isIdentity());
@@ -72,8 +68,6 @@ TEST(CrsTransform, IdentityTransformPassesThrough) {
   EXPECT_DOUBLE_EQ(lat, 52.5);
   EXPECT_DOUBLE_EQ(alt, 10.0);
 }
-
-// ── CrsTransform with PROJ ──────────────────────────────────────────────────
 
 TEST(CrsTransform, UtmZone33NForward) {
   // UTM zone 33N: known Berlin point.

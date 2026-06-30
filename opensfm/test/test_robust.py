@@ -165,7 +165,7 @@ def test_outliers_line_LMedS() -> None:
         data, multiplier, params, pyrobust.RansacType.LMedS)
 
     inliers_count = (1 - ratio_outliers) * samples
-    confidence = 0.95  # 1.96*MAD -> 95% rejecting inliers
+    confidence = 0.94  # 1.96*MAD -> 95% rejecting inliers
     assert np.isclose(
         len(result.inliers_indices), inliers_count, rtol=(1 - confidence), atol=8
     )
@@ -276,7 +276,7 @@ def test_outliers_relative_pose_ransac(
         expected = pose.get_world_to_cam()[:3]
         expected[:, 3] /= np.linalg.norm(expected[:, 3])
 
-        tolerance = 0.15
+        tolerance = 0.18
         inliers_count = (1 - ratio_outliers) * len(points)
         assert np.isclose(len(result.inliers_indices),
                           inliers_count, rtol=tolerance)

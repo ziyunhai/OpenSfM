@@ -1,78 +1,76 @@
 #include <algorithm>
-#include <cassert>
 #include <cmath>
 #include <cstring>
-#include <numeric>
-#include <random>
 #include <vector>
 
-#include <pointcloud/octree_builder.h>
 #include <pointcloud/half_float.h>
 #include <pointcloud/morton.h>
+#include <pointcloud/octree_builder.h>
+#include <pointcloud/octree_internal.h>
 #include <pointcloud/tile_io.h>
 
 namespace pointcloud {
 
-namespace {
+// ── AABB ─────────────────────────────────────────────────────────────────────
 
-// ── Helper: compute AABB ────────────────────────────────────────────────────
-
-struct AABB {
-  float min[3]{1e30f, 1e30f, 1e30f};
-  float max[3]{-1e30f, -1e30f, -1e30f};
-
-  void expand(float x, float y, float z) {
-    if (x < min[0]) {
-      min[0] = x;
-    }
-    if (y < min[1]) {
-      min[1] = y;
-    }
-    if (z < min[2]) {
-      min[2] = z;
-    }
-    if (x > max[0]) {
-      max[0] = x;
-    }
-    if (y > max[1]) {
-      max[1] = y;
-    }
-    if (z > max[2]) {
-      max[2] = z;
-    }
+void AABB::expand(float x, float y, float z) {
+  if (x < min[0]) {
+    min[0] = x;
   }
-
-  float extent(int axis) const { return max[axis] - min[axis]; }
-
-  float maxExtent() const {
-    return std::max({extent(0), extent(1), extent(2)});
+  if (y < min[1]) {
+    min[1] = y;
   }
-
-  void cubePad() {
-    float e = maxExtent();
-    for (int a = 0; a < 3; ++a) {
-      float diff = e - extent(a);
-      min[a] -= diff * 0.5f;
-      max[a] += diff * 0.5f;
-    }
+  if (z < min[2]) {
+    min[2] = z;
   }
-};
+  if (x > max[0]) {
+    max[0] = x;
+  }
+  if (y > max[1]) {
+    max[1] = y;
+  }
+  if (z > max[2]) {
+    max[2] = z;
+  }
+}
 
-// ── Sort point indices by Morton code ───────────────────────────────────────
+float AABB::maxExtent() const {
+  return std::max({extent(0), extent(1), extent(2)});
+}
 
-struct SortEntry {
-  uint64_t morton;
-  uint32_t index;
-};
+void AABB::cubePad() {
+  float e = maxExtent();
+  for (int a = 0; a < 3; ++a) {
+    float diff = e - extent(a);
+    min[a] -= diff * 0.5f;
+    max[a] += diff * 0.5f;
+  }
+}
 
-// ── Recursive octree construction ───────────────────────────────────────────
+// ── Shared geometry kernels ──────────────────────────────────────────────────
 
-/// Convert a point to a PointRecord (compressed format for the tile).
-PointRecord makePointRecord(uint32_t idx, const BuilderInput& input,
+void childAabb(const float min[3], const float max[3], int oct, float outMin[3],
+               float outMax[3]) {
+  float cx = (min[0] + max[0]) * 0.5f;
+  float cy = (min[1] + max[1]) * 0.5f;
+  float cz = (min[2] + max[2]) * 0.5f;
+  outMin[0] = (oct & 1) ? cx : min[0];
+  outMin[1] = (oct & 2) ? cy : min[1];
+  outMin[2] = (oct & 4) ? cz : min[2];
+  outMax[0] = (oct & 1) ? max[0] : cx;
+  outMax[1] = (oct & 2) ? max[1] : cy;
+  outMax[2] = (oct & 4) ? max[2] : cz;
+}
+
+// ── Tile encoding ────────────────────────────────────────────────────────────
+
+PointRecord makePointRecord(uint64_t idx, const PointSource& src,
                             const float tileMin[3], const float tileMax[3],
                             float defaultRadius) {
   PointRecord rec{};
-  const float* p = input.positions + idx * 3;
+
+  float p[3];
+  src.position(idx, p);
 
   // Relative position within the tile AABB → [0,1] → half-float.
   float rangeX = tileMax[0] - tileMin[0];
@@ -93,8 +91,8 @@ PointRecord makePointRecord(uint32_t idx, const BuilderInput& input,
   rec.pz = floatToHalf((p[2] - tileMin[2]) / rangeZ);
 
   // Normal (snorm int8).
-  if (input.normals) {
-    const float* n = input.normals + idx * 3;
+  float n[3];
+  if (src.normal(idx, n)) {
     auto clampSnorm = [](float v) -> int8_t {
       return static_cast<int8_t>(
           std::max(-127.0f, std::min(127.0f, v * 127.0f)));
@@ -105,38 +103,44 @@ PointRecord makePointRecord(uint32_t idx, const BuilderInput& input,
   }
 
   // Color.
-  if (input.colors) {
-    const uint8_t* c = input.colors + idx * 3;
+  uint8_t c[3];
+  if (src.color(idx, c)) {
     rec.r = c[0];
     rec.g = c[1];
     rec.b = c[2];
   }
 
   // Radius.
-  float r = (input.radii) ? input.radii[idx] : defaultRadius;
-  rec.radius = floatToHalf(r);
+  rec.radius = floatToHalf(src.radius(idx, defaultRadius));
 
   std::memset(rec._pad, 0, sizeof(rec._pad));
   return rec;
 }
 
-/// Recursively build the octree and write tiles.
-///
-/// @param key        Octree key for this node (e.g. "r", "r0", "r03").
-/// @param depth      Current depth (root = 0).
-/// @param indices    Point indices belonging to this node.
-/// @param aabbMin/Max  AABB for this node.
-/// @param input      Full input point cloud.
-/// @param config     Builder config.
-/// @param mortons    Pre-computed Morton codes for all points.
-/// @param meta       Accumulating metadata.
-/// @param nodesWritten  Counter for progress.
-/// @param progress   Optional progress callback.
+void strideSubsample(const std::vector<uint64_t>& indices, uint32_t lodCount,
+                     std::vector<uint64_t>& out) {
+  out.clear();
+  uint64_t n = indices.size();
+  if (lodCount == 0 || n == 0) {
+    return;
+  }
+  if (static_cast<uint64_t>(lodCount) >= n) {
+    out = indices;
+    return;
+  }
+  out.reserve(lodCount);
+  float stride = static_cast<float>(n) / static_cast<float>(lodCount);
+  for (uint32_t i = 0; i < lodCount; ++i) {
+    out.push_back(indices[static_cast<size_t>(i * stride)]);
+  }
+}
+
+// ── Recursive octree construction ────────────────────────────────────────────
+
 void buildNode(const std::string& key, int depth,
-               std::vector<uint32_t>& indices, const float aabbMin[3],
-               const float aabbMax[3], const BuilderInput& input,
-               const OctreeBuilderConfig& config,
-               const std::vector<uint64_t>& mortons, OctreeMetadata& meta,
+               std::vector<uint64_t>& indices, const float aabbMin[3],
+               const float aabbMax[3], const PointSource& src,
+               const OctreeBuilderConfig& config, OctreeMetadata& meta,
                int& nodesWritten, const ProgressCallback& progress) {
   if (indices.empty()) {
     return;
@@ -145,13 +149,11 @@ void buildNode(const std::string& key, int depth,
   float extent = std::max({aabbMax[0] - aabbMin[0], aabbMax[1] - aabbMin[1],
                            aabbMax[2] - aabbMin[2]});
 
-  // Determine if we should subdivide further.
   bool isLeaf =
       (indices.size() <= config.maxPointsPerTile) || (depth >= config.maxDepth);
 
   if (isLeaf) {
-    // Write all points into this tile.
-    // Spacing reflects the actual content of the tile.
+    // Write all points into this tile.  Spacing reflects the tile content.
     float spacing =
         extent /
         std::sqrt(static_cast<float>(std::max(size_t(1), indices.size())));
@@ -167,8 +169,8 @@ void buildNode(const std::string& key, int depth,
 
     std::vector<PointRecord> records;
     records.reserve(indices.size());
-    for (uint32_t idx : indices) {
-      records.push_back(makePointRecord(idx, input, aabbMin, aabbMax, spacing));
+    for (uint64_t idx : indices) {
+      records.push_back(makePointRecord(idx, src, aabbMin, aabbMax, spacing));
     }
 
     writeTile(config.outputDir, key, hdr, records);
@@ -186,45 +188,22 @@ void buildNode(const std::string& key, int depth,
 
   // ── Inner node: subdivide into 8 octants ──
 
-  // Partition points into 8 children by their position relative to center.
   float cx = (aabbMin[0] + aabbMax[0]) * 0.5f;
   float cy = (aabbMin[1] + aabbMax[1]) * 0.5f;
   float cz = (aabbMin[2] + aabbMax[2]) * 0.5f;
 
-  std::vector<uint32_t> childIndices[8];
-  for (uint32_t idx : indices) {
-    const float* p = input.positions + idx * 3;
-    int octant = 0;
-    if (p[0] >= cx) {
-      octant |= 1;
-    }
-    if (p[1] >= cy) {
-      octant |= 2;
-    }
-    if (p[2] >= cz) {
-      octant |= 4;
-    }
-    childIndices[octant].push_back(idx);
+  // Partition (stable: preserves Morton order within each child).
+  std::vector<uint64_t> childIndices[8];
+  for (uint64_t idx : indices) {
+    float p[3];
+    src.position(idx, p);
+    childIndices[octantOf(p, cx, cy, cz)].push_back(idx);
   }
 
-  // Select LOD subsample for this inner node.
-  // Use spatial subsampling: pick every N-th point from the Morton-sorted
-  // order.  This ensures spatial uniformity.
-  uint32_t lodCount =
-      std::min(config.lodSampleCount, static_cast<uint32_t>(indices.size()));
-  std::vector<uint32_t> lodIndices;
-  lodIndices.reserve(lodCount);
-  if (lodCount > 0 && lodCount < indices.size()) {
-    // Stride-based subsample.
-    float stride = static_cast<float>(indices.size()) / lodCount;
-    for (uint32_t i = 0; i < lodCount; ++i) {
-      lodIndices.push_back(indices[static_cast<size_t>(i * stride)]);
-    }
-  } else {
-    lodIndices = indices;
-  }
+  // LOD subsample of this inner node (stride over Morton order → uniform).
+  std::vector<uint64_t> lodIndices;
+  strideSubsample(indices, config.lodSampleCount, lodIndices);
 
-  // Build child mask and recurse.
   uint32_t childMask = 0;
   for (int oct = 0; oct < 8; ++oct) {
     if (!childIndices[oct].empty()) {
@@ -232,10 +211,9 @@ void buildNode(const std::string& key, int depth,
     }
   }
 
-  // Write this inner node's LOD tile.
-  // Spacing must reflect the LOD subsample stored in this tile, NOT the
-  // full point set.  The traversal uses this to decide whether children
-  // are needed for more detail.
+  // Write this inner node's LOD tile.  Spacing reflects the LOD subsample
+  // stored in this tile (the traversal uses it to decide when children are
+  // needed for more detail).
   float spacing =
       extent /
       std::sqrt(static_cast<float>(std::max(size_t(1), lodIndices.size())));
@@ -251,8 +229,8 @@ void buildNode(const std::string& key, int depth,
 
   std::vector<PointRecord> records;
   records.reserve(lodIndices.size());
-  for (uint32_t idx : lodIndices) {
-    records.push_back(makePointRecord(idx, input, aabbMin, aabbMax, spacing));
+  for (uint64_t idx : lodIndices) {
+    records.push_back(makePointRecord(idx, src, aabbMin, aabbMax, spacing));
   }
 
   writeTile(config.outputDir, key, hdr, records);
@@ -266,30 +244,24 @@ void buildNode(const std::string& key, int depth,
     progress(nodesWritten, 0);
   }
 
+  // Free the LOD buffer before recursing (children own the bulk memory).
+  lodIndices.clear();
+  lodIndices.shrink_to_fit();
+
   // Recurse into children.
   for (int oct = 0; oct < 8; ++oct) {
     if (childIndices[oct].empty()) {
       continue;
     }
-
     float childMin[3], childMax[3];
-    childMin[0] = (oct & 1) ? cx : aabbMin[0];
-    childMin[1] = (oct & 2) ? cy : aabbMin[1];
-    childMin[2] = (oct & 4) ? cz : aabbMin[2];
-    childMax[0] = (oct & 1) ? aabbMax[0] : cx;
-    childMax[1] = (oct & 2) ? aabbMax[1] : cy;
-    childMax[2] = (oct & 4) ? aabbMax[2] : cz;
-
+    childAabb(aabbMin, aabbMax, oct, childMin, childMax);
     std::string childKey = key + std::to_string(oct);
-
-    buildNode(childKey, depth + 1, childIndices[oct], childMin, childMax, input,
-              config, mortons, meta, nodesWritten, progress);
+    buildNode(childKey, depth + 1, childIndices[oct], childMin, childMax, src,
+              config, meta, nodesWritten, progress);
   }
 }
 
-}  // namespace
-
-// ── Public API ──────────────────────────────────────────────────────────────
+// ── Public API: in-core builder ──────────────────────────────────────────────
 
 OctreeMetadata buildOctree(const BuilderInput& input,
                            const OctreeBuilderConfig& config,
@@ -300,7 +272,9 @@ OctreeMetadata buildOctree(const BuilderInput& input,
     return meta;
   }
 
-  // 1. Compute global AABB and cube-pad.
+  RawPointSource src(input);
+
+  // 1. Global AABB + cube-pad.
   AABB aabb;
   for (uint64_t i = 0; i < input.numPoints; ++i) {
     const float* p = input.positions + i * 3;
@@ -313,15 +287,13 @@ OctreeMetadata buildOctree(const BuilderInput& input,
   meta.maxPointsPerTile = config.maxPointsPerTile;
 
   float rootExtent = aabb.maxExtent();
-  // Root spacing reflects the LOD subsample at the root level.
-  // This is the effective average point spacing when viewing from far away.
   uint64_t rootLodCount =
       std::min(static_cast<uint64_t>(config.lodSampleCount), input.numPoints);
   meta.rootSpacing =
       rootExtent /
       std::sqrt(static_cast<float>(std::max(rootLodCount, uint64_t(1))));
 
-  // 2. Compute Morton codes for all points.
+  // 2. Morton codes (over the global cube).
   float rangeInv[3];
   for (int a = 0; a < 3; ++a) {
     float ext = aabb.max[a] - aabb.min[a];
@@ -335,29 +307,22 @@ OctreeMetadata buildOctree(const BuilderInput& input,
     uint32_t qy = quantise(p[1], aabb.min[1], rangeInv[1]);
     uint32_t qz = quantise(p[2], aabb.min[2], rangeInv[2]);
     entries[i].morton = mortonEncode(qx, qy, qz);
-    entries[i].index = static_cast<uint32_t>(i);
+    entries[i].index = i;
   }
 
-  // 3. Sort by Morton code (standard sort; radix sort would be faster for
-  //    very large clouds but std::sort is simpler and still O(N log N)).
-  std::sort(entries.begin(), entries.end(),
-            [](const SortEntry& a, const SortEntry& b) {
-              return a.morton < b.morton;
-            });
+  // 3. Deterministic sort by (morton, index).
+  std::sort(entries.begin(), entries.end(), sortEntryLess);
 
-  // Build sorted index array and Morton array.
-  std::vector<uint32_t> sortedIndices(input.numPoints);
-  std::vector<uint64_t> mortons(input.numPoints);
+  std::vector<uint64_t> sortedIndices(input.numPoints);
   for (uint64_t i = 0; i < input.numPoints; ++i) {
     sortedIndices[i] = entries[i].index;
-    mortons[i] = entries[i].morton;
   }
-  entries.clear();  // free memory
+  std::vector<SortEntry>().swap(entries);  // free
 
   // 4. Build octree recursively and write tiles.
   int nodesWritten = 0;
-  buildNode("r", 0, sortedIndices, aabb.min, aabb.max, input, config, mortons,
-            meta, nodesWritten, progress);
+  buildNode("r", 0, sortedIndices, aabb.min, aabb.max, src, config, meta,
+            nodesWritten, progress);
 
   // 5. Write metadata.
   writeMetadata(config.outputDir, meta);

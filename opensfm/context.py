@@ -136,12 +136,59 @@ else:
         return float(mem_bytes) / 1024 / 1024
 
 
+try:
+    _PAGE_SIZE: int = resource.getpagesize()
+except (NameError, AttributeError):
+    _PAGE_SIZE = 4096
+
+
+def current_rss_bytes() -> Optional[int]:
+    """Live resident-set size of this process, in bytes (Linux only).
+
+    Unlike ``current_memory_usage`` — which is the high-water peak via
+    ``ru_maxrss`` and never decreases — this is the *current* RSS, so it
+    reflects memory that has been released.  Returns ``None`` where
+    ``/proc`` is unavailable (Windows/macOS).
+    """
+    try:
+        with open("/proc/self/statm") as f:
+            rss_pages = int(f.readline().split()[1])
+        return rss_pages * _PAGE_SIZE
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+_last_log_memory_rss: Optional[int] = None
+
+
 def log_memory(stage: str) -> int:
-    """Log memory usage at a given stage and return usage in MB."""
-    mem_mb = current_memory_usage()
-    mem_gb = mem_mb / 1024
-    logger.info(f"[Memory] {stage}: {mem_gb:.1f} GB")
-    return mem_mb
+    """Log memory usage at a given stage and return the peak RSS in bytes.
+
+    Logs both the live RSS (current footprint, shows whether memory was
+    freed) and the peak RSS high-water mark, plus the delta in live RSS
+    since the previous checkpoint — so per-phase peaks and leaks are
+    visible.  The return value is the peak (``ru_maxrss``) for backward
+    compatibility with callers that record it in stats.
+    """
+    global _last_log_memory_rss
+    peak_bytes = current_memory_usage()
+    peak_gb = peak_bytes / 1024 / 1024 / 1024
+
+    live_bytes = current_rss_bytes()
+    if live_bytes is not None:
+        live_gb = live_bytes / 1024 / 1024 / 1024
+        if _last_log_memory_rss is not None:
+            delta_gb = (live_bytes - _last_log_memory_rss) / 1024 / 1024 / 1024
+            delta = f", Δ{delta_gb:+.2f} GB"
+        else:
+            delta = ""
+        _last_log_memory_rss = live_bytes
+        logger.info(
+            f"[Memory] {stage}: live {live_gb:.2f} GB, peak {peak_gb:.2f} GB{delta}"
+        )
+    else:
+        logger.info(f"[Memory] {stage}: peak {peak_gb:.1f} GB")
+    return peak_bytes
 
 
 def processes_that_fit_in_memory(desired: int, per_process: int) -> int:

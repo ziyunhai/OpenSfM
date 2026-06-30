@@ -1,5 +1,6 @@
 # pyre-strict
 import datetime
+import logging
 import math
 import os
 import random
@@ -24,6 +25,8 @@ import numpy as np
 from numpy.typing import NDArray
 from opensfm import feature_loader, geo, geometry, report, io, multiview, pygeometry, pymap, types
 from opensfm.dataset import DataSet, DataSetBase
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 RESIDUAL_PIXEL_CUTOFF = 4
 
@@ -124,8 +127,7 @@ def _gps_gcp_opk_errors_stats(errors: Optional[NDArray], names: List[str]) -> Di
     average = np.average(np.linalg.norm(errors, axis=1))
 
     stats["mean"] = {names[0]: mean[0], names[1]: mean[1], names[2]: mean[2]}
-    stats["std"] = {names[0]: std_dev[0], names[1]
-        : std_dev[1], names[2]: std_dev[2]}
+    stats["std"] = {names[0]: std_dev[0], names[1]                    : std_dev[1], names[2]: std_dev[2]}
     stats["error"] = {
         names[0]: math.sqrt(m_squared[0]),
         names[1]: math.sqrt(m_squared[1]),
@@ -692,6 +694,14 @@ def processing_statistics(
         "Reconstruction": "reconstruction.json",
     }
 
+    optional_steps = {
+        "Dense Clustering": "dense_clustering.json",
+        "Dense Equalize": "dense_equalize.json",
+        "Dense Depthmaps": "dense_depthmaps.json",
+        "Dense Fusion": "dense_fusion.json",
+        "Dense Merging": "dense_merging.json",
+    }
+
     steps_times = {}
     for step_name, report_file in steps.items():
         try:
@@ -705,6 +715,17 @@ def processing_statistics(
             steps_times[step_name] = sum(obj["wall_times"].values())
         else:
             steps_times[step_name] = -1
+
+    for step_name, report_file in optional_steps.items():
+        try:
+            report_str = data.load_report(report_file)
+            obj = io.json_loads(report_str)
+        except (IOError, OSError):
+            continue
+        if "wall_time" in obj:
+            steps_times[step_name] = obj["wall_time"]
+        elif "wall_times" in obj:
+            steps_times[step_name] = sum(obj["wall_times"].values())
 
     stats = {}
     stats["steps_times"] = steps_times
@@ -885,6 +906,14 @@ def compute_all_statistics(
     stats["3d_errors"] = td_errors(data, tracks_manager, reconstructions)
     stats["opk_errors"] = opk_errors(reconstructions)
     stats["overlap"] = overlap_statistics(reconstructions, tracks_manager)
+
+    # CRS the georeferenced products are written in (GCP CRS if projected, else
+    # UTM from the reference) — the single decision shared with LAS/LAZ + DSM/ortho.
+    try:
+        stats["output_coordinate_system"] = data.output_coordinate_system()
+    except Exception:
+        logger.debug(
+            "Could not determine output coordinate system", exc_info=True)
 
     return stats
 
@@ -1413,9 +1442,9 @@ def save_residual_grids(
         w, h = camera.width, camera.height
         normalizer = max(w, h)
 
-        clamp = 0.1
+        clamp = 0.15
         res_colors = np.linalg.norm(camera_array_res[:, :, :2], axis=2)
-        lowest = np.percentile(res_colors, 0)
+        lowest = np.percentile(res_colors, 100 * clamp)
         highest = np.percentile(res_colors, 100 * (1 - clamp))
         np.clip(res_colors, lowest, highest, res_colors)
         res_colors /= highest - lowest
@@ -1872,6 +1901,96 @@ def save_overlap_map(
     with io_handler.open_wb(os.path.join(output_path, "overlap_map.png")) as fwb:
         plt.savefig(fwb, dpi=200, bbox_inches="tight")
     plt.close(fig)
+
+
+# Hard-coded longest side, in pixels, for the DSM/ortho report thumbnails.
+THUMBNAIL_MAX_SIZE = 1000
+
+
+def _save_thumbnail_jpeg(
+    io_handler: io.IoFilesystemBase, path: str, bgr: NDArray
+) -> None:
+    """Encode a BGR uint8 image as JPEG and write it through ``io_handler``."""
+    ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    if not ok:
+        raise RuntimeError(f"Failed to JPEG-encode thumbnail: {path}")
+    with io_handler.open_wb(path) as fwb:
+        fwb.write(buf.tobytes())
+
+
+def save_dsm_thumbnail(
+    data: DataSet,
+    output_path: str,
+    io_handler: io.IoFilesystemBase,
+    max_size: int = THUMBNAIL_MAX_SIZE,
+) -> bool:
+    """Render a colourised JPEG thumbnail of the dense DSM for the report.
+
+    Reads ``undistorted/depthmaps/dsm.tif`` (decimated to ``max_size``), maps the
+    elevation range through the ``terrain`` colormap and writes ``dsm_thumb.jpg``
+    into ``output_path``, leaving no-data cells white.  Returns False (and writes
+    nothing) when the DSM has not been produced.
+    """
+    dsm_path = data.undistorted_dataset().dsm_file()
+    if not io_handler.isfile(dsm_path):
+        return False
+
+    grid, nodata = geo.read_geotiff_downsampled(dsm_path, max_size)
+    grid = grid.astype(np.float32)
+    valid = np.isfinite(grid)
+    if nodata is not None:
+        valid &= grid != nodata
+    if not valid.any():
+        return False
+
+    lo, hi = np.percentile(grid[valid], [2, 98])
+    if hi <= lo:
+        hi = lo + 1.0
+    norm = np.clip((grid - lo) / (hi - lo), 0.0, 1.0)
+    rgb = (mpl.colormaps["terrain"](norm)[:, :, :3] * 255.0).astype(np.uint8)
+    rgb[~valid] = 255  # white for no-data cells
+
+    _save_thumbnail_jpeg(
+        io_handler,
+        os.path.join(output_path, "dsm_thumb.jpg"),
+        cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+    )
+    return True
+
+
+def save_ortho_thumbnail(
+    data: DataSet,
+    output_path: str,
+    io_handler: io.IoFilesystemBase,
+    max_size: int = THUMBNAIL_MAX_SIZE,
+) -> bool:
+    """Render a JPEG thumbnail of the dense orthophoto for the report.
+
+    Reads ``undistorted/depthmaps/ortho.tif`` (decimated to ``max_size``),
+    composites any alpha band over white (JPEG has no transparency) and writes
+    ``ortho_thumb.jpg`` into ``output_path``.  Returns False (and writes nothing)
+    when the orthophoto has not been produced.
+    """
+    ortho_path = data.undistorted_dataset().ortho_file()
+    if not io_handler.isfile(ortho_path):
+        return False
+
+    arr, _ = geo.read_geotiff_downsampled(ortho_path, max_size)
+    if arr.ndim == 2:  # grayscale fallback
+        rgb = np.repeat(arr[:, :, None], 3, axis=2).astype(np.uint8)
+    else:
+        rgb = arr[:, :, :3].astype(np.float32)
+        if arr.shape[2] >= 4:  # composite RGB over white using the alpha band
+            alpha = arr[:, :, 3:4].astype(np.float32) / 255.0
+            rgb = rgb * alpha + 255.0 * (1.0 - alpha)
+        rgb = rgb.astype(np.uint8)
+
+    _save_thumbnail_jpeg(
+        io_handler,
+        os.path.join(output_path, "ortho_thumb.jpg"),
+        cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+    )
+    return True
 
 
 def decimate_points(

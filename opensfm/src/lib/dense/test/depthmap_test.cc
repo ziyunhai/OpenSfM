@@ -5,8 +5,11 @@ namespace {
 
 using namespace dense;
 
-// Tests for DepthmapFuser would go here.
-// The old CPU PatchMatch tests (NCCEstimator, PlaneInducedHomography, etc.)
-// were removed along with the dead DepthmapEstimator/Cleaner/Pruner code.
+// Type alias smoke test — ensures fuser.h compiles.
+TEST(DenseTypes, ImageFAlias) {
+  ImageF img(2, 3);
+  EXPECT_EQ(img.rows(), 2);
+  EXPECT_EQ(img.cols(), 3);
+}
 
 }  // namespace

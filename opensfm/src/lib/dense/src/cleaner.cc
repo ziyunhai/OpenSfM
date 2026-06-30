@@ -27,15 +27,17 @@ void GPUDepthmapCleaner::SetMinConsistentViews(int n) {
   min_consistent_views_ = n;
 }
 
-void GPUDepthmapCleaner::SetCarvingThreshold(float t) {
-  carving_threshold_ = std::max(0.0f, t);
-}
-
-void GPUDepthmapCleaner::SetMaxCarvedViews(int n) {
-  max_carved_views_ = std::max(0, n);
-}
-
 void GPUDepthmapCleaner::SetDevice(int device_idx) { device_idx_ = device_idx; }
+
+void GPUDepthmapCleaner::SetCarvingThreshold(float t) {
+  carving_threshold_ = t;
+}
+
+void GPUDepthmapCleaner::SetMaxCarvedViews(int n) { max_carved_views_ = n; }
+
+void GPUDepthmapCleaner::SetGrazingCosThreshold(float t) {
+  grazing_cos_threshold_ = t;
+}
 
 int GPUDepthmapCleaner::AddView(const Mat3d& K, const Mat3d& R, const Vec3d& t,
                                 const ImageF& depth) {
@@ -49,6 +51,26 @@ int GPUDepthmapCleaner::AddView(const Mat3d& K, const Mat3d& R, const Vec3d& t,
   v.t = t;
   v.width = static_cast<int>(depth.cols());
   v.height = static_cast<int>(depth.rows());
+  // v.normal remains empty — no normal for this view.
+  views_.push_back(std::move(v));
+  return static_cast<int>(views_.size()) - 1;
+}
+
+int GPUDepthmapCleaner::AddView(const Mat3d& K, const Mat3d& R, const Vec3d& t,
+                                const ImageF& depth,
+                                const PixelData3f& normal) {
+  ViewEntry v;
+  const int h = static_cast<int>(depth.rows());
+  const int w = static_cast<int>(depth.cols());
+  v.depth = cv::Mat(h, w, CV_32F, const_cast<float*>(depth.data())).clone();
+  // PixelData3f is (3, H*W) column-major = interleaved [nx,ny,nz, nx,ny,nz,...]
+  // which maps directly to CV_32FC3 of shape (H, W).
+  v.normal = cv::Mat(h, w, CV_32FC3, const_cast<float*>(normal.data())).clone();
+  v.K = K;
+  v.R = R;
+  v.t = t;
+  v.width = w;
+  v.height = h;
   views_.push_back(std::move(v));
   return static_cast<int>(views_.size()) - 1;
 }
@@ -86,6 +108,7 @@ cv::Mat GPUDepthmapCleaner::Clean(int ref_idx,
   const int npix = w * h;
   const int num_neighbors = static_cast<int>(neighbor_ids.size());
   const int num_views = 1 + num_neighbors;
+  const bool has_normal = !ref.normal.empty();
 
   // --- Ensure image2d_t pool matches current dimensions ---
   if (w != cl_img_w_ || h != cl_img_h_) {
@@ -125,6 +148,32 @@ cv::Mat GPUDepthmapCleaner::Clean(int ref_idx,
                             other_depth.step[0], 0, other_depth.data);
   }
 
+  // --- Upload ref normal buffer (float3 per pixel) ---
+  const size_t normal_bytes = static_cast<size_t>(npix) * 3 * sizeof(float);
+  if (has_normal) {
+    if (normal_bytes > cl_ref_normal_bytes_) {
+      cl_ref_normal_ = cl::Buffer(cl_ctx, CL_MEM_READ_ONLY, normal_bytes);
+      cl_ref_normal_bytes_ = normal_bytes;
+    }
+    // Ensure normal is contiguous and correct size.
+    cv::Mat norm_upload = ref.normal;
+    if (norm_upload.cols != w || norm_upload.rows != h) {
+      cv::resize(norm_upload, norm_upload, cv::Size(w, h), 0, 0,
+                 cv::INTER_LINEAR);
+    }
+    if (!norm_upload.isContinuous()) {
+      norm_upload = norm_upload.clone();
+    }
+    queue.enqueueWriteBuffer(cl_ref_normal_, CL_FALSE, 0, normal_bytes,
+                             norm_upload.data);
+  } else {
+    // Allocate a dummy buffer if not yet allocated (kernel still needs arg).
+    if (cl_ref_normal_bytes_ == 0) {
+      cl_ref_normal_ = cl::Buffer(cl_ctx, CL_MEM_READ_ONLY, sizeof(float));
+      cl_ref_normal_bytes_ = sizeof(float);
+    }
+  }
+
   // --- Upload cameras (small buffer, safe as __global) ---
   std::vector<CLCamera> cameras(num_views);
   cameras[0] = MakeCLCamera(ref.K, ref.R, ref.t, w, h);
@@ -149,6 +198,7 @@ cv::Mat GPUDepthmapCleaner::Clean(int ref_idx,
 
   // --- Set kernel arguments ---
   int effective_min = std::min(min_consistent_views_, num_views);
+  int has_normal_int = has_normal ? 1 : 0;
 
   int arg = 0;
   k_clean_.setArg(arg++, cl_ref_depth_img_);
@@ -157,6 +207,7 @@ cv::Mat GPUDepthmapCleaner::Clean(int ref_idx,
   }
   k_clean_.setArg(arg++, cl_cameras_);
   k_clean_.setArg(arg++, cl_clean_depth_);
+  k_clean_.setArg(arg++, cl_ref_normal_);
   k_clean_.setArg(arg++, w);
   k_clean_.setArg(arg++, h);
   k_clean_.setArg(arg++, num_views);
@@ -164,6 +215,8 @@ cv::Mat GPUDepthmapCleaner::Clean(int ref_idx,
   k_clean_.setArg(arg++, effective_min);
   k_clean_.setArg(arg++, carving_threshold_);
   k_clean_.setArg(arg++, max_carved_views_);
+  k_clean_.setArg(arg++, grazing_cos_threshold_);
+  k_clean_.setArg(arg++, has_normal_int);
 
   cl::NDRange global(static_cast<size_t>((w + 15) / 16 * 16),
                      static_cast<size_t>((h + 15) / 16 * 16));
@@ -183,8 +236,10 @@ void GPUDepthmapCleaner::Clear() {
   // Release GPU resources.
   cl_cameras_ = cl::Buffer();
   cl_clean_depth_ = cl::Buffer();
+  cl_ref_normal_ = cl::Buffer();
   cl_cameras_bytes_ = 0;
   cl_clean_depth_bytes_ = 0;
+  cl_ref_normal_bytes_ = 0;
   cl_ref_depth_img_ = cl::Image2D();
   cl_src_depth_imgs_.clear();
   cl_img_w_ = 0;
