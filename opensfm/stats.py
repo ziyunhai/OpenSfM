@@ -8,6 +8,7 @@ import cv2
 import statistics
 from collections import defaultdict
 from functools import lru_cache
+from itertools import product
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import matplotlib as mpl
@@ -77,6 +78,43 @@ def _gps_errors(reconstruction: types.Reconstruction) -> List[NDArray]:
     return errors
 
 
+def _compute_value_at_p_level(samples: NDArray, p: float = 0.90) -> float:
+    """Based on the method described in "Computation of scalar accuracy metrics LE, CE, and SE as both predictive and sample-based statistics"
+    https://masseranolabs.com/IGTF2016-000255.pdf"""
+    n = len(samples)
+    if n < 1:
+        return -1
+    y = np.sort(samples)
+    if n < 7:
+        return float(y[-1])
+
+    kprime = int(np.floor((n + 1) * p)) - 1  # arrays are 0-indexed
+
+    if not ((n + 1) * p).is_integer():
+        kml = kprime + 0.5
+    else:
+        kml = kprime
+
+    i = int(np.floor(kml)) - 1
+    j = int(np.ceil(kml)) - 1
+
+    return 0.5 * (y[i] + y[j])
+
+
+def _compute_cele_stats(errors: Optional[NDArray]) -> Dict[str, Any]:
+    """Compute CE90 (horizontal) and LE90 (vertical) accuracy"""
+    if errors is None or len(errors) == 0:
+        return {}
+
+    errors = np.asarray(errors)
+    ce_errors = np.sqrt(errors[:, 0] ** 2 + errors[:, 1] ** 2)
+    le_errors = np.abs(errors[:, 2])
+    return {
+        "ce90": _compute_value_at_p_level(ce_errors, 0.90),
+        "le90": _compute_value_at_p_level(le_errors, 0.90),
+    }
+
+
 def _gps_gcp_opk_errors_stats(errors: Optional[NDArray], names: List[str]) -> Dict[str, Any]:
     if errors is None or len(errors) == 0:
         return {}
@@ -111,7 +149,9 @@ def gps_errors(reconstructions: List[types.Reconstruction]) -> Dict[str, Any]:
                         np.array(shot.metadata.gps_accuracy.value))
                 else:
                     all_gps_std.append(geo.DEFAULT_GPS_STD)
-    stats = _gps_gcp_opk_errors_stats(np.array(all_errors), ["x", "y", "z"])
+    errors = np.array(all_errors)
+    stats = _gps_gcp_opk_errors_stats(errors, ["x", "y", "z"])
+    stats.update(_compute_cele_stats(errors))
     if all_gps_std:
         avg_std = np.mean(all_gps_std, axis=0)
         stats["average_gps_std"] = {
@@ -223,8 +263,9 @@ def gcp_errors(
         if d["role"] == "Checkpoint"
     ]
 
-    stats = _gps_gcp_opk_errors_stats(
-        np.array(all_errors) if all_errors else np.array([]), ["x", "y", "z"])
+    errors = np.array(all_errors) if all_errors else np.array([])
+    stats = _gps_gcp_opk_errors_stats(errors, ["x", "y", "z"])
+    stats.update(_compute_cele_stats(errors))
     stats["details"] = gcp_details
 
     # Add separate stats for GCP and CP
@@ -240,6 +281,102 @@ def gcp_errors(
     crs = data.load_gcp_coordinate_system()
     if crs:
         stats["coordinate_system"] = crs
+    return stats
+
+
+def td_errors(
+    data: DataSetBase,
+    tracks_manager: pymap.TracksManager,
+    reconstructions: List[types.Reconstruction],
+) -> Dict[str, Any]:
+    errors = []
+    reproj_threshold = data.config["triangulation_threshold"]
+    min_ray_angle_degrees = data.config["triangulation_min_ray_angle"]
+    min_depth = data.config["triangulation_min_depth"]
+
+    for rec in reconstructions:
+        reproj_errors = rec.map.compute_reprojection_errors(
+            tracks_manager, pymap.ErrorType.Pixel
+        )
+
+        # For each point (cap to 1000 samples)
+        # get the first (up to) 3 cameras that
+        # triangulate a point and sample around
+        # the projection error radius (4 points)
+        # by computing all triangulation permutations
+        max_samples = 1000
+        points = list(rec.points.values())
+
+        if len(points) > max_samples:
+            # Deterministic sampling
+            sampler = random.Random(42)
+            points = sampler.sample(points, max_samples)
+
+        for p in points:
+            track_obs = tracks_manager.get_track_observations(p.id)
+
+            # Build the per-camera reprojection-error-box corners (up to 3 cams).
+            err_perms = []
+            for shot_id, obs in track_obs.items():
+                if shot_id not in reproj_errors:
+                    continue
+
+                rerr = reproj_errors[shot_id][p.id]
+                err_perms.append([
+                    rerr * np.array([1, 1]),
+                    rerr * np.array([-1, 1]),
+                    rerr * np.array([1, -1]),
+                    rerr * np.array([-1, -1]),
+                ])
+                if len(err_perms) >= 3:
+                    break
+
+            # Calculate the cartesian product (try all possibilities)
+            err_products = np.array(list(product(*err_perms)))
+
+            ray_errors = []
+            for err_prod in err_products:
+                origins = []
+                bearings = []
+                i = 0
+
+                for shot_id, obs in track_obs.items():
+                    if shot_id not in reproj_errors:
+                        continue
+
+                    shot = rec.shots[shot_id]
+                    origins.append(shot.pose.get_origin())
+
+                    reprojected_obs = obs.point + err_prod[i]
+                    b = shot.camera.pixel_bearing(np.array(reprojected_obs))
+                    r = shot.pose.get_rotation_matrix().T
+                    bearings.append(r.dot(b))
+
+                    i += 1
+
+                    if i >= 3:
+                        break
+
+                if len(origins) >= 2:
+                    thresholds = len(origins) * [reproj_threshold]
+                    valid_triangulation, X = pygeometry.triangulate_bearings_midpoint(
+                        np.array(origins),
+                        np.array(bearings),
+                        thresholds,
+                        np.radians(min_ray_angle_degrees),
+                        min_depth,
+                    )
+                    if valid_triangulation:
+                        ray_errors.append(X - p.coordinates)
+
+            # Take the max. This is the maximum 3D error estimate
+            # for this point
+            if len(ray_errors) > 0:
+                errors.append(np.max(np.array(ray_errors), axis=0))
+
+    errors = np.array(errors) if errors else np.array([])
+    stats = _gps_gcp_opk_errors_stats(errors, ["x", "y", "z"])
+    stats.update(_compute_cele_stats(errors))
     return stats
 
 
@@ -773,6 +910,7 @@ def compute_all_statistics(
     stats["rig_errors"] = rig_statistics(data, reconstructions)
     stats["gps_errors"] = gps_errors(reconstructions)
     stats["gcp_errors"] = gcp_errors(data, reconstructions)
+    stats["3d_errors"] = td_errors(data, tracks_manager, reconstructions)
     stats["opk_errors"] = opk_errors(reconstructions)
     stats["overlap"] = overlap_statistics(reconstructions, tracks_manager)
 

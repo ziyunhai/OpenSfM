@@ -174,6 +174,13 @@ class Report:
         # Give remainder to last column
         columns_sizes[-1] = CONTENT_WIDTH - sum(columns_sizes[:-1])
 
+        # Keep the whole table on one page
+        n_header_rows = 1 if columns_names else 0
+        table_height = (n_header_rows + len(rows)) * CELL_HEIGHT
+        page_break_trigger = self.pdf.h - self.pdf.b_margin
+        if self.pdf.get_y() + table_height > page_break_trigger:
+            self.pdf.add_page()
+
         if columns_names:
             self.pdf.set_draw_color(*COLOR_TABLE_BORDER)
             self.pdf.set_fill_color(*COLOR_TABLE_HEADER)
@@ -792,6 +799,62 @@ class Report:
             )
 
             self._make_table(columns_names, rows)
+            self.pdf.set_xy(MARGIN, self.pdf.get_y() + TABLE_GAP)
+
+        # 3D error table
+        td_stats = self.stats.get("3d_errors", {})
+        if "average_error" in td_stats:
+            columns_names = [
+                "3D",
+                self.locale.t("mean"),
+                self.locale.t("sigma"),
+                self.locale.t("rms_error"),
+            ]
+            rows = []
+            for comp in ["x", "y", "z"]:
+                rows.append([
+                    self.locale.t(
+                        f"{comp}_error_distance").format(unit=dist_unit),
+                    self.locale.format_distance(
+                        td_stats["mean"][comp], precision=3),
+                    self.locale.format_distance(
+                        td_stats["std"][comp], precision=3),
+                    self.locale.format_distance(
+                        td_stats["error"][comp], precision=3),
+                ])
+            rows.append([
+                self.locale.t("total"),
+                "",
+                "",
+                self.locale.format_distance(
+                    td_stats["average_error"], precision=3),
+            ])
+            self._make_table(columns_names, rows)
+            self.pdf.set_xy(MARGIN, self.pdf.get_y() + TABLE_GAP)
+
+        # CE90 / LE90
+        abs_error_type = (
+            "gcp" if self.stats.get("gcp_errors", {}).get("ce90", 0) > 0 else "gps"
+        )
+        a_ce90 = self.stats.get(abs_error_type + "_errors", {}).get("ce90", 0)
+        a_le90 = self.stats.get(abs_error_type + "_errors", {}).get("le90", 0)
+        r_ce90 = self.stats.get("3d_errors", {}).get("ce90", 0)
+        r_le90 = self.stats.get("3d_errors", {}).get("le90", 0)
+
+        if a_ce90 > 0 and a_le90 > 0:
+            rows = [
+                [
+                    self.locale.t("horizontal_accuracy_ce90"),
+                    self.locale.format_distance(a_ce90, precision=3),
+                    self.locale.format_distance(r_ce90, precision=3) if r_ce90 > 0 else "-",
+                ],
+                [
+                    self.locale.t("vertical_accuracy_le90"),
+                    self.locale.format_distance(a_le90, precision=3),
+                    self.locale.format_distance(r_le90, precision=3) if r_le90 > 0 else "-",
+                ],
+            ]
+            self._make_table(["", self.locale.t("absolute"), self.locale.t("relative")], rows, False)
             self.pdf.set_xy(MARGIN, self.pdf.get_y() + TABLE_GAP)
 
         rows = []

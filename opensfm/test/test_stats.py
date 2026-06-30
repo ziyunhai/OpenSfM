@@ -267,7 +267,7 @@ def test_gps_errors_normal(
     reference = scene_synthetic.reconstruction
     gps_errors = stats.gps_errors([reference])
     assert set(gps_errors.keys()) == {
-        "average_error", "error", "mean", "std", "average_gps_std"}
+        "average_error", "error", "mean", "std", "average_gps_std", "le90", "ce90"}
     # scene_synthetic generated GPS noise is 5 meters
     assert 3.0 < gps_errors["average_error"] < 7.0
 
