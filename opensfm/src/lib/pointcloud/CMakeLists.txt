@@ -30,7 +30,7 @@ elseif(TARGET laszip)
 else()
   find_path(LASZIP_INCLUDE_DIR laszip_api.h
     PATH_SUFFIXES laszip include/laszip include)
-  find_library(LASZIP_LIBRARY NAMES laszip laszip_api)
+  find_library(LASZIP_LIBRARY NAMES laszip laszip_api laszip3 laszip_api3)
   if(NOT LASZIP_INCLUDE_DIR OR NOT LASZIP_LIBRARY)
     message(FATAL_ERROR
       "LASzip not found. Install conda-forge::laszip (it is a required "
