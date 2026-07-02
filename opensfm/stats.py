@@ -1021,7 +1021,7 @@ def save_matchgraph(
         orientation="horizontal",
         label="Number of matches between images",
         pad=0.0,
-        ax=plt.gca(),
+        ax=ax,
     )
 
     with io_handler.open_wb(os.path.join(output_path, "matchgraph.png")) as fwb:
