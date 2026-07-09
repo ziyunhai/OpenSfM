@@ -1,5 +1,5 @@
 
-name: Docker Ubuntu 24.04 and Push to Aliyun ACR
+name: Docker Ubuntu 24.04 and Push to Aliyun ACR 
 
 on: [push, pull_request]
 
