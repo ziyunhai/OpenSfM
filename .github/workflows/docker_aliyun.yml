@@ -33,7 +33,7 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ secrets.ACR_REGISTRY }}/${{ secrets.ACR_NAMESPACE }}/opensfm:$GITHUB_SHA
+            ${{ secrets.ACR_REGISTRY }}/${{ secrets.ACR_NAMESPACE }}/opensfm
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
