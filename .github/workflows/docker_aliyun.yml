@@ -1,7 +1,14 @@
 
 name: Docker Ubuntu 24.04 and Push to Aliyun ACR
-
-on: [push, pull_request]
+run-name: ${{ github.actor }} is building opensfm
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'Dockerfile.ubuntu24'
+      - '.github/workflows/docker_aliyun.yml'  # 工作流文件自身
+  workflow_dispatch:  # 允许手动触发
 
 jobs:
 
@@ -33,7 +40,7 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ secrets.ACR_REGISTRY }}/${{ secrets.ACR_NAMESPACE }}/opensfm
+            ${{ secrets.ACR_REGISTRY }}/${{ secrets.ACR_NAMESPACE }}/opensfm:$GITHUB_SHA
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
